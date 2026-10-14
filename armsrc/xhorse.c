@@ -118,24 +118,13 @@ static const char xh_id8a_probe[] =
 // EM right up to the first burst and is silent from power-up in every window after it, across
 // field-offs of 70 ms, 570 ms and 1.57 s, i.e. the burst turns the emulation off and it stays off
 // across power cycles.  The VVDI wraps the burst in a ~10 s sequence (listen window, XMICRO probes,
-// "1111111" frames, 11 more bursts, long rests, a 1.57 s cold-boot).  For ID11/ID12 none of that
-// changed anything observable; ID13 goes silent after the burst but only answers after the cold-boot.
-// We keep the VVDI's structure (bursts, then one cold-boot, then the handshake) but send only one
-// burst per timing.  See doc/xhorse_notes.md.  Values are the VVDI's, in us.
-//
-// The burst only works if it starts at the right point in the chip's EM frame, which is locked to
-// power-up.  Measured from the field-on edge, freeing bursts for ID11 and ID12 start ~44 "units" into
-// the frame, a unit being 32 T0 for ID11 (RF/32) and 40 T0 for ID12 (RF/40): ID11 1409-1423, ID12 1741
-// T0.  For ID11 bursts at ~1427 T0 and later fail - the VVDI's own first try often does - so the
-// timings aim at the window's centre, commanding 3.5 T0 early because our burst reaches the air that
-// much after the commanded time.  ID13 (RF/64) is freed in its first frame after power-up (VVDI at
-// 1398 T0, ours at ~1752) but not by the same position in a later frame.  ID48 (Megamos) needs a
-// different burst (xh_burst_id48) at 1622 T0.  We don't know the emulated type, so the entries are
-// tried in turn.
-#define XH_T_EM_OFF_US            70050    // field off before and after the burst window (VVDI)
+// "1111111" frames, 11 more bursts, long rests, a 1.57 s cold-boot); none of that changed anything
+// observable and it is not replicated.  See doc/xhorse_notes.md.  Values are the VVDI's, in us.
+#define XH_T_EM_ON_US            155940    // field-on window carrying the burst
+#define XH_T_EM_BURST_AT_US      109660    // burst start within that window (chip powered and broadcasting)
+#define XH_T_EM_OFF_US            70050    // field off after it (the VVDI's following off)
 #define XH_T_EM_SETTLE_US         30180    // field on this long before XHORSE (VVDI, after the chip is freed)
-#define XH_T_EM_COLDBOOT_US     1570940    // VVDI's power-down between the bursts and its handshake (ID13 needs it)
-#define XH_EM_TRIES                   3    // attempts: one burst per xh_em_timings[] entry, cold-boot, handshake
+#define XH_EM_TRIES                   3    // burst + handshake attempts
 
 // func field (top 2 bits of the op byte)
 #define XH_FUNC_CTL   0
@@ -538,8 +527,8 @@ static bool xh_4r(xh_sess_t *s, const char *what, int attempt) {
     uint32_t echo = 0;
     int res = xh_cmd_reply(s, sel1, 16, &echo);
     s->cur_bank = 1;
-    bool ok = (res == PM3_SUCCESS) && ((uint16_t)echo == sel1);
-    if (g_dbglevel >= (ok ? DBG_EXTENDED : DBG_DEBUG)) {
+    if (g_dbglevel >= DBG_EXTENDED) {
+        bool echo_ok = (((echo >> 8) ^ (echo & 0xFF)) == 0xFF) && ((echo >> 14) == 1);
         Dbprintf("xhorse: %s attempt %d  4R echo=%04x %s", what, attempt, (uint16_t)echo,
                  ok ? "(sel ok)" : "(bad - not a real session, retrying)");
     }
@@ -604,40 +593,13 @@ static int xh_open_session(xh_sess_t *s) {
         if (xh_handshake(s) != PM3_SUCCESS) {
             continue;                // no/partial 7372 reply - re-power and retry
         }
-        if (xh_4r(s, "session", attempt) == false) {
-            continue;                // handshake was not a real session - re-power and retry
-        }
-        if (g_dbglevel >= DBG_EXTENDED) {
-            Dbprintf("xhorse: session open on attempt %d (timing %d)", attempt, mode);
-        }
+        xh_4r(s, "session", attempt);
         return PM3_SUCCESS;
     }
     return PM3_EFAILED;
 }
 
-// Open an XT136 session: alternate the VVDI's power-up (130.1 ms off, XHORSE 220.3 ms on) and the
-// XT27A's short one.  Only the VVDI's is confirmed on air.
-static int xh_open_session_xt136(xh_sess_t *s) {
-    for (int attempt = 0; attempt < 2 * XH136_TRIES; attempt++) {
-        if ((attempt % 2) == 0) {
-            Gpio_SSC_DOUT_High();
-            xh_delay_us(XH136_T_OFF_US);
-            Gpio_SSC_DOUT_Low();
-            xh_delay_us(XH136_T_ON_US);
-        } else {
-            xh_field_reset();
-        }
-        if (xh_handshake_xt136(s) == PM3_SUCCESS) {
-            if (g_dbglevel >= DBG_EXTENDED) {
-                Dbprintf("xhorse: XT136 session open on attempt %d", attempt);
-            }
-            return PM3_SUCCESS;
-        }
-    }
-    return PM3_EFAILED;
-}
-
-// The VVDI's EM unlock burst, sent at a set time after power-up (xh_em_timings).  43 field-off pulses; start
+// The VVDI's EM unlock burst, sent 109.66 ms into a field-on window.  43 field-off pulses; start
 // offsets are T0 from the start of the first pulse, averaged over 22 occurrences in two VVDI
 // reset captures (they agree to within 0.75 T0); widths are how long the field is held off, i.e.
 // the measured width minus the 2 T0 the sniffer adds (our 8 T0 BPLM gap measures 10, as does the
@@ -694,68 +656,29 @@ static void xh_em_burst(const xh_burst_t *b) {
     }
 }
 
-// Burst windows (see XH_T_EM_OFF_US): which burst, in a field-on window of on_us, commanded
-// burst_at_us after power-up.
-typedef struct {
-    const char       *name;
-    const xh_burst_t *burst;
-    uint32_t          on_us;
-    uint32_t          burst_at_us;
-} xh_em_timing_t;
-
-static const xh_em_timing_t xh_em_timings[] = {
-    // 13692.5 T0 commanded -> ~13696 on air = 6 ID11 frames + 1408 T0 (unit 44.0).  Frees ID11.  It
-    // does NOT free a fresh ID13 even though it is the same position 3 ID13 frames later: ID13 seems
-    // to listen only in its first frame after power-up (the VVDI frees it at 11.18 ms).
-    { "ID11 (32 T0 units)",      &xh_burst_em,   155940, 109540 },
-    // 1748.75 T0 commanded -> ~1752 on air = unit 43.8 of ID12's 40 T0 units.  Frees ID12 (13.93 ms,
-    // the VVDI's value, freed it at 1741-1745), and also frees ID13 in its first frame - ID13 then
-    // only answers after the cold-boot.
-    { "ID12/ID13 (first frame)", &xh_burst_em,   60300,  13990 },
-    // ID8E broadcasts too (MC64, from ~950 T0 after power-up) and is freed by the same burst B as
-    // ID48, but earlier: the VVDI's freeing round puts it at 1535 T0 on air (1531.5 commanded),
-    // keeps the field on 52.88 ms in total, then powers down 420 ms (vvdi-id8E-reset-success.pm3).
-    // Its two earlier rounds send burst A at 41.7 ms and don't free it.  Our ID48 timing (~1622 on
-    // air) did not free it.
-    { "ID8E",                    &xh_burst_id48, 52880,  12252 },
-    // 1618.5 T0 commanded -> ~1622 on air, the VVDI's position in all three of its tries; it keeps
-    // the field on 63.86 ms in total.  Its own power-down before the handshake is 420 ms; the
-    // cold-boot here is longer.
-    { "ID48 (Megamos)",          &xh_burst_id48, 63860,  12948 },
-};
-
-// Pull a chip stuck broadcasting a non-HITAG2 emulation (ID11/ID12/ID13/ID48/ID8E) back onto the config
-// channel, structured as the VVDI does it: bursts first, no handshake in between, then one cold-boot
-// and one handshake.  Each attempt sends one burst per entry of xh_em_timings[] (each in its own
-// power cycle: off 70 ms, on, burst at burst_at_us, rest of the window), so whichever type the chip
-// emulates gets its timing; a burst at the wrong timing is harmless once the chip is freed (the
-// VVDI keeps bursting after the chip goes silent).  Then field off for the VVDI's 1.57 s cold-boot,
-// on, XHORSE handshake 30.18 ms later.  ID13 only answers after the cold-boot; ID11/ID12 answer
-// either way.  ~2.3 s per attempt.
+// Pull a chip stuck broadcasting a non-HITAG2 emulation (ID11/EM4100 etc) back onto the config
+// channel: power-cycle, burst at +109.66 ms after power-up while the chip is broadcasting, finish
+// the window, field off 70 ms, field on, XHORSE handshake 30.18 ms later.  ~0.5 s per attempt.
 static int xh_open_session_em(xh_sess_t *s) {
     for (int attempt = 0; attempt < XH_EM_TRIES; attempt++) {
-        for (size_t t = 0; t < sizeof(xh_em_timings) / sizeof(xh_em_timings[0]); t++) {
-            const xh_em_timing_t *tm = &xh_em_timings[t];
-
-            Gpio_SSC_DOUT_High();                                    // off: the burst is timed from a fresh power-up
-            xh_delay_us(XH_T_EM_OFF_US);
-            Gpio_SSC_DOUT_Low();                                     // field on: chip boots, broadcasts EM
-            xh_delay_us(tm->burst_at_us);
-            xh_em_burst(tm->burst);
-            xh_delay_us(tm->on_us - tm->burst_at_us - xh_burst_len_us(tm->burst));
-        }
-
-        Gpio_SSC_DOUT_High();                                        // cold-boot
-        xh_delay_us(XH_T_EM_COLDBOOT_US);
-        Gpio_SSC_DOUT_Low();
+        Gpio_SSC_DOUT_High();                                        // off: the burst is timed from a fresh power-up
+        xh_delay_us(XH_T_EM_OFF_US);
+        Gpio_SSC_DOUT_Low();                                         // field on: chip boots, broadcasts EM
+        xh_delay_us(XH_T_EM_BURST_AT_US);
+        xh_em_burst();
+        xh_delay_us(XH_T_EM_ON_US - XH_T_EM_BURST_AT_US - XH_EMB_LEN_US);
+        Gpio_SSC_DOUT_High();                                        // field off
+        xh_delay_us(XH_T_EM_OFF_US);
+        Gpio_SSC_DOUT_Low();                                         // field on
         xh_delay_us(XH_T_EM_SETTLE_US);
 
-        if (xh_handshake(s) == PM3_SUCCESS && xh_4r(s, "EM-recovery", attempt)) {
-            s->em_mode = true;                                       // later sessions: 70 ms off / 30.18 ms settle
+        if (xh_handshake(s) == PM3_SUCCESS) {
+            xh_4r(s, "EM-recovery", attempt);
+            s->em_mode = true;                                       // later sessions: same off/settle timing
             return PM3_SUCCESS;
         }
-        if (g_dbglevel >= DBG_DEBUG) {
-            Dbprintf("xhorse: EM-recovery attempt %d: no session after the bursts and cold-boot", attempt);
+        if (g_dbglevel >= DBG_ERROR) {
+            Dbprintf("xhorse: EM-recovery attempt %d: no handshake after the EM burst", attempt);
         }
     }
     return PM3_EFAILED;
