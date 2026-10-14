@@ -157,7 +157,7 @@ for each:
 | Type | Bit time | Window | `burst_at` | Bit position | Proven by |
 |---|---|---|---|---|---|
 | ID11 | 256 us (RF/32) | 155.94 ms | 109.66 ms | 6 frames + 44.4 | Proxmark reset |
-| ID12 | 320 us (RF/40) | 60.30 ms | 13.93 ms | 43.5 | VVDI reset capture |
+| ID12 | 320 us (RF/40) | 60.30 ms | 13.93 ms | 43.5 | VVDI reset capture, then Proxmark reset |
 
 (109.66 ms is bit 44 for an ID11 but only bit 23 of a frame for an ID12, which is why the first
 firmware freed ID11 but not ID12.) The burst turns the EM emulation off; the handshake then works
@@ -272,8 +272,8 @@ follows is not decoded.
 ^[Top](#top)
 
 * What the unlock burst encodes, and whether it is a generic "leave emulation" command.
-* Whether ID13 and other talk-first emulations need the same burst. The Proxmark reset is confirmed
-  on ID11; the VVDI frees ID12 with the same burst, at a different time after power-up.
+* Whether ID13 and other talk-first emulations need the same burst, and at what time. The Proxmark
+  reset is confirmed on ID11 and ID12 (same burst, different time after power-up).
 * How wide the "bit 44" window is. One VVDI burst at bit 47.3 also worked, so it may not be a single
   narrow slot. Detecting the chip's bit rate from its broadcast would allow computing the position
   instead of trying a table.
