@@ -121,25 +121,48 @@ read page 0x33    0xF30C ^ next keystream = 0x0469   (sent)
 
 An XT27A emulating a reader-talks-first type such as HITAG2 powers up and listens, so the handshake
 works. An EM4100-family type such as ID11 is tag-talks-first: a real EM4100 is read-only and loops
-its 64-bit code from power-up (RF/64 Manchester, ~32.8 ms per frame). An XT27A set to ID11 does the
-same, never hears the handshake, and looks dead to anything that only knows channel A.
+its 64-bit code from power-up. An XT27A set to ID11 does the same, never hears the handshake, and
+looks dead to anything that only knows channel A. Measured from the frame repetition period:
+
+| Emulated type | EM frame period | Bit time | Rate |
+|---|---|---|---|
+| ID11 | 16.38 ms | 32 T0 | RF/32 |
+| ID12 | 20.48 ms | 40 T0 | RF/40 |
+
+RF/32 Manchester is the same coding and rate as a genuine XT27A reply, and RF/40 is close to it,
+so a broadcast could be demodulated as a `7372` reply and "complete" a handshake with a garbage
+seed, which would stop the EM fallback from running. To guard against that, the firmware only
+accepts a session once the chip's echo of the first encrypted command (`sel bank 1`) decrypts to
+exactly `0x41BE`; otherwise the attempt counts as failed.
 
 ## The sequence
 
 `lf xhorse reset` (and `configure`) first tries the normal session open eight times (20 ms field
-off, 3 ms power-up, handshake). For a chip stuck in ID11 all eight fail, and the firmware falls back
-to the unlock:
+off, 3 ms power-up, handshake). For a chip stuck in an EM type all eight fail, and the firmware falls
+back to the unlock:
 
 ```
 OFF 70.05 ms
-ON  |<--- 109.66 ms --->|<- burst 15.95 ms ->|<- 30.33 ms ->|     (155.94 ms in total)
+ON  |<-- burst_at -->|<- burst 15.95 ms ->|<- rest of window ->|
 OFF 70.05 ms
 ON  |<- 30.18 ms ->| XHORSE ..8 ms.. 072F ..11.78 ms.. 7372 -> reply
 ```
 
-The burst turns the EM emulation off; the handshake then works normally. Up to three unlock
-attempts are made. Later sessions in the same run are opened with the same 70.05 ms off / 30.18 ms
-settle. Reset then:
+The burst only works if it lands at the right point in the chip's own EM bit stream, which starts at
+power-up. In every burst that freed a chip it began around **bit 44** of the chip's 64-bit frame
+(the VVDI's own first try is often ~1 bit late, and fails). Because the bit time depends on the
+emulated type, one fixed offset can't suit every type, so the firmware tries the positions proven
+for each:
+
+| Type | Bit time | Window | `burst_at` | Bit position | Proven by |
+|---|---|---|---|---|---|
+| ID11 | 256 us (RF/32) | 155.94 ms | 109.66 ms | 6 frames + 44.4 | Proxmark reset |
+| ID12 | 320 us (RF/40) | 60.30 ms | 13.93 ms | 43.5 | VVDI reset capture |
+
+(109.66 ms is bit 44 for an ID11 but only bit 23 of a frame for an ID12, which is why the first
+firmware freed ID11 but not ID12.) The burst turns the EM emulation off; the handshake then works
+normally. Up to three rounds over the table are made. Later sessions in the same run are opened with
+the same 70.05 ms off / 30.18 ms settle. Reset then:
 
 1. reads the chip ID (bank 1, pages `0x33`-`0x36`) and ends the session with `ctl 0x3F`;
 2. opens a new session, reads status page `0x3F`, and writes, each with a 13 ms program wait and a
@@ -174,8 +197,8 @@ from the start of the first pulse; widths are how long the field is held off.
 | 10 | 415 | 19 | 21 | 961 | 16 | 32 | 1433 | 19 | 43 | 1978 | 16 |
 | 11 | 449 | 15 | 22 | 992 | 15 | 33 | 1497 | 19 | | | |
 
-The gaps are 15-20 T0 (120-160 us), spaced roughly 32 T0 (S) or 64 T0 (L) apart, the timescale
-of EM4100's RF/64 encoding:
+The gaps are 15-20 T0 (120-160 us), spaced roughly 32 T0 (S) or 64 T0 (L) apart, i.e. one or two
+bit-times of the ID11 chip's RF/32 broadcast:
 
 ```
 S S L S L S S L L S L L S S L L L S L S S S S L L S S L S S L L L S L S L S S L L S
@@ -188,9 +211,11 @@ S S L S L S S L L S L L S S L L L S L S S S S L L S S L S S L L L S L S L S S L 
 * It is the reader's signal: it clips to full scale like the reader's BPLM frames, whereas the
   chip's EM signal does not, and it is absent from a Proxmark capture of the same chip taken before
   the burst was implemented.
+* The VVDI sends the identical burst (to within 1-2 T0) to a chip emulating ID12, whose broadcast
+  is RF/40, and it frees that chip too. The pulses themselves are not tuned to the chip's bit rate;
+  only the time the burst starts is (see [The sequence](#the-sequence)).
 * What it encodes is unknown. The spacings are close to, but not exactly, multiples of 32 T0
-  (30-36 and 61-65), and it does not parse cleanly as Manchester or biphase at RF/64. The firmware
-  replays it verbatim (`xh_em_burst` in `armsrc/xhorse.c`).
+  (30-36 and 61-65). The firmware replays it verbatim (`xh_em_burst` in `armsrc/xhorse.c`).
 
 ## Evidence
 
@@ -237,8 +262,9 @@ reader -> XMICRO (ASCII, 48 bits, 0x584D4943524F)    chip -> 0x5AA5
 reader -> 0011 (4 bits)                              chip -> ASCII family, e.g. "XT37" / "XT57", + 1 byte
 ```
 
-The XT27A never answers XMICRO. An XT57B answers an XMICRO sent 3 ms after power-up, but an XT27B
-did not, so the firmware waits the VVDI's 120 ms. The byte after the family name varies; it may be a seed for
+The XT27A never answers XMICRO. The 120 ms wait matters: an XT57B answers an XMICRO sent 3 ms after
+power-up, but an XT27B only answers once it has had the VVDI's 120 ms (confirmed on hardware). An
+XT27B reports itself as `XT37`. The byte after the family name varies; it may be a seed for
 channel-B encryption, as the `7372` reply is for channel A. The channel-B management protocol that
 follows is not decoded.
 
@@ -246,8 +272,12 @@ follows is not decoded.
 ^[Top](#top)
 
 * What the unlock burst encodes, and whether it is a generic "leave emulation" command.
-* Whether ID12, ID13 and other talk-first emulations need the same burst; only ID11 is tested.
-* How much slack the copied timings have (the 109.66 ms offset, 70 ms gap, 30.18 ms settle).
+* Whether ID13 and other talk-first emulations need the same burst. The Proxmark reset is confirmed
+  on ID11; the VVDI frees ID12 with the same burst, at a different time after power-up.
+* How wide the "bit 44" window is. One VVDI burst at bit 47.3 also worked, so it may not be a single
+  narrow slot. Detecting the chip's bit rate from its broadcast would allow computing the position
+  instead of trying a table.
+* How much slack the copied 70 ms gap and 30.18 ms settle have.
 * Detecting the EM broadcast directly would save the ~0.8 s of failed normal handshakes.
 * The channel-B (XT27B / XT57B) management protocol.
 
