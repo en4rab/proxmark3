@@ -596,7 +596,8 @@ static void xh_id13_stream(const uint8_t *uid5, uint8_t out8[8]) {
         for (int half = 0; half < 2; half++) {
             uint8_t nib = half ? (rb[by] & 0x0F) : (rb[by] >> 4);
             uint8_t row[4] = { (uint8_t)((nib >> 3) & 1), (uint8_t)((nib >> 2) & 1),
-                               (uint8_t)((nib >> 1) & 1), (uint8_t)(nib & 1) };
+                               (uint8_t)((nib >> 1) & 1), (uint8_t)(nib & 1)
+                             };
             uint8_t rp = 0;
             for (int k = 0; k < 4; k++) {
                 bits[n++] = row[k];
@@ -698,7 +699,8 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
             // 12-byte stream [crc_hi crc_lo uid(8) 00 00], reversed -> T[12]
             uint8_t st[12] = { (uint8_t)(crc >> 8), (uint8_t)crc,
                                p->uid[0], p->uid[1], p->uid[2], p->uid[3],
-                               p->uid[4], p->uid[5], p->uid[6], p->uid[7], 0, 0 };
+                               p->uid[4], p->uid[5], p->uid[6], p->uid[7], 0, 0
+                             };
             uint8_t t[12];
             for (int i = 0; i < 12; i++) {
                 t[i] = st[11 - i];

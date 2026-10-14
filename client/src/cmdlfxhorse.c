@@ -123,7 +123,7 @@ static const xh_type_t *resolve_type(const char *raw) {
         s += 2;
     }
     for (; *s && n < sizeof(tok) - 1; s++) {
-        tok[n++] = (char)toupper((unsigned char)*s);
+        tok[n++] = (char)toupper((unsigned char) * s);
     }
     tok[n] = '\0';
 
@@ -137,10 +137,14 @@ static const xh_type_t *resolve_type(const char *raw) {
 
 static const char *uidrule_text(xh_uidrule_t r) {
     switch (r) {
-        case UID_REQ8: return "8 bytes";
-        case UID_REQ5: return "5 bytes";
-        case UID_OPT4: return "4 bytes";
-        case UID_NONE: return "none";
+        case UID_REQ8:
+            return "8 bytes";
+        case UID_REQ5:
+            return "5 bytes";
+        case UID_OPT4:
+            return "4 bytes";
+        case UID_NONE:
+            return "none";
     }
     return "none";
 }
@@ -404,7 +408,7 @@ static int CmdLFXhorseConfigure(const char *Cmd) {
         char up[32];
         size_t n = 0;
         for (const char *s = typestr; *s && n < sizeof(up) - 1; s++) {
-            up[n++] = (char)toupper((unsigned char)*s);
+            up[n++] = (char)toupper((unsigned char) * s);
         }
         up[n] = '\0';
         reason = xh_refused(up);
