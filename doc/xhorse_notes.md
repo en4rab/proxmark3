@@ -170,9 +170,18 @@ know the emulated type:
 | 32 T0 units | 155.94 ms | 109.54 ms | 6 ID11 frames = 3 ID13 frames, + 1408 (unit 44.0) | ID11, ID13 |
 | 40 T0 units | 60.30 ms | 13.99 ms | ~1752 (unit 43.8) | ID12 |
 
-The burst turns the EM emulation off; the handshake then works normally. Up to three rounds over the
-table are made. Later sessions in the same run are opened with the same 70.05 ms off / 30.18 ms
-settle. Reset then:
+The burst turns the EM emulation off; for ID11 and ID12 the handshake then works normally. ID13
+behaves differently: after a failed first run it is left half-recovered, its normal handshakes read
+10 bits instead of 0, and it answers a session opened 3 ms after power-up only rarely. Two
+fallbacks, both the VVDI's own timings, cover it:
+
+* if the handshake straight after the burst fails, the firmware powers the chip down for 1.57 s
+  (the VVDI's cold-boot) and tries once more;
+* normal session opens alternate the short 20 ms off / 3 ms power-up with the VVDI's 70.05 ms off /
+  30.18 ms settle.
+
+Up to three rounds over the table are made. Later sessions in the same run always use the 70.05 ms
+off / 30.18 ms settle. Reset then:
 
 1. reads the chip ID (bank 1, pages `0x33`-`0x36`) and ends the session with `ctl 0x3F`;
 2. opens a new session, reads status page `0x3F`, and writes, each with a 13 ms program wait and a
@@ -290,8 +299,8 @@ follows is not decoded.
   earliest success is 1398). One VVDI burst at 1512 T0 (unit 47.3) also worked, so there may be a
   second slot. Detecting the chip's bit rate from its broadcast would allow computing the position
   instead of trying a table.
-* Why a failed first `lf xhorse reset` on ID13 changed the chip's behaviour (the next run's normal
-  handshakes read 10 bits instead of 0) before the next run freed it with its first burst.
+* What the half-recovered ID13 state is (normal handshakes read 10 bits instead of 0 after a failed
+  first run), and whether the cold-boot fallback is really what ID13 needs.
 * How much slack the copied 70 ms gap and 30.18 ms settle have.
 * Detecting the EM broadcast directly would save the ~0.8 s of failed normal handshakes.
 * The channel-B (XT27B / XT57B) management protocol.
