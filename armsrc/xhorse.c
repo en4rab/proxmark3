@@ -99,8 +99,9 @@
 // EM right up to the first burst and is silent from power-up in every window after it, across
 // field-offs of 70 ms, 570 ms and 1.57 s, i.e. the burst turns the emulation off and it stays off
 // across power cycles.  The VVDI wraps the burst in a ~10 s sequence (listen window, XMICRO probes,
-// "1111111" frames, 11 more bursts, long rests, a 1.57 s cold-boot); none of that changed anything
-// observable and it is not replicated.  See doc/xhorse_notes.md.  Values are the VVDI's, in us.
+// "1111111" frames, 11 more bursts, long rests, a 1.57 s cold-boot).  For ID11/ID12 none of that
+// changed anything observable; ID13 appears to need the cold-boot before it answers, so that alone
+// is kept, as a fallback.  See doc/xhorse_notes.md.  Values are the VVDI's, in us.
 //
 // The burst only works if it starts at the right point in the chip's EM frame, which is locked to
 // power-up.  Measured from the field-on edge, every freeing burst starts ~44 "units" into the frame,
@@ -111,6 +112,7 @@
 // much after the commanded time.  We don't know the emulated type, so the entries are tried in turn.
 #define XH_T_EM_OFF_US            70050    // field off before and after the burst window (VVDI)
 #define XH_T_EM_SETTLE_US         30180    // field on this long before XHORSE (VVDI, after the chip is freed)
+#define XH_T_EM_COLDBOOT_US     1570940    // VVDI's power-down before its handshake; fallback when the quick one fails (ID13)
 #define XH_EM_TRIES                   3    // rounds over xh_em_timings[] (each entry: burst + handshake)
 
 // func field (top 2 bits of the op byte)
@@ -398,9 +400,11 @@ static bool xh_4r(xh_sess_t *s, const char *what, int attempt) {
 // its capability read and its writes.
 static int xh_open_session(xh_sess_t *s) {
     for (int attempt = 0; attempt < XH_MAX_ATTEMPTS; attempt++) {
-        if (s->em_mode) {
-            // Chip freed from EM emulation this run: reopen with the same off/settle timing that
-            // worked straight after the burst, rather than the short 20 ms reset + 3 ms power-up.
+        if (s->em_mode || (attempt & 1)) {
+            // The VVDI's timing: off 70 ms, on, XHORSE 30.18 ms later.  Always used once the chip has
+            // been freed from EM emulation this run, and on every other attempt otherwise: an ID13
+            // chip left half-recovered by an earlier run answers a 3 ms power-up only rarely
+            // (rxlen=10) but does answer this one.
             Gpio_SSC_DOUT_High();
             xh_delay_us(XH_T_EM_OFF_US);
             Gpio_SSC_DOUT_Low();
@@ -472,7 +476,8 @@ static const xh_em_timing_t xh_em_timings[] = {
 // Pull a chip stuck broadcasting a non-HITAG2 emulation (ID11/ID12/EM4100) back onto the config
 // channel.  For each candidate timing: power-cycle, burst at burst_at_us after power-up while the
 // chip is broadcasting, finish the window, field off 70 ms, field on, XHORSE handshake 30.18 ms
-// later.  ~0.3-0.5 s per attempt.
+// later; if that fails, a 1.57 s cold-boot and one more handshake.  ~0.3-0.5 s per attempt, or
+// ~2 s with the cold-boot.
 static int xh_open_session_em(xh_sess_t *s) {
     for (int attempt = 0; attempt < XH_EM_TRIES; attempt++) {
         for (size_t t = 0; t < sizeof(xh_em_timings) / sizeof(xh_em_timings[0]); t++) {
@@ -489,15 +494,27 @@ static int xh_open_session_em(xh_sess_t *s) {
             Gpio_SSC_DOUT_Low();                                     // field on
             xh_delay_us(XH_T_EM_SETTLE_US);
 
-            if (xh_handshake(s) == PM3_SUCCESS && xh_4r(s, "EM-recovery", attempt)) {
+            bool cold = false;
+            bool ok = (xh_handshake(s) == PM3_SUCCESS) && xh_4r(s, "EM-recovery", attempt);
+            if (!ok) {
+                // ID13 is freed by the burst but does not answer straight after a 70 ms off; the
+                // VVDI always powers down for 1.57 s before its handshake, so try that once.
+                Gpio_SSC_DOUT_High();
+                xh_delay_us(XH_T_EM_COLDBOOT_US);
+                Gpio_SSC_DOUT_Low();
+                xh_delay_us(XH_T_EM_SETTLE_US);
+                cold = true;
+                ok = (xh_handshake(s) == PM3_SUCCESS) && xh_4r(s, "EM-recovery (cold-boot)", attempt);
+            }
+            if (ok) {
                 if (g_dbglevel >= DBG_EXTENDED) {
-                    Dbprintf("xhorse: chip freed by the %s burst timing", tm->name);
+                    Dbprintf("xhorse: chip freed by the %s burst timing%s", tm->name, cold ? " after a cold-boot" : "");
                 }
                 s->em_mode = true;                                   // later sessions: same off/settle timing
                 return PM3_SUCCESS;
             }
             if (g_dbglevel >= DBG_ERROR) {
-                Dbprintf("xhorse: EM-recovery attempt %d, %s timing: no session after the EM burst", attempt, tm->name);
+                Dbprintf("xhorse: EM-recovery attempt %d, %s timing: no session after the EM burst (or cold-boot)", attempt, tm->name);
             }
         }
     }
