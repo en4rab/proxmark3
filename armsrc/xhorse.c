@@ -28,7 +28,6 @@
 //     page protocol with sel/bank switching.
 //   * the per-emulated-type page recipes (configure).
 //   * recovery of a chip stuck in a talk-first EM emulation (xh_open_session_em).
-//   * the XT136 handshake (E20E/E430, seed constant 0x8C07, no banks), read-only so far.
 //
 // Protocol, timings and how the EM recovery was found: doc/xhorse_notes.md.
 //
@@ -74,27 +73,9 @@
 // back short/empty (rxlen 0 or 15).  The chip opens its XHORSE-listening window right
 // after power-up, so we field-reset (coil off then on) before each attempt to give it
 // a fresh power-up, and retry until we get a full 16-bit 7372 reply.
-#define XH_TRIES_PER_TIMING  3        // session-open attempts per timing (xh_open_session)
+#define XH_MAX_ATTEMPTS      8
 #define XH_T_FIELD_OFF_US    20000    // coil off long enough to reset the chip (VVDI uses 20-60 ms)
 #define XH_T_POWERUP_US      3000     // let the chip power up again before XHORSE
-// A chip set to ID8A ignored every XHORSE we sent 3 ms, 30 ms or 198 ms after power-up, even
-// after a 1.57 s cold-boot.  Before its first XHORSE to such a chip the VVDI keeps the field off
-// 177.1 ms (22135/22136 T0), then sends XHORSE 41.8 ms (5226/5225 T0) after power-up
-// (vvdi-id8A-reset-success.pm3 and -success-2.pm3).
-#define XH_T_ID8A_OFF_US     177100
-#define XH_T_ID8A_ON_US      41800
-// In every round before that, and in the round just before that XHORSE, the VVDI first sends a
-// TI-style command: power-up, 50.04 ms (6255 T0) charge, 100 field gaps ~23 T0 wide, then field off
-// 31.74 ms (3968 T0) after the last gap.  Gap starts are 81 T0 apart for the first two, then 52 T0
-// (S) or 67 T0 (L) as in xh_id8a_probe (identical in both captures).  Replaying it is what lets
-// us reach an ID8A chip, but it also reverts the chip's type byte to 0x36 (info read 0x36 after it
-// while bank 0 still held the ID8A image), so only reset/configure send it (xh_sess_t.allow_probe).
-#define XH_T_ID8A_CHARGE_T0  6255
-#define XH_T_ID8A_GAP_T0     22       // nominal; our gaps sniff ~1 T0 wider than set
-#define XH_T_ID8A_FIRST_T0   81
-#define XH_T_ID8A_TAIL_T0    3968
-static const char xh_id8a_probe[] =
-    "SLLSSSLLSLLLSSLSSSSLLSLLSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSLSLSSSLSLSSL";
 #define XH_T_XMICRO_ID_US    1000     // gap after the XMICRO ACK before the 4-bit identify query
 // XMICRO must not be sent straight after power-up: the VVDI waits 120.14 ms (15018 T0, identical in
 // its XT27B and XT57B read captures, with nothing else on air in between).  The XT57B happens to
@@ -110,7 +91,7 @@ static const char xh_id8a_probe[] =
 // Each READ advances the keystream identically on chip and reader, so retrying is safe.
 #define XH_VERIFY_READS      3
 
-// Recovery for a chip stuck emulating a non-HITAG2 type (e.g. ID11 = EM4100, ID48 = Megamos).  Such a chip
+// Recovery for a chip stuck emulating a non-HITAG2 type (e.g. ID11 = EM4100).  Such a chip
 // continuously broadcasts its fixed code and ignores the XHORSE config channel.
 //
 // What frees it is one reader burst sent a set time after power-up (xh_em_burst:
@@ -120,11 +101,17 @@ static const char xh_id8a_probe[] =
 // across power cycles.  The VVDI wraps the burst in a ~10 s sequence (listen window, XMICRO probes,
 // "1111111" frames, 11 more bursts, long rests, a 1.57 s cold-boot); none of that changed anything
 // observable and it is not replicated.  See doc/xhorse_notes.md.  Values are the VVDI's, in us.
-#define XH_T_EM_ON_US            155940    // field-on window carrying the burst
-#define XH_T_EM_BURST_AT_US      109660    // burst start within that window (chip powered and broadcasting)
-#define XH_T_EM_OFF_US            70050    // field off after it (the VVDI's following off)
+//
+// The burst only works if it starts at the right point in the chip's EM frame, which is locked to
+// power-up.  Measured from the field-on edge, every freeing burst starts ~44 "units" into the frame,
+// where a unit is 32 T0 for ID11 (RF/32) and ID13 (RF/64) and 40 T0 for ID12 (RF/40): ID13 1398,
+// ID11 1409-1423, ID12 1741 T0.  Bursts at ~1427 T0 and later (32-T0 types) fail - the VVDI's own
+// first try often does.  The window is narrow, so the timings below aim at its centre (unit 44.0
+// for 32-T0 types, 43.8 for ID12), commanding 3.5 T0 early because our burst reaches the air that
+// much after the commanded time.  We don't know the emulated type, so the entries are tried in turn.
+#define XH_T_EM_OFF_US            70050    // field off before and after the burst window (VVDI)
 #define XH_T_EM_SETTLE_US         30180    // field on this long before XHORSE (VVDI, after the chip is freed)
-#define XH_EM_TRIES                   3    // burst + handshake attempts
+#define XH_EM_TRIES                   3    // rounds over xh_em_timings[] (each entry: burst + handshake)
 
 // func field (top 2 bits of the op byte)
 #define XH_FUNC_CTL   0
@@ -135,23 +122,7 @@ static const char xh_id8a_probe[] =
 // bank-1 (config/identity) addresses
 #define XH_PG_TYPE    0x3C            // emulated type byte
 #define XH_PG_ID0     0x33            // 16-byte unique chip ID: pages 0x33..0x36
-#define XH_PG_CFG0    0x3D            // config word n (written by ctl 0x30+n) reads back at 0x3D+n
 #define XH_PG_PAD     0x3F
-
-#define XH_SEED_XT27A 0xE12E          // seed = bitrev16(7372 reply) ^ this
-
-// XT136: same LFSR and op,~op commands, different handshake.  After XHORSE it answers E20E with a
-// fixed 32-bit signature and E430 with the 16-bit seed reply; it ignores 072F.  Timings are the
-// VVDI's (vvdi-xt136-*.pm3): field off 130.1 ms, XHORSE 220.3 ms after power-up, E430 ~90 T0 after
-// the signature, and 21.3 ms before the first encrypted command.
-#define XH136_SIG            0x604A027EUL
-#define XH136_SEED           0x8C07
-#define XH136_T_SIG_SEED_T0  90
-#define XH136_T_FIRST_US     21300
-#define XH136_T_OFF_US       130100
-#define XH136_T_ON_US        220300
-#define XH136_TRIES          3        // per timing (VVDI's, then the XT27A's short one)
-#define XH136_PAGES          16       // pages 0x00..0x0F seen; the VVDI never touches higher ones
 
 //-----------------------------------------------------------------------------
 // Keystream engine (incremental; frames are always 16/32 bits so pos stays a
@@ -180,8 +151,8 @@ static uint16_t xh_rev16(uint16_t x) {
     return r;
 }
 
-static void xh_ks_init(xh_ks_t *k, uint16_t reply, uint16_t seed_const) {
-    k->seed = xh_rev16(reply) ^ seed_const;
+static void xh_ks_init(xh_ks_t *k, uint16_t reply) {
+    k->seed = xh_rev16(reply) ^ 0xE12E;
     k->win = 0;
     k->pos = 0;
 }
@@ -218,8 +189,6 @@ typedef struct {
     bool    led;
     int8_t  cur_bank;   // last sel'd bank, or -1
     bool    em_mode;    // freed from EM emulation this run: later sessions reopen with the EM off/settle timing
-    bool    allow_probe; // may send the ID8A probe, which reverts the type byte (reset/configure only)
-    uint8_t family;      // xhorse_family_t of the open session
 } xh_sess_t;
 
 static uint32_t xh_bits_to_u32(const uint8_t *rx, int nbits) {
@@ -257,13 +226,13 @@ static void xh_send_clear(const uint8_t *frame, size_t nbits, bool led) {
 }
 
 // Send a cleartext reader frame and receive the tag reply (no keystream).
-// t_wait is T0 since the last tag edge; 0 when the caller has already spaced this frame with xh_delay_us().
+// t_wait == 0 because the caller has already spaced this frame with xh_delay_us().
 // Returns the number of reply bits demodulated.
 static size_t xh_xfer_clear(xh_sess_t *s, const uint8_t *frame, size_t nbits,
-                            uint8_t *rx, size_t rxsz, int t_wait) {
+                            uint8_t *rx, size_t rxsz) {
     size_t rxlen = 0;
     memset(rx, 0, rxsz);
-    hitag_reader_transfer(frame, nbits, rx, rxsz, &rxlen, t_wait, s->led, XH_MOD, XH_SOF_BITS, XH_SEND_SOF);
+    hitag_reader_transfer(frame, nbits, rx, rxsz, &rxlen, 0, s->led, XH_MOD, XH_SOF_BITS, XH_SEND_SOF);
     return rxlen;
 }
 
@@ -288,56 +257,22 @@ static int xh_cmd_reply(xh_sess_t *s, uint16_t pt_cmd, int reply_bits, uint32_t 
     return (rxlen >= (size_t)reply_bits) ? PM3_SUCCESS : PM3_EFAILED;
 }
 
-// sel a bank (0 = emulated-tag EEPROM, 1 = config/identity).  The tag echoes the sel op.
-// A missing or wrong echo is re-sent: if the chip did act on the first sel, sending it again
-// is harmless and keeps both keystreams in step.  If no echo matches, the selected bank is
-// unknown, so the caller must not write.
+// sel a bank (0 = emulated-tag EEPROM, 1 = config/identity).  The tag echoes it.
 static int xh_sel(xh_sess_t *s, uint8_t bank) {
-    const uint16_t op = xh_op(XH_FUNC_SEL, bank);
-    for (int i = 0; i < XH_VERIFY_READS; i++) {
-        uint32_t echo = 0;
-        if ((xh_cmd_reply(s, op, 16, &echo) == PM3_SUCCESS) && ((uint16_t)echo == op)) {
-            s->cur_bank = (int8_t)bank;
-            return PM3_SUCCESS;
-        }
-    }
-    if (g_dbglevel >= DBG_ERROR) {
-        Dbprintf("xhorse: sel bank %u not echoed", bank);
-    }
-    s->cur_bank = -1;
-    return PM3_EFAILED;
+    int res = xh_cmd_reply(s, xh_op(XH_FUNC_SEL, bank), 16, NULL);
+    s->cur_bank = (int8_t)bank;
+    return res;
 }
 
-static int xh_bank(xh_sess_t *s, uint8_t bank) {
-    if (s->cur_bank == (int8_t)bank) {
-        return PM3_SUCCESS;
+static void xh_bank(xh_sess_t *s, uint8_t bank) {
+    if (s->cur_bank != (int8_t)bank) {
+        xh_sel(s, bank);
     }
-    return xh_sel(s, bank);
 }
 
 // READ a page in the current bank; tag answers with 32-bit data.
 static int xh_read(xh_sess_t *s, uint8_t page, uint32_t *val) {
     return xh_cmd_reply(s, xh_op(XH_FUNC_READ, page), 32, val);
-}
-
-// READ a page until two answered reads in a row agree.  A weak reply can decode to a wrong value
-// with nothing to show for it (a type byte of 0x37 once read as 0xC8), so one read is not trusted.
-// Returns false, with the last value read, if no two consecutive reads agree.
-static bool xh_read_agreed(xh_sess_t *s, uint8_t page, uint32_t *val) {
-    uint32_t prev = 0;
-    bool prev_ok = (xh_read(s, page, &prev) == PM3_SUCCESS);
-    for (int i = 0; i < XH_VERIFY_READS; i++) {
-        uint32_t cur = 0;
-        bool cur_ok = (xh_read(s, page, &cur) == PM3_SUCCESS);
-        if (prev_ok && cur_ok && (cur == prev)) {
-            *val = cur;
-            return true;
-        }
-        prev = cur;
-        prev_ok = cur_ok;
-    }
-    *val = prev;
-    return false;
 }
 
 // WRITE a page in the current bank: command (+echo), then the 32-bit data frame
@@ -361,46 +296,10 @@ static int xh_write(xh_sess_t *s, uint8_t page, uint32_t data, bool verify) {
             ok = (rb == data);
         }
         if (!ok) {
-            if (g_dbglevel >= DBG_ERROR) {
-                Dbprintf("xhorse: verify failed, bank %d page 0x%02X", s->cur_bank, page);
-            }
             return PM3_EFAILED;
         }
     }
     return PM3_SUCCESS;
-}
-
-// ctl with a data frame, shaped like a WRITE: command (+echo, which is ~op,op rather than a copy),
-// then 32-bit data, then the program wait.  The VVDI ends an ID8A set with ctl 0x30 carrying the
-// value it has just read from bank-1 page 0x3D.
-static void xh_ctl_data(xh_sess_t *s, uint8_t page, uint32_t data) {
-    xh_cmd_reply(s, xh_op(XH_FUNC_CTL, page), 16, NULL);
-
-    uint32_t ct = data ^ xh_ks_next32(&s->ks);
-    uint8_t tx[4] = { (uint8_t)(ct >> 24), (uint8_t)(ct >> 16), (uint8_t)(ct >> 8), (uint8_t)ct };
-    hitag_reader_send_frame(tx, 32, s->led, XH_SEND_SOF);
-    xh_delay_us(XH_T_PROG_US);
-}
-
-// Write config word n: ctl 0x30+n with data, which reads back at bank-1 0x3D+n (doc/xhorse_notes.md).
-// Bank 1 must be selected; unlike a bare ctl this does not clear the selection (the VVDI reads
-// straight back).
-static int xh_cfg_write(xh_sess_t *s, uint8_t n, uint32_t data, bool verify) {
-    xh_ctl_data(s, (uint8_t)(0x30 + n), data);
-    if (verify == false) {
-        return PM3_SUCCESS;
-    }
-    for (int i = 0; i < XH_VERIFY_READS; i++) {
-        uint32_t rb = 0;
-        xh_read(s, (uint8_t)(XH_PG_CFG0 + n), &rb);
-        if (rb == data) {
-            return PM3_SUCCESS;
-        }
-    }
-    if (g_dbglevel >= DBG_ERROR) {
-        Dbprintf("xhorse: verify failed, config word %u", n);
-    }
-    return PM3_EFAILED;
 }
 
 // ctl frame (no tag reply): advances the keystream by the 16-bit command only.
@@ -438,9 +337,9 @@ static int xh_handshake(xh_sess_t *s) {
     xh_send_clear(q072f, 16, s->led);
     xh_delay_us(XH_T_072F_7372_US);
 
-    rxlen = xh_xfer_clear(s, q7372, 16, rx, sizeof(rx), 0);               // -> per-session seed reply
+    rxlen = xh_xfer_clear(s, q7372, 16, rx, sizeof(rx));                  // -> per-session seed reply
     if (rxlen < 16) {
-        if (g_dbglevel >= DBG_DEBUG) {
+        if (g_dbglevel >= DBG_ERROR) {
             Dbprintf("xhorse: no 7372 reply (rxlen=%u)", (unsigned)rxlen);
         }
         return PM3_EFAILED;
@@ -448,53 +347,10 @@ static int xh_handshake(xh_sess_t *s) {
 
     uint16_t reply = (uint16_t)((rx[0] << 8) | rx[1]);
     if (g_dbglevel >= DBG_EXTENDED) {
-        Dbprintf("xhorse: 7372 reply=%04x  seed=%04x", reply, xh_rev16(reply) ^ XH_SEED_XT27A);
+        Dbprintf("xhorse: 7372 reply=%04x  seed=%04x", reply, xh_rev16(reply) ^ 0xE12E);
     }
-    xh_ks_init(&s->ks, reply, XH_SEED_XT27A);
+    xh_ks_init(&s->ks, reply);
     s->cur_bank = -1;
-    s->family = XHORSE_FAM_XT27A;
-    return PM3_SUCCESS;
-}
-
-// XT136 handshake: XHORSE -> E20E -> 32-bit family signature, E430 -> 16-bit seed reply.  E20E goes
-// where the XT27A's 072F does; E430 follows the signature the way the VVDI sends it.  There is no 4R
-// check (the XT136 has no fixed first command), so the exact signature is what proves the session.
-static int xh_handshake_xt136(xh_sess_t *s) {
-    static const uint8_t magic[6] = { 'X', 'H', 'O', 'R', 'S', 'E' };
-    static const uint8_t qe20e[2] = { 0xE2, 0x0E };
-    static const uint8_t qe430[2] = { 0xE4, 0x30 };
-
-    uint8_t rx[32];
-    size_t rxlen;
-
-    xh_send_clear(magic, 48, s->led);
-    xh_delay_us(XH_T_XHORSE_072F_US);
-
-    rxlen = xh_xfer_clear(s, qe20e, 16, rx, sizeof(rx), 0);
-    uint32_t sig = xh_bits_to_u32(rx, 32);
-    if ((rxlen < 32) || (sig != XH136_SIG)) {
-        if (g_dbglevel >= DBG_DEBUG) {
-            Dbprintf("xhorse: no XT136 signature (rxlen=%u, %08x)", (unsigned)rxlen, sig);
-        }
-        return PM3_EFAILED;
-    }
-
-    rxlen = xh_xfer_clear(s, qe430, 16, rx, sizeof(rx), XH136_T_SIG_SEED_T0);
-    if (rxlen < 16) {
-        if (g_dbglevel >= DBG_DEBUG) {
-            Dbprintf("xhorse: no E430 reply (rxlen=%u)", (unsigned)rxlen);
-        }
-        return PM3_EFAILED;
-    }
-
-    uint16_t reply = (uint16_t)((rx[0] << 8) | rx[1]);
-    if (g_dbglevel >= DBG_EXTENDED) {
-        Dbprintf("xhorse: E430 reply=%04x  seed=%04x", reply, xh_rev16(reply) ^ XH136_SEED);
-    }
-    xh_ks_init(&s->ks, reply, XH136_SEED);
-    s->cur_bank = -1;
-    s->family = XHORSE_FAM_XT136;
-    xh_delay_us(XH136_T_FIRST_US);
     return PM3_SUCCESS;
 }
 
@@ -527,8 +383,8 @@ static bool xh_4r(xh_sess_t *s, const char *what, int attempt) {
     uint32_t echo = 0;
     int res = xh_cmd_reply(s, sel1, 16, &echo);
     s->cur_bank = 1;
-    if (g_dbglevel >= DBG_EXTENDED) {
-        bool echo_ok = (((echo >> 8) ^ (echo & 0xFF)) == 0xFF) && ((echo >> 14) == 1);
+    bool ok = (res == PM3_SUCCESS) && ((uint16_t)echo == sel1);
+    if (g_dbglevel >= (ok ? DBG_EXTENDED : DBG_ERROR)) {
         Dbprintf("xhorse: %s attempt %d  4R echo=%04x %s", what, attempt, (uint16_t)echo,
                  ok ? "(sel ok)" : "(bad - not a real session, retrying)");
     }
@@ -541,51 +397,14 @@ static bool xh_4r(xh_sess_t *s, const char *what, int attempt) {
 // more commands after a `ctl` must open a new session here first, as the VVDI does between
 // its capability read and its writes.
 static int xh_open_session(xh_sess_t *s) {
-    const int timings = s->allow_probe ? 4 : 3;
-    for (int attempt = 0; attempt < timings * XH_TRIES_PER_TIMING; attempt++) {
-        int mode = s->em_mode ? 1 : (attempt % timings);
-        if (g_dbglevel >= DBG_EXTENDED) {
-            Dbprintf("xhorse: session attempt %d, timing %d", attempt, mode);
-        }
-        if (mode == 3) {
-            // The VVDI's whole last round before its first XHORSE to a chip set to ID8A: the TI-style
-            // probe, then the long off and XHORSE 41.8 ms after power-up (see XH_T_ID8A_CHARGE_T0).
-            xh_field_reset();
-            xh_delay_us(XH_T_ID8A_CHARGE_T0 * 8 - XH_T_POWERUP_US);
-            const size_t n = sizeof(xh_id8a_probe) - 1;     // 98 S/L intervals -> 100 gaps
-            for (size_t i = 0; i < n + 2; i++) {
-                uint32_t next;                               // gap start to next gap start (T0)
-                if (i == 0) {
-                    next = XH_T_ID8A_FIRST_T0;
-                } else if (i <= n) {
-                    next = (xh_id8a_probe[i - 1] == 'L') ? 67 : 52;
-                } else {
-                    next = XH_T_ID8A_TAIL_T0;                // last gap -> field off
-                }
-                Gpio_SSC_DOUT_High();
-                xh_delay_us(XH_T_ID8A_GAP_T0 * 8);
-                Gpio_SSC_DOUT_Low();
-                xh_delay_us((next - XH_T_ID8A_GAP_T0) * 8);
-            }
-            Gpio_SSC_DOUT_High();
-            xh_delay_us(XH_T_ID8A_OFF_US);
-            Gpio_SSC_DOUT_Low();
-            xh_delay_us(XH_T_ID8A_ON_US);
-        } else if (mode == 1) {
-            // The VVDI's timing: off 70 ms, on, XHORSE 30.18 ms later.  Always used once the chip has
-            // been freed from EM emulation this run, and in the timing rotation otherwise: an ID13
-            // chip left half-recovered by an earlier run answers a 3 ms power-up only rarely
-            // (rxlen=10) but does answer this one.
+    for (int attempt = 0; attempt < XH_MAX_ATTEMPTS; attempt++) {
+        if (s->em_mode) {
+            // Chip freed from EM emulation this run: reopen with the same off/settle timing that
+            // worked straight after the burst, rather than the short 20 ms reset + 3 ms power-up.
             Gpio_SSC_DOUT_High();
             xh_delay_us(XH_T_EM_OFF_US);
             Gpio_SSC_DOUT_Low();
             xh_delay_us(XH_T_EM_SETTLE_US);
-        } else if (mode == 2) {
-            // The VVDI's timing for a chip set to ID8A (see XH_T_ID8A_OFF_US).
-            Gpio_SSC_DOUT_High();
-            xh_delay_us(XH_T_ID8A_OFF_US);
-            Gpio_SSC_DOUT_Low();
-            xh_delay_us(XH_T_ID8A_ON_US);
         } else {
             xh_field_reset();
         }
@@ -593,13 +412,15 @@ static int xh_open_session(xh_sess_t *s) {
         if (xh_handshake(s) != PM3_SUCCESS) {
             continue;                // no/partial 7372 reply - re-power and retry
         }
-        xh_4r(s, "session", attempt);
+        if (xh_4r(s, "session", attempt) == false) {
+            continue;                // handshake was not a real session - re-power and retry
+        }
         return PM3_SUCCESS;
     }
     return PM3_EFAILED;
 }
 
-// The VVDI's EM unlock burst, sent 109.66 ms into a field-on window.  43 field-off pulses; start
+// The VVDI's EM unlock burst, sent at a set time after power-up (xh_em_timings).  43 field-off pulses; start
 // offsets are T0 from the start of the first pulse, averaged over 22 occurrences in two VVDI
 // reset captures (they agree to within 0.75 T0); widths are how long the field is held off, i.e.
 // the measured width minus the 2 T0 the sniffer adds (our 8 T0 BPLM gap measures 10, as does the
@@ -614,71 +435,70 @@ static const uint8_t xh_emb_width[43] = {
     20, 16, 15, 19, 16, 19, 15, 15, 19, 19, 15, 19, 19, 16, 15, 19, 19, 19, 16, 19, 16, 15, 15, 15,
     19, 19, 16, 15, 19, 16, 15, 19, 19, 19, 16, 19, 16, 19, 16, 15, 19, 19, 16
 };
+#define XH_EMB_N        (sizeof(xh_emb_start) / sizeof(xh_emb_start[0]))
+// burst length in us: start of the last pulse + its width (1994 T0 = 15.95 ms)
+#define XH_EMB_LEN_US   (((uint32_t)xh_emb_start[XH_EMB_N - 1] + xh_emb_width[XH_EMB_N - 1]) * 8)
 
-// The VVDI's ID48 (Megamos) unlock burst: a different 47-pulse sequence on the same ~32 T0 grid,
-// sent 1622 T0 after power-up.  Measured the same way as the EM burst, averaged over the three
-// occurrences in one VVDI capture (they agree to within 2 T0).  The VVDI first sends twice a 48-pulse
-// variant with an extra pulse at +69 T0, each followed by XMICRO probes (channel B), which did not
-// free an XT27A; this 47-pulse one, followed by XHORSE, did.  See doc/xhorse_notes.md.
-static const uint16_t xh_id48b_start[47] = {
-    0, 35, 131, 167, 200, 262, 298, 332, 394, 459, 525, 590, 626, 689, 725, 787, 823, 857, 890, 923,
-    985, 1050, 1116, 1152, 1247, 1313, 1348, 1382, 1444, 1510, 1575, 1673, 1709, 1742, 1776, 1838,
-    1903, 1969, 2004, 2038, 2071, 2165, 2202, 2264, 2300, 2333, 2428
-};
-static const uint8_t xh_id48b_width[47] = {
-    19, 17, 19, 16, 16, 20, 17, 16, 19, 19, 20, 20, 17, 20, 16, 20, 17, 16, 16, 16, 19, 20, 19, 16,
-    19, 19, 16, 16, 19, 20, 19, 19, 16, 16, 15, 20, 19, 20, 17, 16, 16, 20, 16, 19, 16, 16, 19
-};
-
-typedef struct {
-    const uint16_t *start;      // T0 from the start of the first pulse
-    const uint8_t  *width;      // T0 the field is held off
-    size_t          n;
-} xh_burst_t;
-
-static const xh_burst_t xh_burst_em   = { xh_emb_start,   xh_emb_width,   sizeof(xh_emb_start) / sizeof(xh_emb_start[0]) };
-static const xh_burst_t xh_burst_id48 = { xh_id48b_start, xh_id48b_width, sizeof(xh_id48b_start) / sizeof(xh_id48b_start[0]) };
-
-// burst length in us: start of the last pulse + its width (EM 1994 T0 = 15.95 ms, ID48 2447 T0 = 19.6 ms)
-static uint32_t xh_burst_len_us(const xh_burst_t *b) {
-    return ((uint32_t)b->start[b->n - 1] + b->width[b->n - 1]) * 8;
-}
-
-// Emit a burst with the field on.  One precision-counter reference covers it (2447 T0 = 29364
+// Emit the burst with the field on.  One precision-counter reference covers it (1994 T0 = 23928
 // ticks < 65536), so pulse positions don't accumulate per-pulse error.
-static void xh_em_burst(const xh_burst_t *b) {
+static void xh_em_burst(void) {
     const uint16_t ref = GetPrecisionCounterRaw();
-    for (size_t i = 0; i < b->n; i++) {
-        while (GetPrecisionCounterDelta(ref) < (uint16_t)(T0 * b->start[i])) {};
+    for (size_t i = 0; i < XH_EMB_N; i++) {
+        while (GetPrecisionCounterDelta(ref) < (uint16_t)(T0 * xh_emb_start[i])) {};
         Gpio_SSC_DOUT_High();                                        // field off
-        while (GetPrecisionCounterDelta(ref) < (uint16_t)(T0 * (b->start[i] + b->width[i]))) {};
+        while (GetPrecisionCounterDelta(ref) < (uint16_t)(T0 * (xh_emb_start[i] + xh_emb_width[i]))) {};
         Gpio_SSC_DOUT_Low();                                         // field on
     }
 }
 
-// Pull a chip stuck broadcasting a non-HITAG2 emulation (ID11/EM4100 etc) back onto the config
-// channel: power-cycle, burst at +109.66 ms after power-up while the chip is broadcasting, finish
-// the window, field off 70 ms, field on, XHORSE handshake 30.18 ms later.  ~0.5 s per attempt.
+// Burst positions per frame-unit size (see XH_T_EM_OFF_US).  Each is a field-on window of on_us
+// with the burst commanded burst_at_us after power-up.
+typedef struct {
+    const char *name;
+    uint32_t    on_us;
+    uint32_t    burst_at_us;
+} xh_em_timing_t;
+
+static const xh_em_timing_t xh_em_timings[] = {
+    // 13692.5 T0 commanded -> ~13696 on air = 6 ID11 frames (= 3 ID13 frames) + 1408 T0 (unit 44.0).
+    // Covers ID11 and ID13.  (The earlier 109.66 ms landed at 1423, the late edge: ID11 passed but
+    // ID13 failed often.)
+    { "ID11/ID13 (32 T0 units)", 155940, 109540 },
+    // 1748.75 T0 commanded -> ~1752 on air = unit 43.8 of ID12's 40 T0 units.  (13.93 ms, the VVDI's
+    // value, freed an ID12 at 1741-1745; this is moved slightly towards the centre.)
+    { "ID12 (40 T0 units)",       60300,  13990 },
+};
+
+// Pull a chip stuck broadcasting a non-HITAG2 emulation (ID11/ID12/EM4100) back onto the config
+// channel.  For each candidate timing: power-cycle, burst at burst_at_us after power-up while the
+// chip is broadcasting, finish the window, field off 70 ms, field on, XHORSE handshake 30.18 ms
+// later.  ~0.3-0.5 s per attempt.
 static int xh_open_session_em(xh_sess_t *s) {
     for (int attempt = 0; attempt < XH_EM_TRIES; attempt++) {
-        Gpio_SSC_DOUT_High();                                        // off: the burst is timed from a fresh power-up
-        xh_delay_us(XH_T_EM_OFF_US);
-        Gpio_SSC_DOUT_Low();                                         // field on: chip boots, broadcasts EM
-        xh_delay_us(XH_T_EM_BURST_AT_US);
-        xh_em_burst();
-        xh_delay_us(XH_T_EM_ON_US - XH_T_EM_BURST_AT_US - XH_EMB_LEN_US);
-        Gpio_SSC_DOUT_High();                                        // field off
-        xh_delay_us(XH_T_EM_OFF_US);
-        Gpio_SSC_DOUT_Low();                                         // field on
-        xh_delay_us(XH_T_EM_SETTLE_US);
+        for (size_t t = 0; t < sizeof(xh_em_timings) / sizeof(xh_em_timings[0]); t++) {
+            const xh_em_timing_t *tm = &xh_em_timings[t];
 
-        if (xh_handshake(s) == PM3_SUCCESS) {
-            xh_4r(s, "EM-recovery", attempt);
-            s->em_mode = true;                                       // later sessions: same off/settle timing
-            return PM3_SUCCESS;
-        }
-        if (g_dbglevel >= DBG_ERROR) {
-            Dbprintf("xhorse: EM-recovery attempt %d: no handshake after the EM burst", attempt);
+            Gpio_SSC_DOUT_High();                                    // off: the burst is timed from a fresh power-up
+            xh_delay_us(XH_T_EM_OFF_US);
+            Gpio_SSC_DOUT_Low();                                     // field on: chip boots, broadcasts EM
+            xh_delay_us(tm->burst_at_us);
+            xh_em_burst();
+            xh_delay_us(tm->on_us - tm->burst_at_us - XH_EMB_LEN_US);
+            Gpio_SSC_DOUT_High();                                    // field off
+            xh_delay_us(XH_T_EM_OFF_US);
+            Gpio_SSC_DOUT_Low();                                     // field on
+            xh_delay_us(XH_T_EM_SETTLE_US);
+
+            if (xh_handshake(s) == PM3_SUCCESS && xh_4r(s, "EM-recovery", attempt)) {
+                if (g_dbglevel >= DBG_EXTENDED) {
+                    Dbprintf("xhorse: chip freed by the %s burst timing", tm->name);
+                }
+                s->em_mode = true;                                   // later sessions: same off/settle timing
+                return PM3_SUCCESS;
+            }
+            if (g_dbglevel >= DBG_ERROR) {
+                Dbprintf("xhorse: EM-recovery attempt %d, %s timing: no session after the EM burst", attempt, tm->name);
+            }
         }
     }
     return PM3_EFAILED;
@@ -686,17 +506,11 @@ static int xh_open_session_em(xh_sess_t *s) {
 
 // Open a session, trying the normal XHORSE handshake first and falling back to the EM burst
 // for a chip stuck emulating a non-HITAG2 type (ID11/EM4100 etc).
-// Returns PM3_ENOTIMPL, with the session closed, for an XT136: it has no write recipes yet, and the
-// EM bursts are only known to be safe on an XT27A.
 static int xh_open_any(xh_sess_t *s) {
     if (xh_open_session(s) == PM3_SUCCESS) {
         return PM3_SUCCESS;
     }
-    if (xh_open_session_xt136(s) == PM3_SUCCESS) {
-        xh_ctl(s, XH_PG_PAD);
-        return PM3_ENOTIMPL;
-    }
-    if (g_dbglevel >= DBG_INFO) {
+    if (g_dbglevel >= DBG_ERROR) {
         Dbprintf("xhorse: no XHORSE session; sending EM-recovery burst (chip stuck in non-HITAG2 emulation?)");
     }
     return xh_open_session_em(s);
@@ -710,7 +524,6 @@ static int xh_begin(xh_sess_t *s, bool ledcontrol) {
 // Like xh_begin, but also handles a chip stuck in a non-HITAG2 emulation (reset/configure).
 static int xh_begin_any(xh_sess_t *s, bool ledcontrol) {
     xh_setup(s, ledcontrol);
-    s->allow_probe = true;      // the chip is about to be rewritten anyway
     return xh_open_any(s);
 }
 
@@ -814,28 +627,25 @@ static void xh_id13_stream(const uint8_t *uid5, uint8_t out8[8]) {
 }
 
 //-----------------------------------------------------------------------------
-// Per-type page recipes.  Each returns PM3_SUCCESS, or PM3_EFAILED at the first failed sel or verify.
+// Per-type page recipes.  Each returns PM3_SUCCESS or the first verify failure.
 //-----------------------------------------------------------------------------
-// Stop at the first failure: after a missed sel or frame, the chip's bank or keystream may no
-// longer match ours, and writing on would put data in the wrong place.
-#define XH_WR(pg, val) do { if (xh_write(s, (pg), (val), verify) != PM3_SUCCESS) return PM3_EFAILED; } while (0)
-#define XH_BANK(b) do { if (xh_bank(s, (b)) != PM3_SUCCESS) return PM3_EFAILED; } while (0)
-#define XH_CFG(n, val) do { if (xh_cfg_write(s, (n), (val), verify) != PM3_SUCCESS) return PM3_EFAILED; } while (0)
+#define XH_WR(pg, val) do { if (xh_write(s, (pg), (val), verify) != PM3_SUCCESS) ok = PM3_EFAILED; } while (0)
 
 static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
     bool verify = p->verify;
+    int ok = PM3_SUCCESS;
     uint32_t uid32 = (p->uidlen >= 4) ? xh_be32(p->uid) : 0;
 
-    // Type byte first (bank 1), as every decoded type except ID8A does (its recipe writes it last).
+    // Type byte first (bank 1), as every decoded type except ID8A does.
     if (p->has_type) {
-        XH_BANK(1);
+        xh_bank(s, 1);
         XH_WR(XH_PG_TYPE, p->typeword ? 0x0080008CUL : (uint32_t)p->typebyte);
     }
 
     switch ((xhorse_recipe_t)p->recipe) {
 
         case XHORSE_R_HITAG2:       // ID46/7936/7937/7946
-            XH_BANK(0);
+            xh_bank(s, 0);
             XH_WR(0x00, uid32);
             XH_WR(0x01, 0x4D494B52);   // "MIKR"
             XH_WR(0x02, 0x00004F4E);   // "..ON"
@@ -843,44 +653,28 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
             break;
 
         case XHORSE_R_7935:         // PCF7935: full bank-0 wipe, 0x1F = 0x07
-            XH_BANK(0);
+            xh_bank(s, 0);
             for (uint8_t pg = 0x00; pg <= 0x3F; pg++) {
                 XH_WR(pg, (pg == 0x1F) ? 0x00000007UL : 0x00000000UL);
-            }
-            // Then clear bank-1 0x00..0x0F and set config words 1 and 0, as in both complete VVDI
-            // captures (set2-id7935, 013_set_7935); set-id7935 was cut off before this point.
-            XH_BANK(1);
-            for (uint8_t pg = 0x00; pg <= 0x0F; pg++) {
-                XH_WR(pg, 0x00000000UL);
-            }
-            XH_CFG(1, 0xF370CA18);   // 0x0370CA18 on another chip; where the top nibble comes from is unknown
-            {
-                uint32_t v3d = 0;
-                if (xh_read_agreed(s, XH_PG_CFG0, &v3d) == false) {
-                    return PM3_EFAILED;
-                }
-                XH_CFG(0, v3d | 0x200);   // captures: 0x409 -> 0x609, 0x0002021F kept
             }
             break;
 
         case XHORSE_R_7938:         // ID47: distinct 5-page image + clear bank-1 0x38..0x3B
-            XH_BANK(0);
+            xh_bank(s, 0);
             XH_WR(0x00, uid32);
-            XH_WR(0x01, 0x11112222); // Key 1
-            XH_WR(0x02, 0x33334444); // Key 2
-            XH_WR(0x03, 0x55556666); // Key 3
-            XH_WR(0x04, 0x00FFFFFF); // Config
-            XH_BANK(1);
+            XH_WR(0x01, 0x11112222);
+            XH_WR(0x02, 0x33334444);
+            XH_WR(0x03, 0x55556666);
+            XH_WR(0x04, 0x00FFFFFF);
+            xh_bank(s, 1);
             for (uint8_t pg = 0x38; pg <= 0x3B; pg++) {
                 XH_WR(pg, 0x00000000UL);
             }
             break;
 
-        case XHORSE_R_7939:         // ID49: UID at bank-0 0x00, rest in bank 1
-            XH_BANK(0);
-            XH_WR(0x00, uid32);
-            XH_BANK(1);
-            XH_WR(0x00, 0xF7F8251D);  // The Xhorse app seem to write a random value here
+        case XHORSE_R_7939:         // ID49: config-bank-only
+            xh_bank(s, 1);
+            XH_WR(0x00, 0xF7F8251D);
             for (uint8_t pg = 0x01; pg <= 0x07; pg++) {
                 XH_WR(pg, 0x00000000UL);
             }
@@ -890,10 +684,8 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
             break;
 
         case XHORSE_R_ID48: {       // Megamos: 16-word bank-0 image
-            // The UID is held 16 bits per page, low half first: UID 78B8D707 is
-            // 0x02 = 0x0000D707, 0x03 = 0x000078B8.
-            const uint32_t img[4] = { 0x00005678, 0x0000A1BF, uid32 & 0xFFFF, uid32 >> 16 };
-            XH_BANK(0);
+            static const uint32_t img[4] = { 0x00005678, 0x0000A1BF, 0x0000D707, 0x000078B8 };
+            xh_bank(s, 0);
             for (uint8_t pg = 0x00; pg <= 0x03; pg++) {
                 XH_WR(pg, img[pg]);
             }
@@ -918,7 +710,7 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
             for (int i = 0; i < 12; i++) {
                 t[i] = st[11 - i];
             }
-            XH_BANK(0);
+            xh_bank(s, 0);
             XH_WR(0x26, xh_be32(&t[0]));
             XH_WR(0x25, xh_be32(&t[4]));
             XH_WR(0x24, xh_be32(&t[8]));
@@ -930,7 +722,7 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
             uint16_t pages[5];
             uint16_t hdr = (p->recipe == XHORSE_R_ID11) ? 0x0010 : 0x0014;
             xh_pack_em8(p->uid, hdr, pages);
-            XH_BANK(0);
+            xh_bank(s, 0);
             XH_WR(0x02, pages[0x02]);
             XH_WR(0x01, pages[0x01]);
             XH_WR(0x04, pages[0x04]);
@@ -942,7 +734,7 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
         case XHORSE_R_ID13: {       // EM4102 + bitrev; type word already written
             uint8_t s8[8];
             xh_id13_stream(p->uid, s8);
-            XH_BANK(0);
+            xh_bank(s, 0);
             XH_WR(0x02, (uint32_t)((s8[0] << 8) | s8[1]));
             XH_WR(0x01, (uint32_t)((s8[2] << 8) | s8[3]));
             XH_WR(0x04, (uint32_t)((s8[4] << 8) | s8[5]));
@@ -952,7 +744,7 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
         }
 
         case XHORSE_R_TEMPLATE:     // ID4D / 4D80 / ID4E - config-template family
-            XH_BANK(0);
+            xh_bank(s, 0);
             for (uint8_t pg = 0x00; pg <= 0x1E; pg++) {   // 0x1F deliberately skipped
                 XH_WR(pg, 0x00000000UL);
             }
@@ -963,15 +755,15 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
             for (uint8_t pg = 0x24; pg <= 0x28; pg++) {
                 XH_WR(pg, 0x00000000UL);
             }
-            XH_BANK(1);
+            xh_bank(s, 1);
             XH_WR(0x13, 0x00004600);
             break;
 
-        case XHORSE_R_ID8A: {       // full image, type byte last; UID at 0x04/0x05
+        case XHORSE_R_ID8A: {       // full image, NO type byte; UID at 0x04/0x05
             // 0x04 = uid[1]<<8 | uid[0] ; 0x05 = uid[3]<<8 | uid[2]  (byte-swapped halves)
             uint32_t p04 = ((uint32_t)p->uid[1] << 8) | p->uid[0];
             uint32_t p05 = ((uint32_t)p->uid[3] << 8) | p->uid[2];
-            XH_BANK(0);
+            xh_bank(s, 0);
             XH_WR(0x00, 0x8A0AD459);
             XH_WR(0x01, 0x75020AE0);
             XH_WR(0x02, 0xA03448A3);
@@ -990,22 +782,9 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
             for (uint8_t pg = 0x20; pg <= 0x3F; pg++) {
                 XH_WR(pg, 0x00000000UL);
             }
-            XH_BANK(1);
-            for (uint8_t pg = 0x00; pg <= 0x1C; pg++) {
+            xh_bank(s, 1);
+            for (uint8_t pg = 0x00; pg <= 0x11; pg++) {
                 XH_WR(pg, 0x00000000UL);
-            }
-            XH_WR(XH_PG_TYPE, 0x0000008A);
-            // VVDI's closing step (vvdi-id8A-set-success.pm3): re-sel bank 1, read 0x3D
-            // (0x0002021F), send it back with ctl 0x30, read 0x3D again.  ctl 0x30 writes config
-            // word 0 (xh_cfg_write); why the VVDI rewrites the same value is unknown.
-            {
-                uint32_t v3d = 0;
-                if (xh_sel(s, 1) != PM3_SUCCESS) {
-                    return PM3_EFAILED;
-                }
-                xh_read(s, 0x3D, &v3d);
-                xh_ctl_data(s, 0x30, v3d);
-                xh_read(s, 0x3D, &v3d);
             }
             break;
         }
@@ -1014,22 +793,23 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
             // NOTE: the secondary emulation block at bank-0 0x00..0x04 is UID-high-half
             // dependent and not yet reversed.  We write only the
             // authoritative UID store; a reader may need that block for full emulation.
-            XH_BANK(0);
+            xh_bank(s, 0);
             XH_WR(0x0A, (uint32_t)((p->uid[2] << 8) | p->uid[3]));   // low half
             XH_WR(0x0B, (uint32_t)((p->uid[0] << 8) | p->uid[1]));   // high half
             break;
 
         default:
-            return PM3_EINVARG;
+            ok = PM3_EINVARG;
+            break;
     }
-    return PM3_SUCCESS;
+    return ok;
 }
 
 //-----------------------------------------------------------------------------
 // Command handlers (called from appmain.c)
 //-----------------------------------------------------------------------------
 // Probe the XMICRO / "channel B" identify (XT57 / XT37-class super-chips).  The XT27A never
-// answers XMICRO as itself, so a family name here means a newer family we do not yet support.  Sequence, as
+// answers XMICRO, so any reply here means a newer family we do not yet support.  Sequence, as
 // the VVDI reads an XT27B / XT57B:
 //   field on, wait 120.14 ms
 //   reader -> XMICRO (48b)          tag -> 0x5AA5 ACK
@@ -1050,48 +830,21 @@ static int xh_xmicro_identify(xh_sess_t *s, uint8_t *type, size_t typesz, size_t
     xh_delay_us(XH_T_XMICRO_POWERUP_US);
 
     // 1) XMICRO probe -> expect the 0x5AA5 ACK (XT27A gives nothing here).
-    rxlen = xh_xfer_clear(s, xmicro, 48, rx, sizeof(rx), 0);
-    if (g_dbglevel >= DBG_EXTENDED) {
-        Dbprintf("xhorse: XMICRO reply %u bits: %02x %02x %02x %02x", (unsigned)rxlen, rx[0], rx[1], rx[2], rx[3]);
-    }
+    rxlen = xh_xfer_clear(s, xmicro, 48, rx, sizeof(rx));
     if (rxlen < 16) {
         return PM3_EFAILED;                      // no B-channel response -> not an XT57/XT37-class chip
     }
 
     // 2) 4-bit identify query -> the chip answers with its ASCII family string.
     xh_delay_us(XH_T_XMICRO_ID_US);
-    rxlen = xh_xfer_clear(s, query, 4, rx, sizeof(rx), 0);
-    if (g_dbglevel >= DBG_EXTENDED) {
-        Dbprintf("xhorse: identify reply %u bits: %02x %02x %02x %02x %02x", (unsigned)rxlen, rx[0], rx[1], rx[2], rx[3], rx[4]);
+    rxlen = xh_xfer_clear(s, query, 4, rx, sizeof(rx));
+    if (rxlen >= 8) {
+        size_t n = rxlen / 8;
+        if (n > typesz) n = typesz;
+        memcpy(type, rx, n);
+        *tlen = n;
     }
-
-    // Only a family name ("XT37", "XT57", ...) makes it a B-channel chip.  An XT27A emulating some
-    // types (7938 seen) answers XMICRO with something but says nothing to the identify query; it
-    // is still an XT27A, so let the caller go on to the channel-A handshake.
-    if ((rxlen < 32) || (rx[0] != 'X') || (rx[1] != 'T')) {
-        return PM3_EFAILED;
-    }
-    size_t n = rxlen / 8;
-    if (n > typesz) n = typesz;
-    memcpy(type, rx, n);
-    *tlen = n;
-    return PM3_SUCCESS;                          // named its family: it is a B-channel chip
-}
-
-// Read pages 0..pages-1 of the current bank into out->image, each until two reads agree
-// (xh_read_agreed), and mark the pages that did in out->page_ok.
-static void xh_read_image(xh_sess_t *s, lf_xhorse_info_t *out, uint8_t pages) {
-    out->image_pages = pages;
-    for (uint8_t pg = 0; pg < pages; pg++) {
-        uint32_t w = 0;
-        if (xh_read_agreed(s, pg, &w)) {
-            out->page_ok[pg / 8] |= (uint8_t)(1 << (pg % 8));
-        }
-        out->image[pg * 4 + 0] = (uint8_t)(w >> 24);
-        out->image[pg * 4 + 1] = (uint8_t)(w >> 16);
-        out->image[pg * 4 + 2] = (uint8_t)(w >> 8);
-        out->image[pg * 4 + 3] = (uint8_t)(w);
-    }
+    return PM3_SUCCESS;                          // answered XMICRO: it is a B-channel chip
 }
 
 void Xhorse_Info(bool ledcontrol) {
@@ -1101,7 +854,7 @@ void Xhorse_Info(bool ledcontrol) {
 
     xh_setup(&s, ledcontrol);
 
-    // Try the XMICRO / channel-B identify first.  A family name means a newer super-chip family
+    // Try the XMICRO / channel-B identify first.  A reply means a newer super-chip family
     // (XT57 / XT37-class) that this command does not yet support - report it and stop.
     size_t tlen = 0;
     if (xh_xmicro_identify(&s, out.bchip_type, sizeof(out.bchip_type), &tlen) == PM3_SUCCESS) {
@@ -1112,34 +865,30 @@ void Xhorse_Info(bool ledcontrol) {
         return;
     }
 
-    // Otherwise fall back to the channel-A handshakes + reads: XT27A first, as the VVDI does, then XT136.
+    // Otherwise fall back to the XT27A channel-A handshake + reads.
     if (xh_open_session(&s) != PM3_SUCCESS) {
-        if (xh_open_session_xt136(&s) == PM3_SUCCESS) {
-            out.found = 1;
-            out.family = XHORSE_FAM_XT136;
-            xh_read_image(&s, &out, XH136_PAGES);     // flat page space, no sel
-            xh_ctl(&s, XH_PG_PAD);
-        }
         hitag_cleanup(ledcontrol);
         reply_ng(CMD_LF_XHORSE_INFO, PM3_SUCCESS, (uint8_t *)&out, sizeof(out));
         return;
     }
     out.found = 1;
-    out.family = XHORSE_FAM_XT27A;
 
     xh_read_chipid(&s, out.chipid);
 
     uint32_t tb = 0;
-    if (xh_bank(&s, 1) == PM3_SUCCESS) {
-        out.typebyte_ok = xh_read_agreed(&s, XH_PG_TYPE, &tb) ? 1 : 0;
-    }
+    xh_bank(&s, 1);
+    xh_read(&s, XH_PG_TYPE, &tb);
     out.typebyte = (uint8_t)(tb & 0xFF);
 
-    // If the sel fails the bank is unknown: leave the pages zero and unconfirmed.
-    if (xh_bank(&s, 0) == PM3_SUCCESS) {
-        xh_read_image(&s, &out, 8);
-    } else {
-        out.image_pages = 8;
+    xh_bank(&s, 0);
+    out.image_pages = 8;
+    for (uint8_t pg = 0; pg < out.image_pages; pg++) {
+        uint32_t w = 0;
+        xh_read(&s, pg, &w);
+        out.image[pg * 4 + 0] = (uint8_t)(w >> 24);
+        out.image[pg * 4 + 1] = (uint8_t)(w >> 16);
+        out.image[pg * 4 + 2] = (uint8_t)(w >> 8);
+        out.image[pg * 4 + 3] = (uint8_t)(w);
     }
     xh_ctl(&s, XH_PG_PAD);
 
@@ -1147,44 +896,34 @@ void Xhorse_Info(bool ledcontrol) {
     reply_ng(CMD_LF_XHORSE_INFO, PM3_SUCCESS, (uint8_t *)&out, sizeof(out));
 }
 
-// Dumps one bank (0 = emulated image, 1 = config/identity) per call: both would not fit in one reply.
-// An XT136 has no banks: bank 0 returns pages 0x00..0x3F (only 0x00..0x0F are known to exist), and a
-// bank-1 request only reports the family.
-void Xhorse_Dump(uint8_t bank, bool ledcontrol) {
+void Xhorse_Dump(bool ledcontrol) {
     xh_sess_t s;
     lf_xhorse_info_t out;
     memset(&out, 0, sizeof(out));
-    out.bank = bank;
 
     if (xh_begin(&s, ledcontrol) != PM3_SUCCESS) {
-        if (xh_open_session_xt136(&s) == PM3_SUCCESS) {
-            out.found = 1;
-            out.family = XHORSE_FAM_XT136;
-            if (bank == 0) {
-                xh_read_image(&s, &out, 64);
-            }
-            xh_ctl(&s, XH_PG_PAD);
-        }
         hitag_cleanup(ledcontrol);
         reply_ng(CMD_LF_XHORSE_DUMP, PM3_SUCCESS, (uint8_t *)&out, sizeof(out));
         return;
     }
     out.found = 1;
-    out.family = XHORSE_FAM_XT27A;
 
     xh_read_chipid(&s, out.chipid);
 
     uint32_t tb = 0;
-    if (xh_bank(&s, 1) == PM3_SUCCESS) {
-        out.typebyte_ok = xh_read_agreed(&s, XH_PG_TYPE, &tb) ? 1 : 0;
-    }
+    xh_bank(&s, 1);
+    xh_read(&s, XH_PG_TYPE, &tb);
     out.typebyte = (uint8_t)(tb & 0xFF);
 
-    // If the sel fails the bank is unknown: leave the pages zero and unconfirmed.
-    if (xh_bank(&s, bank) == PM3_SUCCESS) {
-        xh_read_image(&s, &out, 64);
-    } else {
-        out.image_pages = 64;
+    xh_bank(&s, 0);
+    out.image_pages = 64;
+    for (uint16_t pg = 0; pg < out.image_pages; pg++) {
+        uint32_t w = 0;
+        xh_read(&s, (uint8_t)pg, &w);
+        out.image[pg * 4 + 0] = (uint8_t)(w >> 24);
+        out.image[pg * 4 + 1] = (uint8_t)(w >> 16);
+        out.image[pg * 4 + 2] = (uint8_t)(w >> 8);
+        out.image[pg * 4 + 3] = (uint8_t)(w);
     }
     xh_ctl(&s, XH_PG_PAD);
 
@@ -1215,16 +954,7 @@ static int xh_begin_writes(xh_sess_t *s) {
 // that applies the recipe.  Recovers a chip stuck in an EM emulation if needed.
 static void xh_configure_run(const lf_xhorse_data_t *p, uint16_t cmd, bool ledcontrol) {
     xh_sess_t s;
-    int open = xh_begin_any(&s, ledcontrol);
-    if (open == PM3_ENOTIMPL) {
-        hitag_cleanup(ledcontrol);
-        reply_ng(cmd, PM3_ENOTIMPL, NULL, 0);      // XT136: not written to
-        return;
-    }
-    if (open != PM3_SUCCESS) {
-        if (g_dbglevel >= DBG_ERROR) {
-            Dbprintf("xhorse: no session after all attempts, including EM recovery");
-        }
+    if (xh_begin_any(&s, ledcontrol) != PM3_SUCCESS) {
         hitag_cleanup(ledcontrol);
         reply_ng(cmd, PM3_EFAILED, NULL, 0);
         return;
@@ -1235,9 +965,6 @@ static void xh_configure_run(const lf_xhorse_data_t *p, uint16_t cmd, bool ledco
     xh_ctl(&s, XH_PG_PAD);      // ends the capability-read session
 
     if (xh_begin_writes(&s) != PM3_SUCCESS) {
-        if (g_dbglevel >= DBG_ERROR) {
-            Dbprintf("xhorse: no write session after the capability read");
-        }
         hitag_cleanup(ledcontrol);
         reply_ng(cmd, PM3_EFAILED, NULL, 0);
         return;
