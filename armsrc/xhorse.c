@@ -102,12 +102,13 @@
 // "1111111" frames, 11 more bursts, long rests, a 1.57 s cold-boot); none of that changed anything
 // observable and it is not replicated.  See doc/xhorse_notes.md.  Values are the VVDI's, in us.
 //
-// The burst only works if it lands at the right point in the chip's own EM bit stream, which is
-// locked to power-up: around bit 44 of its 64-bit frame in every freeing burst the VVDI sent
-// (VVDI's own first try often lands ~1 bit late and fails).  The chip's bit time depends on the
-// emulated type (ID11 RF/32 = 256 us, ID12 RF/40 = 320 us), so one fixed offset cannot suit both:
-// 109.66 ms is bit 44 (+6 frames) for ID11 but bit 23 for ID12.  We don't know which type the chip
-// is, so xh_em_timings[] lists the burst position proven for each and they are tried in turn.
+// The burst only works if it starts at the right point in the chip's EM frame, which is locked to
+// power-up.  Measured from the field-on edge, every freeing burst starts ~44 "units" into the frame,
+// where a unit is 32 T0 for ID11 (RF/32) and ID13 (RF/64) and 40 T0 for ID12 (RF/40): ID13 1398,
+// ID11 1409-1423, ID12 1741 T0.  Bursts at ~1427 T0 and later (32-T0 types) fail - the VVDI's own
+// first try often does.  The window is narrow, so the timings below aim at its centre (unit 44.0
+// for 32-T0 types, 43.8 for ID12), commanding 3.5 T0 early because our burst reaches the air that
+// much after the commanded time.  We don't know the emulated type, so the entries are tried in turn.
 #define XH_T_EM_OFF_US            70050    // field off before and after the burst window (VVDI)
 #define XH_T_EM_SETTLE_US         30180    // field on this long before XHORSE (VVDI, after the chip is freed)
 #define XH_EM_TRIES                   3    // rounds over xh_em_timings[] (each entry: burst + handshake)
@@ -450,9 +451,8 @@ static void xh_em_burst(void) {
     }
 }
 
-// Burst positions proven to free a chip, per emulated EM type (see XH_T_EM_OFF_US).  Each is a
-// field-on window of on_us with the burst starting burst_at_us after power-up; both land the burst
-// around bit 44 of the chip's EM frame.
+// Burst positions per frame-unit size (see XH_T_EM_OFF_US).  Each is a field-on window of on_us
+// with the burst commanded burst_at_us after power-up.
 typedef struct {
     const char *name;
     uint32_t    on_us;
@@ -460,8 +460,13 @@ typedef struct {
 } xh_em_timing_t;
 
 static const xh_em_timing_t xh_em_timings[] = {
-    { "ID11 (RF/32)", 155940, 109660 },   // frees ID11 on the Proxmark (= 6 frames + bit ~44)
-    { "ID12 (RF/40)",  60300,  13930 },   // the VVDI's burst that freed an ID12 chip (bit ~44)
+    // 13692.5 T0 commanded -> ~13696 on air = 6 ID11 frames (= 3 ID13 frames) + 1408 T0 (unit 44.0).
+    // Covers ID11 and ID13.  (The earlier 109.66 ms landed at 1423, the late edge: ID11 passed but
+    // ID13 failed often.)
+    { "ID11/ID13 (32 T0 units)", 155940, 109540 },
+    // 1748.75 T0 commanded -> ~1752 on air = unit 43.8 of ID12's 40 T0 units.  (13.93 ms, the VVDI's
+    // value, freed an ID12 at 1741-1745; this is moved slightly towards the centre.)
+    { "ID12 (40 T0 units)",       60300,  13990 },
 };
 
 // Pull a chip stuck broadcasting a non-HITAG2 emulation (ID11/ID12/EM4100) back onto the config

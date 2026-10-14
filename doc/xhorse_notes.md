@@ -148,21 +148,31 @@ OFF 70.05 ms
 ON  |<- 30.18 ms ->| XHORSE ..8 ms.. 072F ..11.78 ms.. 7372 -> reply
 ```
 
-The burst only works if it lands at the right point in the chip's own EM bit stream, which starts at
-power-up. In every burst that freed a chip it began around **bit 44** of the chip's 64-bit frame
-(the VVDI's own first try is often ~1 bit late, and fails). Because the bit time depends on the
-emulated type, one fixed offset can't suit every type, so the firmware tries the positions proven
-for each:
+The burst only works if it starts at the right point in the chip's own EM frame, which starts at
+power-up. Measured from the field-on edge, every burst that freed a chip started about **44 units**
+into the frame, where a unit is **32 T0 for ID11 (RF/32) and ID13 (RF/64)** and **40 T0 for ID12
+(RF/40)**:
 
-| Type | Bit time | Window | `burst_at` | Bit position | Proven by |
-|---|---|---|---|---|---|
-| ID11 | 256 us (RF/32) | 155.94 ms | 109.66 ms | 6 frames + 44.4 | Proxmark reset |
-| ID12 | 320 us (RF/40) | 60.30 ms | 13.93 ms | 43.5 | VVDI reset capture, then Proxmark reset |
+| Type | Frame | Freeing bursts (T0 into the frame) | Failing bursts |
+|---|---|---|---|
+| ID11 | 2048 T0 | 1409, 1410, 1417 (VVDI), 1423 (Proxmark) | 1427-1450 (VVDI first tries) |
+| ID13 | 4096 T0 | 1398 (VVDI) | ~1423 (Proxmark, ID11 timing; failed 3 of 4 times) |
+| ID12 | 2560 T0 | 1741 = 43.5 x 40 (VVDI), ~1745 (Proxmark) | ~911 (Proxmark, ID11 timing) |
 
-(109.66 ms is bit 44 for an ID11 but only bit 23 of a frame for an ID12, which is why the first
-firmware freed ID11 but not ID12.) The burst turns the EM emulation off; the handshake then works
-normally. Up to three rounds over the table are made. Later sessions in the same run are opened with
-the same 70.05 ms off / 30.18 ms settle. Reset then:
+The window is narrow: at ~1425 T0 a 32-T0-type burst stops working reliably, which is why the VVDI's
+own first try often fails, and why the first Proxmark firmware (1423) freed ID11 but only sometimes
+ID13. The firmware aims at the centre of each window, commanding 3.5 T0 early because its burst
+reaches the air that much after the commanded time, and tries the entries in turn because it doesn't
+know the emulated type:
+
+| Entry | Window | `burst_at` | Lands at (T0 into the frame) | Covers |
+|---|---|---|---|---|
+| 32 T0 units | 155.94 ms | 109.54 ms | 6 ID11 frames = 3 ID13 frames, + 1408 (unit 44.0) | ID11, ID13 |
+| 40 T0 units | 60.30 ms | 13.99 ms | ~1752 (unit 43.8) | ID12 |
+
+The burst turns the EM emulation off; the handshake then works normally. Up to three rounds over the
+table are made. Later sessions in the same run are opened with the same 70.05 ms off / 30.18 ms
+settle. Reset then:
 
 1. reads the chip ID (bank 1, pages `0x33`-`0x36`) and ends the session with `ctl 0x3F`;
 2. opens a new session, reads status page `0x3F`, and writes, each with a 13 ms program wait and a
@@ -272,11 +282,16 @@ follows is not decoded.
 ^[Top](#top)
 
 * What the unlock burst encodes, and whether it is a generic "leave emulation" command.
-* Whether ID13 and other talk-first emulations need the same burst, and at what time. The Proxmark
-  reset is confirmed on ID11 and ID12 (same burst, different time after power-up).
-* How wide the "bit 44" window is. One VVDI burst at bit 47.3 also worked, so it may not be a single
-  narrow slot. Detecting the chip's bit rate from its broadcast would allow computing the position
+* Which unit size other talk-first emulations use. The same burst frees ID11, ID12 and ID13; the
+  Proxmark reset is confirmed on ID11 and ID12, and on ID13 at the old, marginal timing.
+* Why ID11 and ID13 share a 32 T0 unit although their bit rates differ (RF/32 vs RF/64), while ID12
+  uses 40 T0.
+* How wide the window is. Its late edge is ~1425 T0 (32 T0 types); its early edge is unknown (the
+  earliest success is 1398). One VVDI burst at 1512 T0 (unit 47.3) also worked, so there may be a
+  second slot. Detecting the chip's bit rate from its broadcast would allow computing the position
   instead of trying a table.
+* Why a failed first `lf xhorse reset` on ID13 changed the chip's behaviour (the next run's normal
+  handshakes read 10 bits instead of 0) before the next run freed it with its first burst.
 * How much slack the copied 70 ms gap and 30.18 ms settle have.
 * Detecting the EM broadcast directly would save the ~0.8 s of failed normal handshakes.
 * The channel-B (XT27B / XT57B) management protocol.
