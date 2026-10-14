@@ -822,6 +822,7 @@ SRCS =  mifare/aiddesfire.c \
         cmdlftrovan.c \
         cmdlfviking.c \
         cmdlfvisa2000.c \
+        cmdlfxhorse.c \
         cmdlfzx8211.c \
         cmdmad.c \
         cmdmain.c \

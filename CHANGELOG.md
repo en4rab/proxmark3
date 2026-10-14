@@ -3,6 +3,7 @@ All notable changes to this project will be documented in this file.
 This project uses the changelog in accordance with [keepchangelog](http://keepachangelog.com/). Please use this to write notable changes, which is not the same as git commit log...
 
 ## [unreleased][unreleased]
+- Added `lf xhorse` - Xhorse XT27A super-chip support: `info`, `dump`, `configure`, `reset`, `types`; `reset`/`configure` also recover a chip stuck emulating an EM type; `info` identifies XT27B/XT57B (channel B) chips as unsupported. See `doc/xhorse_notes.md` (@CHANGEME)
 - Fixed corrected `sim014.bin` references to `sim024.bin` as `sim014.bin` does not exist in this repo currently, thus removing some newbie confusion. (@innocentbystanderproxmark)
 - Added `A1856618` (an EM4305 anti-clone card password) to the `t55xx_default_pwds` dictionary used by `lf em 4x05 chk` (@nemanjan00)
 - Added `hw bwm ble` - the BWM's BLE settings: `on`/`off` (persisted radio switch), `pairing` (require a 6-digit passkey, LE Secure Connections; the module ships open), `forget` bonded devices, `txpower`, `status` (@Msprg)

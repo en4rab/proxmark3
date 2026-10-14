@@ -215,6 +215,7 @@ if ("${APP_CFLAGS}" MATCHES "WITH_HITAG")
             hitagS.c
             hitagu.c
             hitag2_crack.c
+            xhorse.c
     )
     list(APPEND INC_DIRS ../common/hitag2)
 else ()
