@@ -57,6 +57,7 @@
 #include "hitag2_crack.h"
 #include "hitagS.h"
 #include "hitagu.h"
+#include "xhorse.h"
 #include "em4x50.h"
 #include "em4x70.h"
 #include "iclass.h"
@@ -1985,6 +1986,23 @@ static void PacketReceived(PacketCommandNG *packet) {
         }
         case CMD_LF_HITAGU_UID: {
             htu_read_uid(NULL, true, true);
+            break;
+        }
+
+        case CMD_LF_XHORSE_INFO: {
+            Xhorse_Info(true);
+            break;
+        }
+        case CMD_LF_XHORSE_DUMP: {
+            Xhorse_Dump(true);
+            break;
+        }
+        case CMD_LF_XHORSE_CONFIGURE: {
+            Xhorse_Configure((const lf_xhorse_data_t *)packet->data.asBytes, true);
+            break;
+        }
+        case CMD_LF_XHORSE_RESET: {
+            Xhorse_Reset(true);
             break;
         }
 #endif

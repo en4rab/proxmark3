@@ -1151,6 +1151,12 @@ typedef struct {
 
 #define CMD_LF_SNIFF_RAW_ADC 0x0360
 
+// For Xhorse super-chip (XT27A, channel A)
+#define CMD_LF_XHORSE_INFO 0x0369
+#define CMD_LF_XHORSE_RESET 0x036A
+#define CMD_LF_XHORSE_CONFIGURE 0x036B
+#define CMD_LF_XHORSE_DUMP 0x036C
+
 // For Hitag 2 transponders
 #define CMD_LF_HITAG_SNIFF 0x0370
 #define CMD_LF_HITAG_SIMULATE 0x0371
