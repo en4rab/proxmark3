@@ -75,6 +75,7 @@
 #include "cmdlfviking.h"    // for viking menu
 #include "cmdlfvisa2000.h"  // for VISA2000 menu
 #include "cmdlfwatchnet.h"  // for WatchNET menu
+#include "cmdlfxhorse.h"    // for Xhorse super-chip menu
 #include "cmdlfzx8211.h"    // for ZX8211 menu
 #include "crc.h"
 #include "pm3_cmd.h"        // for LF_CMDREAD_MAX_EXTRA_SYMBOLS
@@ -2465,6 +2466,7 @@ static command_t CommandTable[] = {
     {"viking",      CmdLFViking,        AlwaysAvailable, "{ Viking RFIDs...            }"},
     {"visa2000",    CmdLFVisa2k,        AlwaysAvailable, "{ Visa2000 RFIDs...          }"},
     {"watchnet",    CmdLFWatchnet,      AlwaysAvailable, "{ WatchNET RFIDs...          }"},
+    {"xhorse",      CmdLFXhorse,        AlwaysAvailable, "{ Xhorse XT27A super-chip... }"},
 //    {"zx",          CmdLFZx8211,        AlwaysAvailable, "{ ZX8211 RFIDs...            }"},
     {"-----------", CmdHelp,            AlwaysAvailable, "--------------------- " _CYAN_("General") " ---------------------"},
     {"config",      CmdLFConfig,        IfPm3Lf,         "Get/Set config for LF sampling, bit/sample, decimation, frequency"},
