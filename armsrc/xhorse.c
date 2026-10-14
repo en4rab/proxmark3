@@ -100,20 +100,22 @@
 // field-offs of 70 ms, 570 ms and 1.57 s, i.e. the burst turns the emulation off and it stays off
 // across power cycles.  The VVDI wraps the burst in a ~10 s sequence (listen window, XMICRO probes,
 // "1111111" frames, 11 more bursts, long rests, a 1.57 s cold-boot).  For ID11/ID12 none of that
-// changed anything observable; ID13 appears to need the cold-boot before it answers, so that alone
-// is kept, as a fallback.  See doc/xhorse_notes.md.  Values are the VVDI's, in us.
+// changed anything observable; ID13 goes silent after the burst but only answers after the cold-boot.
+// We keep the VVDI's structure (bursts, then one cold-boot, then the handshake) but send only one
+// burst per timing.  See doc/xhorse_notes.md.  Values are the VVDI's, in us.
 //
 // The burst only works if it starts at the right point in the chip's EM frame, which is locked to
-// power-up.  Measured from the field-on edge, every freeing burst starts ~44 "units" into the frame,
-// where a unit is 32 T0 for ID11 (RF/32) and ID13 (RF/64) and 40 T0 for ID12 (RF/40): ID13 1398,
-// ID11 1409-1423, ID12 1741 T0.  Bursts at ~1427 T0 and later (32-T0 types) fail - the VVDI's own
-// first try often does.  The window is narrow, so the timings below aim at its centre (unit 44.0
-// for 32-T0 types, 43.8 for ID12), commanding 3.5 T0 early because our burst reaches the air that
-// much after the commanded time.  We don't know the emulated type, so the entries are tried in turn.
+// power-up.  Measured from the field-on edge, freeing bursts for ID11 and ID12 start ~44 "units" into
+// the frame, a unit being 32 T0 for ID11 (RF/32) and 40 T0 for ID12 (RF/40): ID11 1409-1423, ID12 1741
+// T0.  For ID11 bursts at ~1427 T0 and later fail - the VVDI's own first try often does - so the
+// timings aim at the window's centre, commanding 3.5 T0 early because our burst reaches the air that
+// much after the commanded time.  ID13 (RF/64) is freed in its first frame after power-up (VVDI at
+// 1398 T0, ours at ~1752) but not by the same position in a later frame.  We don't know the emulated
+// type, so the entries are tried in turn.
 #define XH_T_EM_OFF_US            70050    // field off before and after the burst window (VVDI)
 #define XH_T_EM_SETTLE_US         30180    // field on this long before XHORSE (VVDI, after the chip is freed)
-#define XH_T_EM_COLDBOOT_US     1570940    // VVDI's power-down before its handshake; fallback when the quick one fails (ID13)
-#define XH_EM_TRIES                   3    // rounds over xh_em_timings[] (each entry: burst + handshake)
+#define XH_T_EM_COLDBOOT_US     1570940    // VVDI's power-down between the bursts and its handshake (ID13 needs it)
+#define XH_EM_TRIES                   3    // attempts: one burst per xh_em_timings[] entry, cold-boot, handshake
 
 // func field (top 2 bits of the op byte)
 #define XH_FUNC_CTL   0
@@ -464,20 +466,24 @@ typedef struct {
 } xh_em_timing_t;
 
 static const xh_em_timing_t xh_em_timings[] = {
-    // 13692.5 T0 commanded -> ~13696 on air = 6 ID11 frames (= 3 ID13 frames) + 1408 T0 (unit 44.0).
-    // Covers ID11 and ID13.  (The earlier 109.66 ms landed at 1423, the late edge: ID11 passed but
-    // ID13 failed often.)
-    { "ID11/ID13 (32 T0 units)", 155940, 109540 },
-    // 1748.75 T0 commanded -> ~1752 on air = unit 43.8 of ID12's 40 T0 units.  (13.93 ms, the VVDI's
-    // value, freed an ID12 at 1741-1745; this is moved slightly towards the centre.)
-    { "ID12 (40 T0 units)",       60300,  13990 },
+    // 13692.5 T0 commanded -> ~13696 on air = 6 ID11 frames + 1408 T0 (unit 44.0).  Frees ID11.  It
+    // does NOT free a fresh ID13 even though it is the same position 3 ID13 frames later: ID13 seems
+    // to listen only in its first frame after power-up (the VVDI frees it at 11.18 ms).
+    { "ID11 (32 T0 units)",       155940, 109540 },
+    // 1748.75 T0 commanded -> ~1752 on air = unit 43.8 of ID12's 40 T0 units.  Frees ID12 (13.93 ms,
+    // the VVDI's value, freed it at 1741-1745), and also frees ID13 in its first frame - ID13 then
+    // only answers after the cold-boot.
+    { "ID12/ID13 (first frame)",  60300,  13990 },
 };
 
-// Pull a chip stuck broadcasting a non-HITAG2 emulation (ID11/ID12/EM4100) back onto the config
-// channel.  For each candidate timing: power-cycle, burst at burst_at_us after power-up while the
-// chip is broadcasting, finish the window, field off 70 ms, field on, XHORSE handshake 30.18 ms
-// later; if that fails, a 1.57 s cold-boot and one more handshake.  ~0.3-0.5 s per attempt, or
-// ~2 s with the cold-boot.
+// Pull a chip stuck broadcasting a non-HITAG2 emulation (ID11/ID12/ID13) back onto the config
+// channel, structured as the VVDI does it: bursts first, no handshake in between, then one cold-boot
+// and one handshake.  Each attempt sends one burst per entry of xh_em_timings[] (each in its own
+// power cycle: off 70 ms, on, burst at burst_at_us, rest of the window), so whichever type the chip
+// emulates gets its timing; a burst at the wrong timing is harmless once the chip is freed (the
+// VVDI keeps bursting after the chip goes silent).  Then field off for the VVDI's 1.57 s cold-boot,
+// on, XHORSE handshake 30.18 ms later.  ID13 only answers after the cold-boot; ID11/ID12 answer
+// either way.  ~2.1 s per attempt.
 static int xh_open_session_em(xh_sess_t *s) {
     for (int attempt = 0; attempt < XH_EM_TRIES; attempt++) {
         for (size_t t = 0; t < sizeof(xh_em_timings) / sizeof(xh_em_timings[0]); t++) {
@@ -489,33 +495,19 @@ static int xh_open_session_em(xh_sess_t *s) {
             xh_delay_us(tm->burst_at_us);
             xh_em_burst();
             xh_delay_us(tm->on_us - tm->burst_at_us - XH_EMB_LEN_US);
-            Gpio_SSC_DOUT_High();                                    // field off
-            xh_delay_us(XH_T_EM_OFF_US);
-            Gpio_SSC_DOUT_Low();                                     // field on
-            xh_delay_us(XH_T_EM_SETTLE_US);
+        }
 
-            bool cold = false;
-            bool ok = (xh_handshake(s) == PM3_SUCCESS) && xh_4r(s, "EM-recovery", attempt);
-            if (!ok) {
-                // ID13 is freed by the burst but does not answer straight after a 70 ms off; the
-                // VVDI always powers down for 1.57 s before its handshake, so try that once.
-                Gpio_SSC_DOUT_High();
-                xh_delay_us(XH_T_EM_COLDBOOT_US);
-                Gpio_SSC_DOUT_Low();
-                xh_delay_us(XH_T_EM_SETTLE_US);
-                cold = true;
-                ok = (xh_handshake(s) == PM3_SUCCESS) && xh_4r(s, "EM-recovery (cold-boot)", attempt);
-            }
-            if (ok) {
-                if (g_dbglevel >= DBG_EXTENDED) {
-                    Dbprintf("xhorse: chip freed by the %s burst timing%s", tm->name, cold ? " after a cold-boot" : "");
-                }
-                s->em_mode = true;                                   // later sessions: same off/settle timing
-                return PM3_SUCCESS;
-            }
-            if (g_dbglevel >= DBG_ERROR) {
-                Dbprintf("xhorse: EM-recovery attempt %d, %s timing: no session after the EM burst (or cold-boot)", attempt, tm->name);
-            }
+        Gpio_SSC_DOUT_High();                                        // cold-boot
+        xh_delay_us(XH_T_EM_COLDBOOT_US);
+        Gpio_SSC_DOUT_Low();
+        xh_delay_us(XH_T_EM_SETTLE_US);
+
+        if (xh_handshake(s) == PM3_SUCCESS && xh_4r(s, "EM-recovery", attempt)) {
+            s->em_mode = true;                                       // later sessions: 70 ms off / 30.18 ms settle
+            return PM3_SUCCESS;
+        }
+        if (g_dbglevel >= DBG_ERROR) {
+            Dbprintf("xhorse: EM-recovery attempt %d: no session after the bursts and cold-boot", attempt);
         }
     }
     return PM3_EFAILED;

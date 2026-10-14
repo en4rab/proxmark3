@@ -142,46 +142,49 @@ off, 3 ms power-up, handshake). For a chip stuck in an EM type all eight fail, a
 back to the unlock:
 
 ```
-OFF 70.05 ms
-ON  |<-- burst_at -->|<- burst 15.95 ms ->|<- rest of window ->|
-OFF 70.05 ms
+for each burst timing in the table (see below):
+    OFF 70.05 ms
+    ON  |<-- burst_at -->|<- burst 15.95 ms ->|<- rest of window ->|
+OFF 1570.94 ms                                   (cold-boot)
 ON  |<- 30.18 ms ->| XHORSE ..8 ms.. 072F ..11.78 ms.. 7372 -> reply
 ```
 
+This is the VVDI's structure. In all eight VVDI reset captures (ID11, ID12, ID13) it sends its
+bursts with no handshake in between, then powers down for 1.57 s once, then handshakes. It sends 12
+bursts; the firmware sends one per timing.
+
 The burst only works if it starts at the right point in the chip's own EM frame, which starts at
-power-up. Measured from the field-on edge, every burst that freed a chip started about **44 units**
-into the frame, where a unit is **32 T0 for ID11 (RF/32) and ID13 (RF/64)** and **40 T0 for ID12
-(RF/40)**:
+power-up. Measured from the field-on edge:
 
-| Type | Frame | Freeing bursts (T0 into the frame) | Failing bursts |
+| Type | Frame | Freeing bursts (T0 after power-up) | Failing bursts |
 |---|---|---|---|
-| ID11 | 2048 T0 | 1409, 1410, 1417 (VVDI), 1423 (Proxmark) | 1427-1450 (VVDI first tries) |
-| ID13 | 4096 T0 | 1398 (VVDI) | ~1423 (Proxmark, ID11 timing; failed 3 of 4 times) |
-| ID12 | 2560 T0 | 1741 = 43.5 x 40 (VVDI), ~1745 (Proxmark) | ~911 (Proxmark, ID11 timing) |
+| ID11 (RF/32) | 2048 T0 | 1409, 1410, 1417 (VVDI), 1423 (Proxmark), and the same + 6 frames | 1427-1450 + 6 frames (VVDI first tries) |
+| ID12 (RF/40) | 2560 T0 | 1741 = 43.5 x 40 (VVDI), ~1752 (Proxmark) | ~911 + 5 frames (Proxmark, ID11 timing) |
+| ID13 (RF/64) | 4096 T0 | 1398 (VVDI), ~1752 (Proxmark) | ~1408 and ~1423 + 3 frames (Proxmark) |
 
-The window is narrow: at ~1425 T0 a 32-T0-type burst stops working reliably, which is why the VVDI's
-own first try often fails, and why the first Proxmark firmware (1423) freed ID11 but only sometimes
-ID13. The firmware aims at the centre of each window, commanding 3.5 T0 early because its burst
-reaches the air that much after the commanded time, and tries the entries in turn because it doesn't
-know the emulated type:
+For ID11 and ID12 the freeing bursts start about **44 units** into the frame, a unit being 32 T0
+for ID11 and 40 T0 for ID12, and the same position in a later frame also works for ID11. The ID11
+window is narrow: from ~1425 T0 bursts stop working reliably, which is why the VVDI's own first try
+often fails. ID13 is different: it is freed by a burst in its **first frame** after power-up (at
+1398 or ~1752 T0), but not by the same position three frames later. The firmware aims at the centre
+of each window, commanding 3.5 T0 early because its burst reaches the air that much after the
+commanded time, and sends a burst at every entry because it doesn't know the emulated type:
 
-| Entry | Window | `burst_at` | Lands at (T0 into the frame) | Covers |
+| Entry | Window | `burst_at` | Lands at (T0 after power-up) | Frees |
 |---|---|---|---|---|
-| 32 T0 units | 155.94 ms | 109.54 ms | 6 ID11 frames = 3 ID13 frames, + 1408 (unit 44.0) | ID11, ID13 |
-| 40 T0 units | 60.30 ms | 13.99 ms | ~1752 (unit 43.8) | ID12 |
+| ID11 | 155.94 ms | 109.54 ms | 6 ID11 frames + 1408 (unit 44.0) | ID11 |
+| ID12/ID13 | 60.30 ms | 13.99 ms | ~1752 (unit 43.8 for ID12; first ID13 frame) | ID12, ID13 |
 
-The burst turns the EM emulation off; for ID11 and ID12 the handshake then works normally. ID13
-behaves differently: after a failed first run it is left half-recovered, its normal handshakes read
-10 bits instead of 0, and it answers a session opened 3 ms after power-up only rarely. Two
-fallbacks, both the VVDI's own timings, cover it:
+A burst at the wrong timing is harmless once the chip is freed: the VVDI keeps bursting after the
+chip goes silent. The burst turns the EM emulation off. ID11 and ID12 would answer the handshake
+30 ms after a 70 ms field-off, but ID13 goes silent and does not answer until it has been powered
+down for longer, which is why the cold-boot is always made. Each attempt takes ~2.1 s whatever the
+emulated type; up to three are made.
 
-* if the handshake straight after the burst fails, the firmware powers the chip down for 1.57 s
-  (the VVDI's cold-boot) and tries once more;
-* normal session opens alternate the short 20 ms off / 3 ms power-up with the VVDI's 70.05 ms off /
-  30.18 ms settle.
-
-Up to three rounds over the table are made. Later sessions in the same run always use the 70.05 ms
-off / 30.18 ms settle. Reset then:
+Normal session opens alternate the short 20 ms off / 3 ms power-up with the VVDI's 70.05 ms off /
+30.18 ms settle. This covers a chip left half-recovered by an earlier failed run (its normal
+handshakes read 10 bits instead of 0). Later sessions in the same run always use the 70.05 ms off /
+30.18 ms settle. Reset then:
 
 1. reads the chip ID (bank 1, pages `0x33`-`0x36`) and ends the session with `ctl 0x3F`;
 2. opens a new session, reads status page `0x3F`, and writes, each with a 13 ms program wait and a
@@ -291,16 +294,14 @@ follows is not decoded.
 ^[Top](#top)
 
 * What the unlock burst encodes, and whether it is a generic "leave emulation" command.
-* Which unit size other talk-first emulations use. The same burst frees ID11, ID12 and ID13; the
-  Proxmark reset is confirmed on ID11 and ID12, and on ID13 at the old, marginal timing.
-* Why ID11 and ID13 share a 32 T0 unit although their bit rates differ (RF/32 vs RF/64), while ID12
-  uses 40 T0.
-* How wide the window is. Its late edge is ~1425 T0 (32 T0 types); its early edge is unknown (the
-  earliest success is 1398). One VVDI burst at 1512 T0 (unit 47.3) also worked, so there may be a
-  second slot. Detecting the chip's bit rate from its broadcast would allow computing the position
-  instead of trying a table.
+* Whether other talk-first emulations need their own timing. The same burst frees ID11, ID12 and
+  ID13, and the Proxmark reset is confirmed on all three.
+* What decides the window. ID11 and ID12 fit "~44 units into a frame, in any frame"; ID13 is freed at
+  two different points of its first frame (1398 and ~1752 T0) but not at the ID11 position three
+  frames later. One VVDI ID11 burst at 1512 T0 also worked. Detecting the chip's bit rate from its
+  broadcast might allow computing the position instead of trying a table.
 * What the half-recovered ID13 state is (normal handshakes read 10 bits instead of 0 after a failed
-  first run), and whether the cold-boot fallback is really what ID13 needs.
+  first run), and why ID13 needs a long power-down before it answers when ID11 and ID12 don't.
 * How much slack the copied 70 ms gap and 30.18 ms settle have.
 * Detecting the EM broadcast directly would save the ~0.8 s of failed normal handshakes.
 * The channel-B (XT27B / XT57B) management protocol.
