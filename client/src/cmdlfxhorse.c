@@ -48,7 +48,7 @@ typedef struct {
     const char   *aliases;   // space-separated alternative tokens, or ""
     uint8_t       recipe;    // xhorse_recipe_t
     uint8_t       typebyte;  // on-chip 0x3C low byte
-    bool          has_type;  // write the type byte?
+    bool          has_type;  // write the type byte first? (ID8A's recipe writes 0x8A itself, last)
     bool          typeword;  // ID13: writes 0x0080008C
     xh_uidrule_t  uid;
     uint16_t      aux;       // config word for the template family
@@ -71,7 +71,7 @@ static const xh_type_t g_types[] = {
     { "ID4D",  "ID60 ID63",                         XHORSE_R_TEMPLATE, 0x4D, true,  false, UID_NONE, 0xAAF3, "config-template" },
     { "4D80",  "ID70 ID83",                         XHORSE_R_TEMPLATE, 0x80, true,  false, UID_NONE, 0x9201, "config-template" },
     { "ID4E",  "ID64",                              XHORSE_R_TEMPLATE, 0x64, true,  false, UID_NONE, 0x33A6, "config-template" },
-    { "ID8A",  "",                                  XHORSE_R_ID8A,     0x00, false, false, UID_OPT4, 0,      "full image, no type byte" },
+    { "ID8A",  "",                                  XHORSE_R_ID8A,     0x8A, false, false, UID_OPT4, 0,      "full image, type byte last" },
     { "ID8E",  "",                                  XHORSE_R_ID8E,     0x8E, true,  false, UID_OPT4, 0,      "UID at pages 0x0A/0x0B" },
 };
 #define XH_NTYPES (sizeof(g_types) / sizeof(g_types[0]))
@@ -144,7 +144,7 @@ static const char *uidrule_text(xh_uidrule_t r) {
         case UID_OPT4:
             return "4 bytes";
         case UID_REQ4:
-            return "4 (req)";
+            return "4 bytes";
         case UID_NONE:
             return "none";
     }
@@ -178,9 +178,7 @@ static int CmdLFXhorseTypes(const char *Cmd) {
             snprintf(toks, sizeof(toks), "%s", t->canon);
         }
         char onchip[12];
-        if (!t->has_type) {
-            snprintf(onchip, sizeof(onchip), "(image)");
-        } else if (t->typeword) {
+        if (t->typeword) {
             snprintf(onchip, sizeof(onchip), "0x%02X *", t->typebyte);
         } else {
             snprintf(onchip, sizeof(onchip), "0x%02X", t->typebyte);
@@ -208,7 +206,7 @@ static const char *typebyte_name(uint8_t tb) {
         return "ID11/12/13";
     }
     for (size_t i = 0; i < XH_NTYPES; i++) {
-        if (g_types[i].has_type && !g_types[i].typeword && g_types[i].typebyte == tb) {
+        if (!g_types[i].typeword && g_types[i].typebyte == tb) {
             return g_types[i].canon;
         }
     }
@@ -346,7 +344,7 @@ static int xh_send_wait(uint16_t cmd, const lf_xhorse_data_t *p, const char *wha
     SendCommandNG(cmd, (uint8_t *)p, p ? sizeof(lf_xhorse_data_t) : 0);
     PacketResponseNG resp;
     // Configure/reset open two sessions; each can spend a second or so on handshake retries,
-    // and the first may add up to three ~2.2 s EM-recovery attempts (worst case ~9.5 s in total).
+    // and the first may add up to three ~2.2 s EM-recovery attempts (worst case ~10.5 s in total).
     // Allow generous time.
     if (WaitForResponseTimeout(cmd, &resp, 30000) == false) {
         PrintAndLogEx(WARNING, "timeout while waiting for reply");
@@ -488,8 +486,8 @@ static int CmdLFXhorseConfigure(const char *Cmd) {
         PrintAndLogEx(WARNING, "      the emulation block at 0x00..0x04 is not yet fully derived.");
     }
 
-    PrintAndLogEx(INFO, "configuring " _GREEN_("%s") " (on-chip %s0x%02X)%s",
-                  t->canon, t->has_type ? "" : "image, no ", t->typebyte, p.verify ? ", verify" : "");
+    PrintAndLogEx(INFO, "configuring " _GREEN_("%s") " (on-chip 0x%02X)%s",
+                  t->canon, t->typebyte, p.verify ? ", verify" : "");
     return xh_send_wait(CMD_LF_XHORSE_CONFIGURE, &p, "configure");
 }
 
