@@ -229,11 +229,11 @@ static int xh_request_info(uint16_t cmd, lf_xhorse_info_t *out) {
     return PM3_SUCCESS;
 }
 
-// info/dump never send the EM-recovery burst (it changes the chip), so a chip stuck in an EM or
-// ID48 emulation simply doesn't answer them.  Say so.
+// info/dump never send the EM-recovery burst or the ID8A probe (both change the chip), so a chip
+// stuck in an EM, ID48 or ID8A emulation simply doesn't answer them.  Say so.
 static void xh_print_not_found(void) {
     PrintAndLogEx(FAILED, "No XT27A answered the " _YELLOW_("XHORSE") " handshake");
-    PrintAndLogEx(HINT, "An XT27A emulating an EM type (ID11/12/13) or ID48 broadcasts continuously and never answers;");
+    PrintAndLogEx(HINT, "An XT27A emulating an EM type (ID11/12/13), ID48 or ID8A never answers it;");
     PrintAndLogEx(HINT, "`" _YELLOW_("lf xhorse reset") "` or `" _YELLOW_("lf xhorse configure") "` can recover it.");
 }
 
@@ -499,8 +499,8 @@ static int CmdLFXhorseReset(const char *Cmd) {
     CLIParserInit(&ctx, "lf xhorse reset",
                   "Restore an Xhorse XT27A to its factory-default ID46/HITAG2 personality\n"
                   "(type 0x36 + default UID/password/config).  Does not blank the chip.\n"
-                  "Also recovers a chip stuck emulating an EM type (ID11/12/13) or ID48, which\n"
-                  "never answers the normal handshake.",
+                  "Also recovers a chip stuck emulating an EM type (ID11/12/13), ID48 or ID8A,\n"
+                  "which never answers the normal handshake.",
                   "lf xhorse reset");
     void *argtable[] = { arg_param_begin, arg_param_end };
     CLIExecWithReturn(ctx, Cmd, argtable, true);
