@@ -137,8 +137,8 @@ exactly `0x41BE`; otherwise the attempt counts as failed.
 
 ## The sequence
 
-`lf xhorse reset` (and `configure`) first tries the normal session open eight times (20 ms field
-off, 3 ms power-up, handshake). For a chip stuck in an EM type all eight fail, and the firmware falls
+`lf xhorse reset` (and `configure`) first tries the normal session open nine times (field off,
+power-up, handshake; three timings, see below). For a chip stuck in an EM type all nine fail, and the firmware falls
 back to the unlock:
 
 ```
@@ -182,9 +182,10 @@ chip goes silent. The burst turns the EM emulation off. ID11 and ID12 would answ
 down for longer, which is why the cold-boot is always made. Each attempt takes ~2.2 s whatever the
 emulated type; up to three are made.
 
-Normal session opens alternate the short 20 ms off / 3 ms power-up with the VVDI's 70.05 ms off /
-30.18 ms settle. This covers a chip left half-recovered by an earlier failed run (its normal
-handshakes read 10 bits instead of 0). Later sessions in the same run always use the 70.05 ms off /
+Normal session opens cycle three timings: the short 20 ms off / 3 ms power-up, the VVDI's 70.05 ms
+off / 30.18 ms settle, and 20.58 ms off / 198.3 ms on. The second covers a chip left half-recovered
+by an earlier failed run (its normal handshakes read 10 bits instead of 0). The third is for a chip
+set to ID8A (see [Types that need no unlock](#types-that-need-no-unlock)). Later sessions in the same run always use the 70.05 ms off /
 30.18 ms settle. Reset then:
 
 1. reads the chip ID (bank 1, pages `0x33`-`0x36`) and ends the session with `ctl 0x3F`;
@@ -283,6 +284,18 @@ B:  3  1 1 2 1 1 2 2 2 2 1 2 1 2 1 1 1 1 2 2 2 1 3 2 1 1 2 2 2 3 1 1 1 2 2 2 1 1
 
 Gaps of 3 units appear here but never in the EM burst, so the two are different messages; what
 either encodes is unknown.
+
+### Types that need no unlock
+
+A chip emulating ID4C (TI fixed-code) is reader-talks-first, like ID46: in the VVDI's capture
+(`vvdi-id4C-reset-success.pm3`) it is silent at every power-up, the VVDI sends no burst, and the
+chip answers an ordinary XHORSE handshake (off 130 ms, on, XHORSE 30.18 ms later). `lf xhorse reset`
+resets it through the normal session open, without EM recovery.
+
+A chip set to ID8A is also silent and needs no burst (`vvdi-id8A-reset-success.pm3`; the reset writes are
+the usual ones), but it ignored every XHORSE we sent 3 ms or 30 ms after power-up. The VVDI's first XHORSE
+to it goes out 198.3 ms after power-up, following a 20.58 ms field-off, so the session open also tries
+that timing.
 
 ## Evidence
 

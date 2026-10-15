@@ -73,9 +73,14 @@
 // back short/empty (rxlen 0 or 15).  The chip opens its XHORSE-listening window right
 // after power-up, so we field-reset (coil off then on) before each attempt to give it
 // a fresh power-up, and retry until we get a full 16-bit 7372 reply.
-#define XH_MAX_ATTEMPTS      8
+#define XH_MAX_ATTEMPTS      9        // three of each session-open timing (xh_open_session)
 #define XH_T_FIELD_OFF_US    20000    // coil off long enough to reset the chip (VVDI uses 20-60 ms)
 #define XH_T_POWERUP_US      3000     // let the chip power up again before XHORSE
+// A chip set to ID8A ignores XHORSE sent 3 ms or 30 ms after power-up, even after a 1.57 s
+// cold-boot.  The VVDI's first XHORSE to such a chip goes out 198.3 ms (24788 T0) after a
+// 20.58 ms field-off (vvdi-id8A-reset-success.pm3).
+#define XH_T_LONGON_OFF_US   20580
+#define XH_T_LONGON_ON_US    198300
 #define XH_T_XMICRO_ID_US    1000     // gap after the XMICRO ACK before the 4-bit identify query
 // XMICRO must not be sent straight after power-up: the VVDI waits 120.14 ms (15018 T0, identical in
 // its XT27B and XT57B read captures, with nothing else on air in between).  The XT57B happens to
@@ -307,6 +312,18 @@ static int xh_write(xh_sess_t *s, uint8_t page, uint32_t data, bool verify) {
     return PM3_SUCCESS;
 }
 
+// ctl with a data frame, shaped like a WRITE: command (+echo, which is ~op,op rather than a copy),
+// then 32-bit data, then the program wait.  The VVDI ends an ID8A set with ctl 0x30 carrying the
+// value it has just read from bank-1 page 0x3D.
+static void xh_ctl_data(xh_sess_t *s, uint8_t page, uint32_t data) {
+    xh_cmd_reply(s, xh_op(XH_FUNC_CTL, page), 16, NULL);
+
+    uint32_t ct = data ^ xh_ks_next32(&s->ks);
+    uint8_t tx[4] = { (uint8_t)(ct >> 24), (uint8_t)(ct >> 16), (uint8_t)(ct >> 8), (uint8_t)ct };
+    hitag_reader_send_frame(tx, 32, s->led, XH_SEND_SOF);
+    xh_delay_us(XH_T_PROG_US);
+}
+
 // ctl frame (no tag reply): advances the keystream by the 16-bit command only.
 // In every capture a ctl is followed by a fresh sel, i.e. ctl clears the chip's
 // bank selection - so force the next bank access to re-sel.
@@ -403,15 +420,22 @@ static bool xh_4r(xh_sess_t *s, const char *what, int attempt) {
 // its capability read and its writes.
 static int xh_open_session(xh_sess_t *s) {
     for (int attempt = 0; attempt < XH_MAX_ATTEMPTS; attempt++) {
-        if (s->em_mode || (attempt & 1)) {
+        int mode = s->em_mode ? 1 : (attempt % 3);
+        if (mode == 1) {
             // The VVDI's timing: off 70 ms, on, XHORSE 30.18 ms later.  Always used once the chip has
-            // been freed from EM emulation this run, and on every other attempt otherwise: an ID13
+            // been freed from EM emulation this run, and on every third attempt otherwise: an ID13
             // chip left half-recovered by an earlier run answers a 3 ms power-up only rarely
             // (rxlen=10) but does answer this one.
             Gpio_SSC_DOUT_High();
             xh_delay_us(XH_T_EM_OFF_US);
             Gpio_SSC_DOUT_Low();
             xh_delay_us(XH_T_EM_SETTLE_US);
+        } else if (mode == 2) {
+            // Long field-on before XHORSE, for a chip set to ID8A (see XH_T_LONGON_ON_US).
+            Gpio_SSC_DOUT_High();
+            xh_delay_us(XH_T_LONGON_OFF_US);
+            Gpio_SSC_DOUT_Low();
+            xh_delay_us(XH_T_LONGON_ON_US);
         } else {
             xh_field_reset();
         }
@@ -421,6 +445,9 @@ static int xh_open_session(xh_sess_t *s) {
         }
         if (xh_4r(s, "session", attempt) == false) {
             continue;                // handshake was not a real session - re-power and retry
+        }
+        if (g_dbglevel >= DBG_EXTENDED) {
+            Dbprintf("xhorse: session open on attempt %d (timing %d)", attempt, mode);
         }
         return PM3_SUCCESS;
     }
@@ -677,7 +704,7 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
     int ok = PM3_SUCCESS;
     uint32_t uid32 = (p->uidlen >= 4) ? xh_be32(p->uid) : 0;
 
-    // Type byte first (bank 1), as every decoded type except ID8A does.
+    // Type byte first (bank 1), as every decoded type except ID8A does (its recipe writes it last).
     if (p->has_type) {
         xh_bank(s, 1);
         XH_WR(XH_PG_TYPE, p->typeword ? 0x0080008CUL : (uint32_t)p->typebyte);
@@ -802,7 +829,7 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
             XH_WR(0x13, 0x00004600);
             break;
 
-        case XHORSE_R_ID8A: {       // full image, NO type byte; UID at 0x04/0x05
+        case XHORSE_R_ID8A: {       // full image, type byte last; UID at 0x04/0x05
             // 0x04 = uid[1]<<8 | uid[0] ; 0x05 = uid[3]<<8 | uid[2]  (byte-swapped halves)
             uint32_t p04 = ((uint32_t)p->uid[1] << 8) | p->uid[0];
             uint32_t p05 = ((uint32_t)p->uid[3] << 8) | p->uid[2];
@@ -826,8 +853,18 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
                 XH_WR(pg, 0x00000000UL);
             }
             xh_bank(s, 1);
-            for (uint8_t pg = 0x00; pg <= 0x11; pg++) {
+            for (uint8_t pg = 0x00; pg <= 0x1C; pg++) {
                 XH_WR(pg, 0x00000000UL);
+            }
+            XH_WR(XH_PG_TYPE, 0x0000008A);
+            // VVDI's closing step (vvdi-id8A-set-success.pm3): re-sel bank 1, read 0x3D
+            // (0x0002021F), send it back with ctl 0x30, read 0x3D again.  Meaning unknown.
+            {
+                uint32_t v3d = 0;
+                xh_sel(s, 1);
+                xh_read(s, 0x3D, &v3d);
+                xh_ctl_data(s, 0x30, v3d);
+                xh_read(s, 0x3D, &v3d);
             }
             break;
         }

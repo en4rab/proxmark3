@@ -44,7 +44,7 @@ typedef enum {
     XHORSE_R_ID12,        // EM fixed-code, header 0x0014
     XHORSE_R_ID13,        // EM4102 + per-byte bitrev, type word 0x0080008C
     XHORSE_R_TEMPLATE,    // ID4D/4D80/ID4E config-template (config word in .aux)
-    XHORSE_R_ID8A,        // full-memory image, no type byte, UID at 0x04/0x05
+    XHORSE_R_ID8A,        // full-memory image, type byte 0x8A last, UID at 0x04/0x05
     XHORSE_R_ID8E,        // UID at bank-0 0x0B||0x0A
 } xhorse_recipe_t;
 
@@ -52,7 +52,7 @@ typedef enum {
 typedef struct {
     uint8_t  recipe;      // xhorse_recipe_t
     uint8_t  typebyte;    // on-chip 0x3C low byte
-    uint8_t  has_type;    // 1 => write the type byte at 0x3C (0 for ID8A)
+    uint8_t  has_type;    // 1 => write the type byte at 0x3C first (0 for ID8A, whose recipe writes it last)
     uint8_t  typeword;    // 1 => write 32-bit 0x0080008C at 0x3C (ID13)
     uint8_t  uidlen;      // 0 / 4 / 5 / 8
     uint8_t  uid[XHORSE_UID_MAXLEN];
