@@ -137,8 +137,8 @@ exactly `0x41BE`; otherwise the attempt counts as failed.
 
 ## The sequence
 
-`lf xhorse reset` (and `configure`) first tries the normal session open nine times (field off,
-power-up, handshake; three timings, see below). For a chip stuck in an EM type all nine fail, and the firmware falls
+`lf xhorse reset` (and `configure`) first tries the normal session open twelve times (field off,
+power-up, handshake; four timings, see below). For a chip stuck in an EM type all twelve fail, and the firmware falls
 back to the unlock:
 
 ```
@@ -182,9 +182,10 @@ chip goes silent. The burst turns the EM emulation off. ID11 and ID12 would answ
 down for longer, which is why the cold-boot is always made. Each attempt takes ~2.2 s whatever the
 emulated type; up to three are made.
 
-Normal session opens cycle three timings: the short 20 ms off / 3 ms power-up, the VVDI's 70.05 ms
-off / 30.18 ms settle, and 177.1 ms off / 41.8 ms on. The second covers a chip left half-recovered
-by an earlier failed run (its normal handshakes read 10 bits instead of 0). The third is for a chip
+Normal session opens cycle four timings: the short 20 ms off / 3 ms power-up, the VVDI's 70.05 ms
+off / 30.18 ms settle, 177.1 ms off / 41.8 ms on, and that again preceded by the VVDI's TI-style
+probe. The second covers a chip left half-recovered
+by an earlier failed run (its normal handshakes read 10 bits instead of 0). The third and fourth are for a chip
 set to ID8A (see [Types that need no unlock](#types-that-need-no-unlock)). Later sessions in the same run always use the 70.05 ms off /
 30.18 ms settle. Reset then:
 
@@ -299,6 +300,14 @@ real power-up: the sniff stays flat until the real power-up transient), and send
 power-up, in both VVDI captures (`vvdi-id8A-reset-success.pm3`, `-success-2.pm3`). The session
 open's third timing copies this. The first capture also has one lone 56 us field gap 11.6 ms after
 power-up; the second does not, so it is not needed.
+
+Before that, in every round, the VVDI sends a TI-style command: power-up, 50.04 ms charge, 100
+field gaps ~23 T0 wide (gap starts 81 T0 apart, then 52 or 67 T0 in a fixed pattern, identical in
+both captures), and field off 31.74 ms after the last gap. The session open's fourth timing replays
+the last of these before the 177.1 ms off / 41.8 ms on. The Proxmark sniff of a failed reset
+(`pm3-id8A-reset-fail.pm3`) shows the chip is not silent: after our XHORSE and 072F it load-modulates
+weakly at the 32 T0 bit rate, starting ~80 T0 later than a normal reply, but it never sends the
+5AA5 acknowledgement or answers 7372.
 
 ## Evidence
 

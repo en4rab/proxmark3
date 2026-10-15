@@ -344,7 +344,7 @@ static int xh_send_wait(uint16_t cmd, const lf_xhorse_data_t *p, const char *wha
     SendCommandNG(cmd, (uint8_t *)p, p ? sizeof(lf_xhorse_data_t) : 0);
     PacketResponseNG resp;
     // Configure/reset open two sessions; each can spend a second or so on handshake retries,
-    // and the first may add up to three ~2.2 s EM-recovery attempts (worst case ~10.5 s in total).
+    // and the first may add up to three ~2.2 s EM-recovery attempts (worst case ~12 s in total).
     // Allow generous time.
     if (WaitForResponseTimeout(cmd, &resp, 30000) == false) {
         PrintAndLogEx(WARNING, "timeout while waiting for reply");

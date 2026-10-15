@@ -73,7 +73,7 @@
 // back short/empty (rxlen 0 or 15).  The chip opens its XHORSE-listening window right
 // after power-up, so we field-reset (coil off then on) before each attempt to give it
 // a fresh power-up, and retry until we get a full 16-bit 7372 reply.
-#define XH_MAX_ATTEMPTS      9        // three of each session-open timing (xh_open_session)
+#define XH_MAX_ATTEMPTS      12       // three of each session-open timing (xh_open_session)
 #define XH_T_FIELD_OFF_US    20000    // coil off long enough to reset the chip (VVDI uses 20-60 ms)
 #define XH_T_POWERUP_US      3000     // let the chip power up again before XHORSE
 // A chip set to ID8A ignored every XHORSE we sent 3 ms, 30 ms or 198 ms after power-up, even
@@ -82,6 +82,16 @@
 // (vvdi-id8A-reset-success.pm3 and -success-2.pm3).
 #define XH_T_ID8A_OFF_US     177100
 #define XH_T_ID8A_ON_US      41800
+// In every round before that, and in the round just before that XHORSE, the VVDI first sends a
+// TI-style command: power-up, 50.04 ms (6255 T0) charge, 100 field gaps ~23 T0 wide, then field off
+// 31.74 ms (3968 T0) after the last gap.  Gap starts are 81 T0 apart for the first two, then 52 T0
+// (S) or 67 T0 (L) as in xh_id8a_probe (identical in both captures).  Untested whether it matters.
+#define XH_T_ID8A_CHARGE_T0  6255
+#define XH_T_ID8A_GAP_T0     22       // nominal; our gaps sniff ~1 T0 wider than set
+#define XH_T_ID8A_FIRST_T0   81
+#define XH_T_ID8A_TAIL_T0    3968
+static const char xh_id8a_probe[] =
+    "SLLSSSLLSLLLSSLSSSSLLSLLSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSLSLSSSLSLSSL";
 #define XH_T_XMICRO_ID_US    1000     // gap after the XMICRO ACK before the 4-bit identify query
 // XMICRO must not be sent straight after power-up: the VVDI waits 120.14 ms (15018 T0, identical in
 // its XT27B and XT57B read captures, with nothing else on air in between).  The XT57B happens to
@@ -421,8 +431,35 @@ static bool xh_4r(xh_sess_t *s, const char *what, int attempt) {
 // its capability read and its writes.
 static int xh_open_session(xh_sess_t *s) {
     for (int attempt = 0; attempt < XH_MAX_ATTEMPTS; attempt++) {
-        int mode = s->em_mode ? 1 : (attempt % 3);
-        if (mode == 1) {
+        int mode = s->em_mode ? 1 : (attempt % 4);
+        if (g_dbglevel >= DBG_EXTENDED) {
+            Dbprintf("xhorse: session attempt %d, timing %d", attempt, mode);
+        }
+        if (mode == 3) {
+            // The VVDI's whole last round before its first XHORSE to a chip set to ID8A: the TI-style
+            // probe, then the long off and XHORSE 41.8 ms after power-up (see XH_T_ID8A_CHARGE_T0).
+            xh_field_reset();
+            xh_delay_us(XH_T_ID8A_CHARGE_T0 * 8 - XH_T_POWERUP_US);
+            const size_t n = sizeof(xh_id8a_probe) - 1;     // 98 S/L intervals -> 100 gaps
+            for (size_t i = 0; i < n + 2; i++) {
+                uint32_t next;                               // gap start to next gap start (T0)
+                if (i == 0) {
+                    next = XH_T_ID8A_FIRST_T0;
+                } else if (i <= n) {
+                    next = (xh_id8a_probe[i - 1] == 'L') ? 67 : 52;
+                } else {
+                    next = XH_T_ID8A_TAIL_T0;                // last gap -> field off
+                }
+                Gpio_SSC_DOUT_High();
+                xh_delay_us(XH_T_ID8A_GAP_T0 * 8);
+                Gpio_SSC_DOUT_Low();
+                xh_delay_us((next - XH_T_ID8A_GAP_T0) * 8);
+            }
+            Gpio_SSC_DOUT_High();
+            xh_delay_us(XH_T_ID8A_OFF_US);
+            Gpio_SSC_DOUT_Low();
+            xh_delay_us(XH_T_ID8A_ON_US);
+        } else if (mode == 1) {
             // The VVDI's timing: off 70 ms, on, XHORSE 30.18 ms later.  Always used once the chip has
             // been freed from EM emulation this run, and on every third attempt otherwise: an ID13
             // chip left half-recovered by an earlier run answers a 3 ms power-up only rarely
