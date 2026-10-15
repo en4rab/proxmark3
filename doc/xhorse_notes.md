@@ -144,12 +144,12 @@ back to the unlock:
 ```
 for each burst timing in the table (see below):
     OFF 70.05 ms
-    ON  |<-- burst_at -->|<- burst 15.95 ms ->|<- rest of window ->|
+    ON  |<-- burst_at -->|<- burst (EM 15.95 ms, ID48 19.6 ms) ->|<- rest of window ->|
 OFF 1570.94 ms                                   (cold-boot)
 ON  |<- 30.18 ms ->| XHORSE ..8 ms.. 072F ..11.78 ms.. 7372 -> reply
 ```
 
-This is the VVDI's structure. In all eight VVDI reset captures (ID11, ID12, ID13) it sends its
+This is the VVDI's structure. In all eight VVDI EM reset captures (ID11, ID12, ID13) it sends its
 bursts with no handshake in between, then powers down for 1.57 s once, then handshakes. It sends 12
 bursts; the firmware sends one per timing.
 
@@ -174,11 +174,12 @@ commanded time, and sends a burst at every entry because it doesn't know the emu
 |---|---|---|---|---|
 | ID11 | 155.94 ms | 109.54 ms | 6 ID11 frames + 1408 (unit 44.0) | ID11 |
 | ID12/ID13 | 60.30 ms | 13.99 ms | ~1752 (unit 43.8 for ID12; first ID13 frame) | ID12, ID13 |
+| ID48 | 63.86 ms | 12.95 ms | ~1622 (the VVDI's position), with the ID48 burst | ID48 |
 
 A burst at the wrong timing is harmless once the chip is freed: the VVDI keeps bursting after the
 chip goes silent. The burst turns the EM emulation off. ID11 and ID12 would answer the handshake
 30 ms after a 70 ms field-off, but ID13 goes silent and does not answer until it has been powered
-down for longer, which is why the cold-boot is always made. Each attempt takes ~2.1 s whatever the
+down for longer, which is why the cold-boot is always made. Each attempt takes ~2.2 s whatever the
 emulated type; up to three are made.
 
 Normal session opens alternate the short 20 ms off / 3 ms power-up with the VVDI's 70.05 ms off /
@@ -238,6 +239,50 @@ S S L S L S S L L S L L S S L L L S L S S S S L L S S L S S L L L S L S L S S L 
   only the time the burst starts is (see [The sequence](#the-sequence)).
 * What it encodes is unknown. The spacings are close to, but not exactly, multiples of 32 T0
   (30-36 and 61-65). The firmware replays it verbatim (`xh_em_burst` in `armsrc/xhorse.c`).
+
+## The ID48 unlock burst
+
+A chip emulating ID48 (Megamos) is not freed by the EM burst. In the VVDI's capture
+(`vvdi-id48-reset-success.pm3`) the chip broadcasts a 160 T0 periodic pattern from ~213 T0 after
+power-up, and the VVDI sends a **different burst** 1622 T0 after power-up, on the same ~32 T0 grid
+with the same two pulse widths. Its sequence is short (~4.4 s, with no 1.57 s cold-boot):
+
+| Step | VVDI |
+|---|---|
+| 1 | off 120 ms, on 63.9 ms: burst **A** at 1622 T0 |
+| 2 | off 720 ms, XMICRO probe (120 ms after power-up), then 3 x (off 30 ms, XMICRO): no answer |
+| 3 | off 130 ms, on 63.9 ms: burst **A** again |
+| 4 | as step 2: no answer |
+| 5 | off 140 ms, on 63.9 ms: burst **B** at 1621 T0 |
+| 6 | off 420 ms, on, XHORSE 30.08 ms later: `5AA5`, handshake, then the normal reset writes |
+
+Burst A has 48 pulses; burst B is burst A with its third pulse (at +69 T0) left out, matching to
+within 1-3 T0 elsewhere. After each A the chip is still broadcasting at the next power-up; after B
+it is silent and answers XHORSE. A is followed by XMICRO (channel B) probes and B by XHORSE
+(channel A), so A is probably the variant for the XMICRO-family chips; that is a guess. The firmware
+sends only B, as a third entry in the timing table, before the usual cold-boot (1.57 s rather than
+the VVDI's 420 ms here).
+
+Burst B, 47 field-off pulses, 19.6 ms (2447 T0); offsets in T0 from the start of the first pulse,
+widths as held off (measured minus 2 T0), averaged over the three occurrences (agreeing within 2 T0):
+
+```
+start: 0 35 131 167 200 262 298 332 394 459 525 590 626 689 725 787 823 857 890 923
+       985 1050 1116 1152 1247 1313 1348 1382 1444 1510 1575 1673 1709 1742 1776 1838
+       1903 1969 2004 2038 2071 2165 2202 2264 2300 2333 2428
+width: 19 17 19 16 16 20 17 16 19 19 20 20 17 20 16 20 17 16 16 16 19 20 19 16
+       19 19 16 16 19 20 19 19 16 16 15 20 19 20 17 16 16 20 16 19 16 16 19
+```
+
+Gaps in units of ~32 T0 (burst A has `11` where B has `3` at the start):
+
+```
+A: 1 1 2 1 1 2 1 1 2 2 2 2 1 2 1 2 1 1 1 1 2 2 2 1 3 2 1 1 2 2 2 3 1 1 1 2 2 2 1 1 1 3 1 2 1 1 3
+B:  3  1 1 2 1 1 2 2 2 2 1 2 1 2 1 1 1 1 2 2 2 1 3 2 1 1 2 2 2 3 1 1 1 2 2 2 1 1 1 3 1 2 1 1 3
+```
+
+Gaps of 3 units appear here but never in the EM burst, so the two are different messages; what
+either encodes is unknown.
 
 ## Evidence
 
