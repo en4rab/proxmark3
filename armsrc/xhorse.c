@@ -91,7 +91,7 @@
 // Each READ advances the keystream identically on chip and reader, so retrying is safe.
 #define XH_VERIFY_READS      3
 
-// Recovery for a chip stuck emulating a non-HITAG2 type (e.g. ID11 = EM4100).  Such a chip
+// Recovery for a chip stuck emulating a non-HITAG2 type (e.g. ID11 = EM4100, ID48 = Megamos).  Such a chip
 // continuously broadcasts its fixed code and ignores the XHORSE config channel.
 //
 // What frees it is one reader burst sent a set time after power-up (xh_em_burst:
@@ -110,8 +110,9 @@
 // T0.  For ID11 bursts at ~1427 T0 and later fail - the VVDI's own first try often does - so the
 // timings aim at the window's centre, commanding 3.5 T0 early because our burst reaches the air that
 // much after the commanded time.  ID13 (RF/64) is freed in its first frame after power-up (VVDI at
-// 1398 T0, ours at ~1752) but not by the same position in a later frame.  We don't know the emulated
-// type, so the entries are tried in turn.
+// 1398 T0, ours at ~1752) but not by the same position in a later frame.  ID48 (Megamos) needs a
+// different burst (xh_burst_id48) at 1622 T0.  We don't know the emulated type, so the entries are
+// tried in turn.
 #define XH_T_EM_OFF_US            70050    // field off before and after the burst window (VVDI)
 #define XH_T_EM_SETTLE_US         30180    // field on this long before XHORSE (VVDI, after the chip is freed)
 #define XH_T_EM_COLDBOOT_US     1570940    // VVDI's power-down between the bursts and its handshake (ID13 needs it)
@@ -441,49 +442,80 @@ static const uint8_t xh_emb_width[43] = {
     20, 16, 15, 19, 16, 19, 15, 15, 19, 19, 15, 19, 19, 16, 15, 19, 19, 19, 16, 19, 16, 15, 15, 15,
     19, 19, 16, 15, 19, 16, 15, 19, 19, 19, 16, 19, 16, 19, 16, 15, 19, 19, 16
 };
-#define XH_EMB_N        (sizeof(xh_emb_start) / sizeof(xh_emb_start[0]))
-// burst length in us: start of the last pulse + its width (1994 T0 = 15.95 ms)
-#define XH_EMB_LEN_US   (((uint32_t)xh_emb_start[XH_EMB_N - 1] + xh_emb_width[XH_EMB_N - 1]) * 8)
 
-// Emit the burst with the field on.  One precision-counter reference covers it (1994 T0 = 23928
+// The VVDI's ID48 (Megamos) unlock burst: a different 47-pulse sequence on the same ~32 T0 grid,
+// sent 1622 T0 after power-up.  Measured the same way as the EM burst, averaged over the three
+// occurrences in one VVDI capture (they agree to within 2 T0).  The VVDI first sends twice a 48-pulse
+// variant with an extra pulse at +69 T0, each followed by XMICRO probes (channel B), which did not
+// free an XT27A; this 47-pulse one, followed by XHORSE, did.  See doc/xhorse_notes.md.
+static const uint16_t xh_id48b_start[47] = {
+    0, 35, 131, 167, 200, 262, 298, 332, 394, 459, 525, 590, 626, 689, 725, 787, 823, 857, 890, 923,
+    985, 1050, 1116, 1152, 1247, 1313, 1348, 1382, 1444, 1510, 1575, 1673, 1709, 1742, 1776, 1838,
+    1903, 1969, 2004, 2038, 2071, 2165, 2202, 2264, 2300, 2333, 2428
+};
+static const uint8_t xh_id48b_width[47] = {
+    19, 17, 19, 16, 16, 20, 17, 16, 19, 19, 20, 20, 17, 20, 16, 20, 17, 16, 16, 16, 19, 20, 19, 16,
+    19, 19, 16, 16, 19, 20, 19, 19, 16, 16, 15, 20, 19, 20, 17, 16, 16, 20, 16, 19, 16, 16, 19
+};
+
+typedef struct {
+    const uint16_t *start;      // T0 from the start of the first pulse
+    const uint8_t  *width;      // T0 the field is held off
+    size_t          n;
+} xh_burst_t;
+
+static const xh_burst_t xh_burst_em   = { xh_emb_start,   xh_emb_width,   sizeof(xh_emb_start) / sizeof(xh_emb_start[0]) };
+static const xh_burst_t xh_burst_id48 = { xh_id48b_start, xh_id48b_width, sizeof(xh_id48b_start) / sizeof(xh_id48b_start[0]) };
+
+// burst length in us: start of the last pulse + its width (EM 1994 T0 = 15.95 ms, ID48 2447 T0 = 19.6 ms)
+static uint32_t xh_burst_len_us(const xh_burst_t *b) {
+    return ((uint32_t)b->start[b->n - 1] + b->width[b->n - 1]) * 8;
+}
+
+// Emit a burst with the field on.  One precision-counter reference covers it (2447 T0 = 29364
 // ticks < 65536), so pulse positions don't accumulate per-pulse error.
-static void xh_em_burst(void) {
+static void xh_em_burst(const xh_burst_t *b) {
     const uint16_t ref = GetPrecisionCounterRaw();
-    for (size_t i = 0; i < XH_EMB_N; i++) {
-        while (GetPrecisionCounterDelta(ref) < (uint16_t)(T0 * xh_emb_start[i])) {};
+    for (size_t i = 0; i < b->n; i++) {
+        while (GetPrecisionCounterDelta(ref) < (uint16_t)(T0 * b->start[i])) {};
         Gpio_SSC_DOUT_High();                                        // field off
-        while (GetPrecisionCounterDelta(ref) < (uint16_t)(T0 * (xh_emb_start[i] + xh_emb_width[i]))) {};
+        while (GetPrecisionCounterDelta(ref) < (uint16_t)(T0 * (b->start[i] + b->width[i]))) {};
         Gpio_SSC_DOUT_Low();                                         // field on
     }
 }
 
-// Burst positions per frame-unit size (see XH_T_EM_OFF_US).  Each is a field-on window of on_us
-// with the burst commanded burst_at_us after power-up.
+// Burst windows (see XH_T_EM_OFF_US): which burst, in a field-on window of on_us, commanded
+// burst_at_us after power-up.
 typedef struct {
-    const char *name;
-    uint32_t    on_us;
-    uint32_t    burst_at_us;
+    const char       *name;
+    const xh_burst_t *burst;
+    uint32_t          on_us;
+    uint32_t          burst_at_us;
 } xh_em_timing_t;
 
 static const xh_em_timing_t xh_em_timings[] = {
     // 13692.5 T0 commanded -> ~13696 on air = 6 ID11 frames + 1408 T0 (unit 44.0).  Frees ID11.  It
     // does NOT free a fresh ID13 even though it is the same position 3 ID13 frames later: ID13 seems
     // to listen only in its first frame after power-up (the VVDI frees it at 11.18 ms).
-    { "ID11 (32 T0 units)",       155940, 109540 },
+    { "ID11 (32 T0 units)",      &xh_burst_em,   155940, 109540 },
     // 1748.75 T0 commanded -> ~1752 on air = unit 43.8 of ID12's 40 T0 units.  Frees ID12 (13.93 ms,
     // the VVDI's value, freed it at 1741-1745), and also frees ID13 in its first frame - ID13 then
     // only answers after the cold-boot.
-    { "ID12/ID13 (first frame)",  60300,  13990 },
+    { "ID12/ID13 (first frame)", &xh_burst_em,   60300,  13990 },
+    // 1618.5 T0 commanded -> ~1622 on air, the VVDI's position in all three of its tries; it keeps
+    // the field on 63.86 ms in total.  Its own power-down before the handshake is 420 ms; the
+    // cold-boot here is longer.
+    { "ID48 (Megamos)",          &xh_burst_id48, 63860,  12948 },
 };
 
-// Pull a chip stuck broadcasting a non-HITAG2 emulation (ID11/ID12/ID13) back onto the config
+// Pull a chip stuck broadcasting a non-HITAG2 emulation (ID11/ID12/ID13/ID48) back onto the config
 // channel, structured as the VVDI does it: bursts first, no handshake in between, then one cold-boot
 // and one handshake.  Each attempt sends one burst per entry of xh_em_timings[] (each in its own
 // power cycle: off 70 ms, on, burst at burst_at_us, rest of the window), so whichever type the chip
 // emulates gets its timing; a burst at the wrong timing is harmless once the chip is freed (the
 // VVDI keeps bursting after the chip goes silent).  Then field off for the VVDI's 1.57 s cold-boot,
 // on, XHORSE handshake 30.18 ms later.  ID13 only answers after the cold-boot; ID11/ID12 answer
-// either way.  ~2.1 s per attempt.
+// either way.  ~2.2 s per attempt.
 static int xh_open_session_em(xh_sess_t *s) {
     for (int attempt = 0; attempt < XH_EM_TRIES; attempt++) {
         for (size_t t = 0; t < sizeof(xh_em_timings) / sizeof(xh_em_timings[0]); t++) {
@@ -493,8 +525,8 @@ static int xh_open_session_em(xh_sess_t *s) {
             xh_delay_us(XH_T_EM_OFF_US);
             Gpio_SSC_DOUT_Low();                                     // field on: chip boots, broadcasts EM
             xh_delay_us(tm->burst_at_us);
-            xh_em_burst();
-            xh_delay_us(tm->on_us - tm->burst_at_us - XH_EMB_LEN_US);
+            xh_em_burst(tm->burst);
+            xh_delay_us(tm->on_us - tm->burst_at_us - xh_burst_len_us(tm->burst));
         }
 
         Gpio_SSC_DOUT_High();                                        // cold-boot
@@ -693,7 +725,9 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
             break;
 
         case XHORSE_R_ID48: {       // Megamos: 16-word bank-0 image
-            static const uint32_t img[4] = { 0x00005678, 0x0000A1BF, 0x0000D707, 0x000078B8 };
+            // The UID is held 16 bits per page, low half first: UID 78B8D707 is
+            // 0x02 = 0x0000D707, 0x03 = 0x000078B8.
+            const uint32_t img[4] = { 0x00005678, 0x0000A1BF, uid32 & 0xFFFF, uid32 >> 16 };
             xh_bank(s, 0);
             for (uint8_t pg = 0x00; pg <= 0x03; pg++) {
                 XH_WR(pg, img[pg]);

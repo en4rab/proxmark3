@@ -41,7 +41,7 @@ static int CmdHelp(const char *Cmd);
 //-----------------------------------------------------------------------------
 // Type catalog
 //-----------------------------------------------------------------------------
-typedef enum { UID_NONE, UID_OPT4, UID_REQ5, UID_REQ8 } xh_uidrule_t;
+typedef enum { UID_NONE, UID_OPT4, UID_REQ4, UID_REQ5, UID_REQ8 } xh_uidrule_t;
 
 typedef struct {
     const char   *canon;     // canonical token
@@ -66,7 +66,7 @@ static const xh_type_t g_types[] = {
     { "7938",  "ID47",                              XHORSE_R_7938,     0x47, true,  false, UID_OPT4, 0,      "PCF7938" },
     { "7939",  "ID49",                              XHORSE_R_7939,     0x39, true,  false, UID_NONE, 0,      "PCF7939 (config only)" },
     { "7946",  "",                                  XHORSE_R_HITAG2,   0x46, true,  false, UID_OPT4, 0,      "PCF7946 (HITAG2 image)" },
-    { "ID48",  "",                                  XHORSE_R_ID48,     0x48, true,  false, UID_NONE, 0,      "Megamos / ID48" },
+    { "ID48",  "",                                  XHORSE_R_ID48,     0x48, true,  false, UID_REQ4, 0,      "Megamos / ID48" },
     { "ID4C",  "",                                  XHORSE_R_ID4C,     0x4C, true,  false, UID_REQ8, 0,      "CRC16-KERMIT UID" },
     { "ID4D",  "ID60 ID63",                         XHORSE_R_TEMPLATE, 0x4D, true,  false, UID_NONE, 0xAAF3, "config-template" },
     { "4D80",  "ID70 ID83",                         XHORSE_R_TEMPLATE, 0x80, true,  false, UID_NONE, 0x9201, "config-template" },
@@ -143,6 +143,8 @@ static const char *uidrule_text(xh_uidrule_t r) {
             return "5 bytes";
         case UID_OPT4:
             return "4 bytes";
+        case UID_REQ4:
+            return "4 (req)";
         case UID_NONE:
             return "none";
     }
@@ -189,7 +191,7 @@ static int CmdLFXhorseTypes(const char *Cmd) {
     PrintAndLogEx(INFO, "");
     PrintAndLogEx(INFO, "  * ID13 writes 0x3C = 0x0080008C (high half set).");
     PrintAndLogEx(INFO, "  Names are case-insensitive; " _YELLOW_("none") " = no UID accepted.");
-    PrintAndLogEx(INFO, "  A 4-byte UID is auto-generated if -u is omitted (as the app does).");
+    PrintAndLogEx(INFO, "  " _YELLOW_("4 bytes") " = auto-generated if -u is omitted (as the app does); " _YELLOW_("4 (req)") " = -u required.");
     PrintAndLogEx(INFO, "  Not supported: " _RED_("ID8C") " (opaque write, not decoded);");
     PrintAndLogEx(INFO, "                 " _RED_("ID4A / MQB / MQB49 / MQB-Renegade / MQB-4.5") " (XT27B / XT57 only).");
     PrintAndLogEx(NORMAL, "");
@@ -229,11 +231,11 @@ static int xh_request_info(uint16_t cmd, lf_xhorse_info_t *out) {
     return PM3_SUCCESS;
 }
 
-// info/dump never send the EM-recovery burst (it changes the chip), so a chip stuck in an EM
-// emulation simply doesn't answer them.  Say so.
+// info/dump never send the EM-recovery burst (it changes the chip), so a chip stuck in an EM or
+// ID48 emulation simply doesn't answer them.  Say so.
 static void xh_print_not_found(void) {
     PrintAndLogEx(FAILED, "No XT27A answered the " _YELLOW_("XHORSE") " handshake");
-    PrintAndLogEx(HINT, "An XT27A emulating an EM type (ID11/12/13) broadcasts continuously and never answers;");
+    PrintAndLogEx(HINT, "An XT27A emulating an EM type (ID11/12/13) or ID48 broadcasts continuously and never answers;");
     PrintAndLogEx(HINT, "`" _YELLOW_("lf xhorse reset") "` or `" _YELLOW_("lf xhorse configure") "` can recover it.");
 }
 
@@ -344,7 +346,7 @@ static int xh_send_wait(uint16_t cmd, const lf_xhorse_data_t *p, const char *wha
     SendCommandNG(cmd, (uint8_t *)p, p ? sizeof(lf_xhorse_data_t) : 0);
     PacketResponseNG resp;
     // Configure/reset open two sessions; each can spend a second or so on handshake retries,
-    // and the first may add up to three ~2.1 s EM-recovery attempts (worst case ~9 s in total).
+    // and the first may add up to three ~2.2 s EM-recovery attempts (worst case ~9.5 s in total).
     // Allow generous time.
     if (WaitForResponseTimeout(cmd, &resp, 30000) == false) {
         PrintAndLogEx(WARNING, "timeout while waiting for reply");
@@ -381,6 +383,7 @@ static int CmdLFXhorseConfigure(const char *Cmd) {
                   "lf xhorse configure -t ID46                 -> HITAG2, auto 4-byte UID\n"
                   "lf xhorse configure -t 7936 -u 11223344     -> same type, chosen UID\n"
                   "lf xhorse configure -t ID13 -u 20471BB01B   -> EM4102, 5-byte UID\n"
+                  "lf xhorse configure -t ID48 -u 11223344     -> Megamos, 4-byte UID\n"
                   "lf xhorse configure -t ID4C -u D3DA834C7E39EE98");
 
     void *argtable[] = {
@@ -432,6 +435,12 @@ static int CmdLFXhorseConfigure(const char *Cmd) {
         case UID_NONE:
             if (uidlen > 0) {
                 PrintAndLogEx(FAILED, "%s takes no UID", t->canon);
+                return PM3_EINVARG;
+            }
+            break;
+        case UID_REQ4:
+            if (uidlen != 4) {
+                PrintAndLogEx(FAILED, "%s needs a 4-byte UID (got %d)", t->canon, uidlen);
                 return PM3_EINVARG;
             }
             break;
@@ -492,8 +501,8 @@ static int CmdLFXhorseReset(const char *Cmd) {
     CLIParserInit(&ctx, "lf xhorse reset",
                   "Restore an Xhorse XT27A to its factory-default ID46/HITAG2 personality\n"
                   "(type 0x36 + default UID/password/config).  Does not blank the chip.\n"
-                  "Also recovers a chip stuck emulating an EM type (ID11/12/13), which never\n"
-                  "answers the normal handshake.",
+                  "Also recovers a chip stuck emulating an EM type (ID11/12/13) or ID48, which\n"
+                  "never answers the normal handshake.",
                   "lf xhorse reset");
     void *argtable[] = { arg_param_begin, arg_param_end };
     CLIExecWithReturn(ctx, Cmd, argtable, true);
