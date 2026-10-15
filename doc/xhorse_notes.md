@@ -183,7 +183,7 @@ down for longer, which is why the cold-boot is always made. Each attempt takes ~
 emulated type; up to three are made.
 
 Normal session opens cycle three timings: the short 20 ms off / 3 ms power-up, the VVDI's 70.05 ms
-off / 30.18 ms settle, and 20.58 ms off / 198.3 ms on. The second covers a chip left half-recovered
+off / 30.18 ms settle, and 177.1 ms off / 41.8 ms on. The second covers a chip left half-recovered
 by an earlier failed run (its normal handshakes read 10 bits instead of 0). The third is for a chip
 set to ID8A (see [Types that need no unlock](#types-that-need-no-unlock)). Later sessions in the same run always use the 70.05 ms off /
 30.18 ms settle. Reset then:
@@ -293,9 +293,12 @@ chip answers an ordinary XHORSE handshake (off 130 ms, on, XHORSE 30.18 ms later
 resets it through the normal session open, without EM recovery.
 
 A chip set to ID8A is also silent and needs no burst (`vvdi-id8A-reset-success.pm3`; the reset writes are
-the usual ones), but it ignored every XHORSE we sent 3 ms or 30 ms after power-up. The VVDI's first XHORSE
-to it goes out 198.3 ms after power-up, following a 20.58 ms field-off, so the session open also tries
-that timing.
+the usual ones), but it ignored every XHORSE we sent straight after power-up (3, 30 or 198 ms on). Before its first
+XHORSE the VVDI keeps the field off 177.1 ms (a 20.6 ms "off" followed by a one-sample blip, not a
+real power-up: the sniff stays flat until the real power-up transient), and sends XHORSE 41.8 ms after
+power-up, in both VVDI captures (`vvdi-id8A-reset-success.pm3`, `-success-2.pm3`). The session
+open's third timing copies this. The first capture also has one lone 56 us field gap 11.6 ms after
+power-up; the second does not, so it is not needed.
 
 ## Evidence
 
