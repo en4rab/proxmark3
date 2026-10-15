@@ -76,11 +76,12 @@
 #define XH_MAX_ATTEMPTS      9        // three of each session-open timing (xh_open_session)
 #define XH_T_FIELD_OFF_US    20000    // coil off long enough to reset the chip (VVDI uses 20-60 ms)
 #define XH_T_POWERUP_US      3000     // let the chip power up again before XHORSE
-// A chip set to ID8A ignores XHORSE sent 3 ms or 30 ms after power-up, even after a 1.57 s
-// cold-boot.  The VVDI's first XHORSE to such a chip goes out 198.3 ms (24788 T0) after a
-// 20.58 ms field-off (vvdi-id8A-reset-success.pm3).
-#define XH_T_LONGON_OFF_US   20580
-#define XH_T_LONGON_ON_US    198300
+// A chip set to ID8A ignored every XHORSE we sent 3 ms, 30 ms or 198 ms after power-up, even
+// after a 1.57 s cold-boot.  Before its first XHORSE to such a chip the VVDI keeps the field off
+// 177.1 ms (22135/22136 T0), then sends XHORSE 41.8 ms (5226/5225 T0) after power-up
+// (vvdi-id8A-reset-success.pm3 and -success-2.pm3).
+#define XH_T_ID8A_OFF_US     177100
+#define XH_T_ID8A_ON_US      41800
 #define XH_T_XMICRO_ID_US    1000     // gap after the XMICRO ACK before the 4-bit identify query
 // XMICRO must not be sent straight after power-up: the VVDI waits 120.14 ms (15018 T0, identical in
 // its XT27B and XT57B read captures, with nothing else on air in between).  The XT57B happens to
@@ -431,11 +432,11 @@ static int xh_open_session(xh_sess_t *s) {
             Gpio_SSC_DOUT_Low();
             xh_delay_us(XH_T_EM_SETTLE_US);
         } else if (mode == 2) {
-            // Long field-on before XHORSE, for a chip set to ID8A (see XH_T_LONGON_ON_US).
+            // The VVDI's timing for a chip set to ID8A (see XH_T_ID8A_OFF_US).
             Gpio_SSC_DOUT_High();
-            xh_delay_us(XH_T_LONGON_OFF_US);
+            xh_delay_us(XH_T_ID8A_OFF_US);
             Gpio_SSC_DOUT_Low();
-            xh_delay_us(XH_T_LONGON_ON_US);
+            xh_delay_us(XH_T_ID8A_ON_US);
         } else {
             xh_field_reset();
         }
