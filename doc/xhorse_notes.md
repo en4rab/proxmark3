@@ -138,7 +138,8 @@ exactly `0x41BE`; otherwise the attempt counts as failed.
 ## The sequence
 
 `lf xhorse reset` (and `configure`) first tries the normal session open twelve times (field off,
-power-up, handshake; four timings, see below). For a chip stuck in an EM type all twelve fail, and the firmware falls
+power-up, handshake; four timings, see below; `info` and `dump` use only the first three, nine
+times). For a chip stuck in an EM type all of them fail, and the firmware falls
 back to the unlock:
 
 ```
@@ -304,7 +305,10 @@ power-up; the second does not, so it is not needed.
 Before that, in every round, the VVDI sends a TI-style command: power-up, 50.04 ms charge, 100
 field gaps ~23 T0 wide (gap starts 81 T0 apart, then 52 or 67 T0 in a fixed pattern, identical in
 both captures), and field off 31.74 ms after the last gap. The session open's fourth timing replays
-the last of these before the 177.1 ms off / 41.8 ms on. The Proxmark sniff of a failed reset
+the last of these before the 177.1 ms off / 41.8 ms on. This is what opens an ID8A chip (hardware,
+2026-10-16: session open on timing 3 after timings 0-2 failed). It also reverts the chip's type
+byte to 0x36: `info` run through it read type 0x36 while bank 0 still held the ID8A image. So only
+`reset` and `configure` send it; `info` and `dump` report an ID8A chip as not found. The Proxmark sniff of a failed reset
 (`pm3-id8A-reset-fail.pm3`) shows the chip is not silent: after our XHORSE and 072F it load-modulates
 weakly at the 32 T0 bit rate, starting ~80 T0 later than a normal reply, but it never sends the
 5AA5 acknowledgement or answers 7372.
