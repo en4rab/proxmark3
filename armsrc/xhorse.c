@@ -73,7 +73,7 @@
 // back short/empty (rxlen 0 or 15).  The chip opens its XHORSE-listening window right
 // after power-up, so we field-reset (coil off then on) before each attempt to give it
 // a fresh power-up, and retry until we get a full 16-bit 7372 reply.
-#define XH_MAX_ATTEMPTS      12       // three of each session-open timing (xh_open_session)
+#define XH_TRIES_PER_TIMING  3        // session-open attempts per timing (xh_open_session)
 #define XH_T_FIELD_OFF_US    20000    // coil off long enough to reset the chip (VVDI uses 20-60 ms)
 #define XH_T_POWERUP_US      3000     // let the chip power up again before XHORSE
 // A chip set to ID8A ignored every XHORSE we sent 3 ms, 30 ms or 198 ms after power-up, even
@@ -85,7 +85,9 @@
 // In every round before that, and in the round just before that XHORSE, the VVDI first sends a
 // TI-style command: power-up, 50.04 ms (6255 T0) charge, 100 field gaps ~23 T0 wide, then field off
 // 31.74 ms (3968 T0) after the last gap.  Gap starts are 81 T0 apart for the first two, then 52 T0
-// (S) or 67 T0 (L) as in xh_id8a_probe (identical in both captures).  Untested whether it matters.
+// (S) or 67 T0 (L) as in xh_id8a_probe (identical in both captures).  Replaying it is what lets
+// us reach an ID8A chip, but it also reverts the chip's type byte to 0x36 (info read 0x36 after it
+// while bank 0 still held the ID8A image), so only reset/configure send it (xh_sess_t.allow_probe).
 #define XH_T_ID8A_CHARGE_T0  6255
 #define XH_T_ID8A_GAP_T0     22       // nominal; our gaps sniff ~1 T0 wider than set
 #define XH_T_ID8A_FIRST_T0   81
@@ -210,6 +212,7 @@ typedef struct {
     bool    led;
     int8_t  cur_bank;   // last sel'd bank, or -1
     bool    em_mode;    // freed from EM emulation this run: later sessions reopen with the EM off/settle timing
+    bool    allow_probe; // may send the ID8A probe, which reverts the type byte (reset/configure only)
 } xh_sess_t;
 
 static uint32_t xh_bits_to_u32(const uint8_t *rx, int nbits) {
@@ -430,8 +433,9 @@ static bool xh_4r(xh_sess_t *s, const char *what, int attempt) {
 // more commands after a `ctl` must open a new session here first, as the VVDI does between
 // its capability read and its writes.
 static int xh_open_session(xh_sess_t *s) {
-    for (int attempt = 0; attempt < XH_MAX_ATTEMPTS; attempt++) {
-        int mode = s->em_mode ? 1 : (attempt % 4);
+    const int timings = s->allow_probe ? 4 : 3;
+    for (int attempt = 0; attempt < timings * XH_TRIES_PER_TIMING; attempt++) {
+        int mode = s->em_mode ? 1 : (attempt % timings);
         if (g_dbglevel >= DBG_EXTENDED) {
             Dbprintf("xhorse: session attempt %d, timing %d", attempt, mode);
         }
@@ -630,6 +634,7 @@ static int xh_begin(xh_sess_t *s, bool ledcontrol) {
 // Like xh_begin, but also handles a chip stuck in a non-HITAG2 emulation (reset/configure).
 static int xh_begin_any(xh_sess_t *s, bool ledcontrol) {
     xh_setup(s, ledcontrol);
+    s->allow_probe = true;      // the chip is about to be rewritten anyway
     return xh_open_any(s);
 }
 
