@@ -65,7 +65,7 @@ static const xh_type_t g_types[] = {
     { "7937",  "",                                  XHORSE_R_HITAG2,   0x37, true,  false, UID_OPT4, 0,      "PCF7937 (HITAG2 image)" },
     { "7938",  "ID47",                              XHORSE_R_7938,     0x47, true,  false, UID_OPT4, 0,      "PCF7938" },
     { "7939",  "ID49",                              XHORSE_R_7939,     0x39, true,  false, UID_NONE, 0,      "PCF7939 (config only)" },
-    { "7946",  "",                                  XHORSE_R_HITAG2,   0x46, true,  false, UID_OPT4, 0,      "PCF7946 (HITAG2 image)" },
+    { "7946",  "",                                  XHORSE_R_HITAG2,   0x46, true,  false, UID_OPT4, 0,      "PCF7946 / HITAG2 plus" },
     { "ID48",  "",                                  XHORSE_R_ID48,     0x48, true,  false, UID_REQ4, 0,      "Megamos / ID48" },
     { "ID4C",  "",                                  XHORSE_R_ID4C,     0x4C, true,  false, UID_REQ8, 0,      "CRC16-KERMIT UID" },
     { "ID4D",  "ID60 ID63",                         XHORSE_R_TEMPLATE, 0x4D, true,  false, UID_NONE, 0xAAF3, "config-template" },
@@ -166,7 +166,7 @@ static int CmdLFXhorseTypes(const char *Cmd) {
     PrintAndLogEx(NORMAL, "");
     PrintAndLogEx(INFO, "Xhorse XT27A - emulated types accepted by " _YELLOW_("`lf xhorse configure -t`"));
     PrintAndLogEx(INFO, "");
-    PrintAndLogEx(INFO, "  %-38s %-7s %-7s %s", "-t token(s)", "on-chip", "UID", "emulates");
+    PrintAndLogEx(INFO, "  %-38s %-7s %-7s %s", "-t type", "on-chip", "UID", "emulates");
     PrintAndLogEx(INFO, "  %-38s %-7s %-7s %s", "--------------------------------------", "-------", "-------", "---------------------------");
 
     for (size_t i = 0; i < XH_NTYPES; i++) {
@@ -230,10 +230,10 @@ static int xh_request_info(uint16_t cmd, lf_xhorse_info_t *out) {
 }
 
 // info/dump never send the EM-recovery burst or the ID8A probe (both change the chip), so a chip
-// stuck in an EM, ID48 or ID8A emulation simply doesn't answer them.  Say so.
+// stuck in an EM, ID48, ID8E or ID8A emulation simply doesn't answer them.  Say so.
 static void xh_print_not_found(void) {
     PrintAndLogEx(FAILED, "No XT27A answered the " _YELLOW_("XHORSE") " handshake");
-    PrintAndLogEx(HINT, "An XT27A emulating an EM type (ID11/12/13), ID48 or ID8A never answers it;");
+    PrintAndLogEx(HINT, "An XT27A emulating an EM type (ID11/12/13), ID48, ID8E or ID8A never answers it;");
     PrintAndLogEx(HINT, "`" _YELLOW_("lf xhorse reset") "` or `" _YELLOW_("lf xhorse configure") "` can recover it.");
 }
 
@@ -344,7 +344,7 @@ static int xh_send_wait(uint16_t cmd, const lf_xhorse_data_t *p, const char *wha
     SendCommandNG(cmd, (uint8_t *)p, p ? sizeof(lf_xhorse_data_t) : 0);
     PacketResponseNG resp;
     // Configure/reset open two sessions; each can spend a second or so on handshake retries,
-    // and the first may add up to three ~2.2 s EM-recovery attempts (worst case ~12 s in total).
+    // and the first may add up to three ~2.3 s EM-recovery attempts (worst case ~12.5 s in total).
     // Allow generous time.
     if (WaitForResponseTimeout(cmd, &resp, 30000) == false) {
         PrintAndLogEx(WARNING, "timeout while waiting for reply");
@@ -499,8 +499,8 @@ static int CmdLFXhorseReset(const char *Cmd) {
     CLIParserInit(&ctx, "lf xhorse reset",
                   "Restore an Xhorse XT27A to its factory-default ID46/HITAG2 personality\n"
                   "(type 0x36 + default UID/password/config).  Does not blank the chip.\n"
-                  "Also recovers a chip stuck emulating an EM type (ID11/12/13), ID48 or ID8A,\n"
-                  "which never answers the normal handshake.",
+                  "Also recovers a chip stuck emulating an EM type (ID11/12/13), ID48, ID8E or\n"
+                  "ID8A, which never answers the normal handshake.",
                   "lf xhorse reset");
     void *argtable[] = { arg_param_begin, arg_param_end };
     CLIExecWithReturn(ctx, Cmd, argtable, true);

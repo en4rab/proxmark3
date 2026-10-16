@@ -175,12 +175,13 @@ commanded time, and sends a burst at every entry because it doesn't know the emu
 |---|---|---|---|---|
 | ID11 | 155.94 ms | 109.54 ms | 6 ID11 frames + 1408 (unit 44.0) | ID11 |
 | ID12/ID13 | 60.30 ms | 13.99 ms | ~1752 (unit 43.8 for ID12; first ID13 frame) | ID12, ID13 |
+| ID8E | 52.88 ms | 12.25 ms | ~1535 (the VVDI's position), with the ID48 burst | ID8E (untested) |
 | ID48 | 63.86 ms | 12.95 ms | ~1622 (the VVDI's position), with the ID48 burst | ID48 |
 
 A burst at the wrong timing is harmless once the chip is freed: the VVDI keeps bursting after the
 chip goes silent. The burst turns the EM emulation off. ID11 and ID12 would answer the handshake
 30 ms after a 70 ms field-off, but ID13 goes silent and does not answer until it has been powered
-down for longer, which is why the cold-boot is always made. Each attempt takes ~2.2 s whatever the
+down for longer, which is why the cold-boot is always made. Each attempt takes ~2.3 s whatever the
 emulated type; up to three are made.
 
 Normal session opens cycle four timings: the short 20 ms off / 3 ms power-up, the VVDI's 70.05 ms
@@ -286,6 +287,17 @@ B:  3  1 1 2 1 1 2 2 2 2 1 2 1 2 1 1 1 1 2 2 2 1 3 2 1 1 2 2 2 3 1 1 1 2 2 2 1 1
 
 Gaps of 3 units appear here but never in the EM burst, so the two are different messages; what
 either encodes is unknown.
+
+### ID8E uses the same burst
+
+A chip emulating ID8E also broadcasts at power-up (MC64, repeating `8C6318FF…`, from ~950 T0) and
+ignores XHORSE (`lf xhorse reset` received the broadcast as 101 edges on every attempt). In the
+VVDI's capture (`vvdi-id8E-reset-success.pm3`) each round is: power-up, a burst, the field on 52.88 ms
+in total, then **420 ms** off. The first two rounds send burst A (with the extra pulse at +68) 41.7 ms
+after power-up, and the chip keeps broadcasting. The third sends burst B, pulse for pulse the ID48
+table, **1535 T0** after power-up. After its 420 ms off the chip is silent and answers XHORSE 30.2 ms
+after power-up. Our ID48 entry (~1622 T0) did not free it, so ID8E has its own entry at the VVDI's
+position, ahead of ID48 so the hardware-confirmed ID48 entry still comes right before the cold-boot.
 
 ### Types that need no unlock
 
