@@ -571,20 +571,26 @@ static const xh_em_timing_t xh_em_timings[] = {
     // the VVDI's value, freed it at 1741-1745), and also frees ID13 in its first frame - ID13 then
     // only answers after the cold-boot.
     { "ID12/ID13 (first frame)", &xh_burst_em,   60300,  13990 },
+    // ID8E broadcasts too (MC64, from ~950 T0 after power-up) and is freed by the same burst B as
+    // ID48, but earlier: the VVDI's freeing round puts it at 1535 T0 on air (1531.5 commanded),
+    // keeps the field on 52.88 ms in total, then powers down 420 ms (vvdi-id8E-reset-success.pm3).
+    // Its two earlier rounds send burst A at 41.7 ms and don't free it.  Our ID48 timing (~1622 on
+    // air) did not free it.
+    { "ID8E",                    &xh_burst_id48, 52880,  12252 },
     // 1618.5 T0 commanded -> ~1622 on air, the VVDI's position in all three of its tries; it keeps
     // the field on 63.86 ms in total.  Its own power-down before the handshake is 420 ms; the
     // cold-boot here is longer.
     { "ID48 (Megamos)",          &xh_burst_id48, 63860,  12948 },
 };
 
-// Pull a chip stuck broadcasting a non-HITAG2 emulation (ID11/ID12/ID13/ID48) back onto the config
+// Pull a chip stuck broadcasting a non-HITAG2 emulation (ID11/ID12/ID13/ID48/ID8E) back onto the config
 // channel, structured as the VVDI does it: bursts first, no handshake in between, then one cold-boot
 // and one handshake.  Each attempt sends one burst per entry of xh_em_timings[] (each in its own
 // power cycle: off 70 ms, on, burst at burst_at_us, rest of the window), so whichever type the chip
 // emulates gets its timing; a burst at the wrong timing is harmless once the chip is freed (the
 // VVDI keeps bursting after the chip goes silent).  Then field off for the VVDI's 1.57 s cold-boot,
 // on, XHORSE handshake 30.18 ms later.  ID13 only answers after the cold-boot; ID11/ID12 answer
-// either way.  ~2.2 s per attempt.
+// either way.  ~2.3 s per attempt.
 static int xh_open_session_em(xh_sess_t *s) {
     for (int attempt = 0; attempt < XH_EM_TRIES; attempt++) {
         for (size_t t = 0; t < sizeof(xh_em_timings) / sizeof(xh_em_timings[0]); t++) {
