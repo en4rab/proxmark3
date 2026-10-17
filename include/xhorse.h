@@ -66,16 +66,16 @@ typedef struct {
     uint8_t  found;           // 1 => an XT27A answered the handshake
     uint8_t  typebyte;        // emulated type byte read from bank-1 0x3C
     uint8_t  typebyte_ok;     // 1 => two consecutive reads of 0x3C agreed
-    uint8_t  rfu;
+    uint8_t  bank;            // bank image[] was read from (dump: 0 or 1, as requested; info: 0)
     uint8_t  chipid[16];      // 16-byte unique chip ID (bank-1 0x33..0x36)
-    uint8_t  image[64 * 4];   // bank-0 pages 0x00..0x3F (dump); 0x00..0x07 (info)
+    uint8_t  image[64 * 4];   // pages 0x00..0x3F of `bank` (dump); bank-0 0x00..0x07 (info)
     uint8_t  image_pages;     // how many bank-0 pages in image[] are valid
     // XMICRO / "channel B" probe (XT57 / XT37-class chips).  The XT27A never answers
     // XMICRO, so a reply here means a newer, not-yet-supported super-chip family.
     uint8_t  bchip;           // 1 => a B-channel (XMICRO) chip answered the identify probe
     uint8_t  bchip_type_len;  // number of ASCII bytes in bchip_type[]
     uint8_t  bchip_type[8];   // ASCII family string the chip reported (e.g. "XT37")
-    uint8_t  page_ok[8];      // bit (n % 8) of byte n / 8 set => two consecutive reads of bank-0 page n agreed
+    uint8_t  page_ok[8];      // bit (n % 8) of byte n / 8 set => two consecutive reads of page n agreed
 } PACKED lf_xhorse_info_t;
 
 #endif // XHORSE_H__
