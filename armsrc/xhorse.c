@@ -281,17 +281,31 @@ static int xh_cmd_reply(xh_sess_t *s, uint16_t pt_cmd, int reply_bits, uint32_t 
     return (rxlen >= (size_t)reply_bits) ? PM3_SUCCESS : PM3_EFAILED;
 }
 
-// sel a bank (0 = emulated-tag EEPROM, 1 = config/identity).  The tag echoes it.
+// sel a bank (0 = emulated-tag EEPROM, 1 = config/identity).  The tag echoes the sel op.
+// A missing or wrong echo is re-sent: if the chip did act on the first sel, sending it again
+// is harmless and keeps both keystreams in step.  If no echo matches, the selected bank is
+// unknown, so the caller must not write.
 static int xh_sel(xh_sess_t *s, uint8_t bank) {
-    int res = xh_cmd_reply(s, xh_op(XH_FUNC_SEL, bank), 16, NULL);
-    s->cur_bank = (int8_t)bank;
-    return res;
+    const uint16_t op = xh_op(XH_FUNC_SEL, bank);
+    for (int i = 0; i < XH_VERIFY_READS; i++) {
+        uint32_t echo = 0;
+        if ((xh_cmd_reply(s, op, 16, &echo) == PM3_SUCCESS) && ((uint16_t)echo == op)) {
+            s->cur_bank = (int8_t)bank;
+            return PM3_SUCCESS;
+        }
+    }
+    if (g_dbglevel >= DBG_ERROR) {
+        Dbprintf("xhorse: sel bank %u not echoed", bank);
+    }
+    s->cur_bank = -1;
+    return PM3_EFAILED;
 }
 
-static void xh_bank(xh_sess_t *s, uint8_t bank) {
-    if (s->cur_bank != (int8_t)bank) {
-        xh_sel(s, bank);
+static int xh_bank(xh_sess_t *s, uint8_t bank) {
+    if (s->cur_bank == (int8_t)bank) {
+        return PM3_SUCCESS;
     }
+    return xh_sel(s, bank);
 }
 
 // READ a page in the current bank; tag answers with 32-bit data.
@@ -340,6 +354,9 @@ static int xh_write(xh_sess_t *s, uint8_t page, uint32_t data, bool verify) {
             ok = (rb == data);
         }
         if (!ok) {
+            if (g_dbglevel >= DBG_ERROR) {
+                Dbprintf("xhorse: verify failed, bank %d page 0x%02X", s->cur_bank, page);
+            }
             return PM3_EFAILED;
         }
     }
@@ -395,7 +412,7 @@ static int xh_handshake(xh_sess_t *s) {
 
     rxlen = xh_xfer_clear(s, q7372, 16, rx, sizeof(rx));                  // -> per-session seed reply
     if (rxlen < 16) {
-        if (g_dbglevel >= DBG_ERROR) {
+        if (g_dbglevel >= DBG_DEBUG) {
             Dbprintf("xhorse: no 7372 reply (rxlen=%u)", (unsigned)rxlen);
         }
         return PM3_EFAILED;
@@ -440,7 +457,7 @@ static bool xh_4r(xh_sess_t *s, const char *what, int attempt) {
     int res = xh_cmd_reply(s, sel1, 16, &echo);
     s->cur_bank = 1;
     bool ok = (res == PM3_SUCCESS) && ((uint16_t)echo == sel1);
-    if (g_dbglevel >= (ok ? DBG_EXTENDED : DBG_ERROR)) {
+    if (g_dbglevel >= (ok ? DBG_EXTENDED : DBG_DEBUG)) {
         Dbprintf("xhorse: %s attempt %d  4R echo=%04x %s", what, attempt, (uint16_t)echo,
                  ok ? "(sel ok)" : "(bad - not a real session, retrying)");
     }
@@ -633,7 +650,7 @@ static int xh_open_session_em(xh_sess_t *s) {
             s->em_mode = true;                                       // later sessions: 70 ms off / 30.18 ms settle
             return PM3_SUCCESS;
         }
-        if (g_dbglevel >= DBG_ERROR) {
+        if (g_dbglevel >= DBG_DEBUG) {
             Dbprintf("xhorse: EM-recovery attempt %d: no session after the bursts and cold-boot", attempt);
         }
     }
@@ -646,7 +663,7 @@ static int xh_open_any(xh_sess_t *s) {
     if (xh_open_session(s) == PM3_SUCCESS) {
         return PM3_SUCCESS;
     }
-    if (g_dbglevel >= DBG_ERROR) {
+    if (g_dbglevel >= DBG_INFO) {
         Dbprintf("xhorse: no XHORSE session; sending EM-recovery burst (chip stuck in non-HITAG2 emulation?)");
     }
     return xh_open_session_em(s);
@@ -764,25 +781,27 @@ static void xh_id13_stream(const uint8_t *uid5, uint8_t out8[8]) {
 }
 
 //-----------------------------------------------------------------------------
-// Per-type page recipes.  Each returns PM3_SUCCESS or the first verify failure.
+// Per-type page recipes.  Each returns PM3_SUCCESS, or PM3_EFAILED at the first failed sel or verify.
 //-----------------------------------------------------------------------------
-#define XH_WR(pg, val) do { if (xh_write(s, (pg), (val), verify) != PM3_SUCCESS) ok = PM3_EFAILED; } while (0)
+// Stop at the first failure: after a missed sel or frame, the chip's bank or keystream may no
+// longer match ours, and writing on would put data in the wrong place.
+#define XH_WR(pg, val) do { if (xh_write(s, (pg), (val), verify) != PM3_SUCCESS) return PM3_EFAILED; } while (0)
+#define XH_BANK(b) do { if (xh_bank(s, (b)) != PM3_SUCCESS) return PM3_EFAILED; } while (0)
 
 static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
     bool verify = p->verify;
-    int ok = PM3_SUCCESS;
     uint32_t uid32 = (p->uidlen >= 4) ? xh_be32(p->uid) : 0;
 
     // Type byte first (bank 1), as every decoded type except ID8A does (its recipe writes it last).
     if (p->has_type) {
-        xh_bank(s, 1);
+        XH_BANK(1);
         XH_WR(XH_PG_TYPE, p->typeword ? 0x0080008CUL : (uint32_t)p->typebyte);
     }
 
     switch ((xhorse_recipe_t)p->recipe) {
 
         case XHORSE_R_HITAG2:       // ID46/7936/7937/7946
-            xh_bank(s, 0);
+            XH_BANK(0);
             XH_WR(0x00, uid32);
             XH_WR(0x01, 0x4D494B52);   // "MIKR"
             XH_WR(0x02, 0x00004F4E);   // "..ON"
@@ -790,29 +809,29 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
             break;
 
         case XHORSE_R_7935:         // PCF7935: full bank-0 wipe, 0x1F = 0x07
-            xh_bank(s, 0);
+            XH_BANK(0);
             for (uint8_t pg = 0x00; pg <= 0x3F; pg++) {
                 XH_WR(pg, (pg == 0x1F) ? 0x00000007UL : 0x00000000UL);
             }
             break;
 
         case XHORSE_R_7938:         // ID47: distinct 5-page image + clear bank-1 0x38..0x3B
-            xh_bank(s, 0);
+            XH_BANK(0);
             XH_WR(0x00, uid32);
-            XH_WR(0x01, 0x11112222);
-            XH_WR(0x02, 0x33334444);
-            XH_WR(0x03, 0x55556666);
-            XH_WR(0x04, 0x00FFFFFF);
-            xh_bank(s, 1);
+            XH_WR(0x01, 0x11112222); // Key 1
+            XH_WR(0x02, 0x33334444); // Key 2
+            XH_WR(0x03, 0x55556666); // Key 3
+            XH_WR(0x04, 0x00FFFFFF); // Config
+            XH_BANK(1);
             for (uint8_t pg = 0x38; pg <= 0x3B; pg++) {
                 XH_WR(pg, 0x00000000UL);
             }
             break;
 
         case XHORSE_R_7939:         // ID49: UID at bank-0 0x00, rest in bank 1
-            xh_bank(s, 0);
+            XH_BANK(0);
             XH_WR(0x00, uid32);
-            xh_bank(s, 1);
+            XH_BANK(1);
             XH_WR(0x00, 0xF7F8251D);  // The Xhorse app seem to write a random value here
             for (uint8_t pg = 0x01; pg <= 0x07; pg++) {
                 XH_WR(pg, 0x00000000UL);
@@ -826,7 +845,7 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
             // The UID is held 16 bits per page, low half first: UID 78B8D707 is
             // 0x02 = 0x0000D707, 0x03 = 0x000078B8.
             const uint32_t img[4] = { 0x00005678, 0x0000A1BF, uid32 & 0xFFFF, uid32 >> 16 };
-            xh_bank(s, 0);
+            XH_BANK(0);
             for (uint8_t pg = 0x00; pg <= 0x03; pg++) {
                 XH_WR(pg, img[pg]);
             }
@@ -851,7 +870,7 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
             for (int i = 0; i < 12; i++) {
                 t[i] = st[11 - i];
             }
-            xh_bank(s, 0);
+            XH_BANK(0);
             XH_WR(0x26, xh_be32(&t[0]));
             XH_WR(0x25, xh_be32(&t[4]));
             XH_WR(0x24, xh_be32(&t[8]));
@@ -863,7 +882,7 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
             uint16_t pages[5];
             uint16_t hdr = (p->recipe == XHORSE_R_ID11) ? 0x0010 : 0x0014;
             xh_pack_em8(p->uid, hdr, pages);
-            xh_bank(s, 0);
+            XH_BANK(0);
             XH_WR(0x02, pages[0x02]);
             XH_WR(0x01, pages[0x01]);
             XH_WR(0x04, pages[0x04]);
@@ -875,7 +894,7 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
         case XHORSE_R_ID13: {       // EM4102 + bitrev; type word already written
             uint8_t s8[8];
             xh_id13_stream(p->uid, s8);
-            xh_bank(s, 0);
+            XH_BANK(0);
             XH_WR(0x02, (uint32_t)((s8[0] << 8) | s8[1]));
             XH_WR(0x01, (uint32_t)((s8[2] << 8) | s8[3]));
             XH_WR(0x04, (uint32_t)((s8[4] << 8) | s8[5]));
@@ -885,7 +904,7 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
         }
 
         case XHORSE_R_TEMPLATE:     // ID4D / 4D80 / ID4E - config-template family
-            xh_bank(s, 0);
+            XH_BANK(0);
             for (uint8_t pg = 0x00; pg <= 0x1E; pg++) {   // 0x1F deliberately skipped
                 XH_WR(pg, 0x00000000UL);
             }
@@ -896,7 +915,7 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
             for (uint8_t pg = 0x24; pg <= 0x28; pg++) {
                 XH_WR(pg, 0x00000000UL);
             }
-            xh_bank(s, 1);
+            XH_BANK(1);
             XH_WR(0x13, 0x00004600);
             break;
 
@@ -904,7 +923,7 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
             // 0x04 = uid[1]<<8 | uid[0] ; 0x05 = uid[3]<<8 | uid[2]  (byte-swapped halves)
             uint32_t p04 = ((uint32_t)p->uid[1] << 8) | p->uid[0];
             uint32_t p05 = ((uint32_t)p->uid[3] << 8) | p->uid[2];
-            xh_bank(s, 0);
+            XH_BANK(0);
             XH_WR(0x00, 0x8A0AD459);
             XH_WR(0x01, 0x75020AE0);
             XH_WR(0x02, 0xA03448A3);
@@ -923,7 +942,7 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
             for (uint8_t pg = 0x20; pg <= 0x3F; pg++) {
                 XH_WR(pg, 0x00000000UL);
             }
-            xh_bank(s, 1);
+            XH_BANK(1);
             for (uint8_t pg = 0x00; pg <= 0x1C; pg++) {
                 XH_WR(pg, 0x00000000UL);
             }
@@ -932,7 +951,9 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
             // (0x0002021F), send it back with ctl 0x30, read 0x3D again.  Meaning unknown.
             {
                 uint32_t v3d = 0;
-                xh_sel(s, 1);
+                if (xh_sel(s, 1) != PM3_SUCCESS) {
+                    return PM3_EFAILED;
+                }
                 xh_read(s, 0x3D, &v3d);
                 xh_ctl_data(s, 0x30, v3d);
                 xh_read(s, 0x3D, &v3d);
@@ -944,16 +965,15 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
             // NOTE: the secondary emulation block at bank-0 0x00..0x04 is UID-high-half
             // dependent and not yet reversed.  We write only the
             // authoritative UID store; a reader may need that block for full emulation.
-            xh_bank(s, 0);
+            XH_BANK(0);
             XH_WR(0x0A, (uint32_t)((p->uid[2] << 8) | p->uid[3]));   // low half
             XH_WR(0x0B, (uint32_t)((p->uid[0] << 8) | p->uid[1]));   // high half
             break;
 
         default:
-            ok = PM3_EINVARG;
-            break;
+            return PM3_EINVARG;
     }
-    return ok;
+    return PM3_SUCCESS;
 }
 
 //-----------------------------------------------------------------------------
@@ -1054,12 +1074,17 @@ void Xhorse_Info(bool ledcontrol) {
     xh_read_chipid(&s, out.chipid);
 
     uint32_t tb = 0;
-    xh_bank(&s, 1);
-    out.typebyte_ok = xh_read_agreed(&s, XH_PG_TYPE, &tb) ? 1 : 0;
+    if (xh_bank(&s, 1) == PM3_SUCCESS) {
+        out.typebyte_ok = xh_read_agreed(&s, XH_PG_TYPE, &tb) ? 1 : 0;
+    }
     out.typebyte = (uint8_t)(tb & 0xFF);
 
-    xh_bank(&s, 0);
-    xh_read_image(&s, &out, 8);
+    // If the sel fails the bank is unknown: leave the pages zero and unconfirmed.
+    if (xh_bank(&s, 0) == PM3_SUCCESS) {
+        xh_read_image(&s, &out, 8);
+    } else {
+        out.image_pages = 8;
+    }
     xh_ctl(&s, XH_PG_PAD);
 
     hitag_cleanup(ledcontrol);
@@ -1083,12 +1108,17 @@ void Xhorse_Dump(uint8_t bank, bool ledcontrol) {
     xh_read_chipid(&s, out.chipid);
 
     uint32_t tb = 0;
-    xh_bank(&s, 1);
-    out.typebyte_ok = xh_read_agreed(&s, XH_PG_TYPE, &tb) ? 1 : 0;
+    if (xh_bank(&s, 1) == PM3_SUCCESS) {
+        out.typebyte_ok = xh_read_agreed(&s, XH_PG_TYPE, &tb) ? 1 : 0;
+    }
     out.typebyte = (uint8_t)(tb & 0xFF);
 
-    xh_bank(&s, bank);
-    xh_read_image(&s, &out, 64);
+    // If the sel fails the bank is unknown: leave the pages zero and unconfirmed.
+    if (xh_bank(&s, bank) == PM3_SUCCESS) {
+        xh_read_image(&s, &out, 64);
+    } else {
+        out.image_pages = 64;
+    }
     xh_ctl(&s, XH_PG_PAD);
 
     hitag_cleanup(ledcontrol);
@@ -1119,6 +1149,9 @@ static int xh_begin_writes(xh_sess_t *s) {
 static void xh_configure_run(const lf_xhorse_data_t *p, uint16_t cmd, bool ledcontrol) {
     xh_sess_t s;
     if (xh_begin_any(&s, ledcontrol) != PM3_SUCCESS) {
+        if (g_dbglevel >= DBG_ERROR) {
+            Dbprintf("xhorse: no session after all attempts, including EM recovery");
+        }
         hitag_cleanup(ledcontrol);
         reply_ng(cmd, PM3_EFAILED, NULL, 0);
         return;
@@ -1129,6 +1162,9 @@ static void xh_configure_run(const lf_xhorse_data_t *p, uint16_t cmd, bool ledco
     xh_ctl(&s, XH_PG_PAD);      // ends the capability-read session
 
     if (xh_begin_writes(&s) != PM3_SUCCESS) {
+        if (g_dbglevel >= DBG_ERROR) {
+            Dbprintf("xhorse: no write session after the capability read");
+        }
         hitag_cleanup(ledcontrol);
         reply_ng(cmd, PM3_EFAILED, NULL, 0);
         return;

@@ -69,9 +69,10 @@ typedef struct {
     uint8_t  bank;            // bank image[] was read from (dump: 0 or 1, as requested; info: 0)
     uint8_t  chipid[16];      // 16-byte unique chip ID (bank-1 0x33..0x36)
     uint8_t  image[64 * 4];   // pages 0x00..0x3F of `bank` (dump); bank-0 0x00..0x07 (info)
-    uint8_t  image_pages;     // how many bank-0 pages in image[] are valid
-    // XMICRO / "channel B" probe (XT57 / XT37-class chips).  The XT27A never answers
-    // XMICRO, so a reply here means a newer, not-yet-supported super-chip family.
+    uint8_t  image_pages;     // how many pages of `bank` are in image[]
+    // XMICRO / "channel B" probe (XT57 / XT37-class chips).  An XT27A set to some types (7938)
+    // answers XMICRO too, but only a newer, not-yet-supported family names itself ("XT37",
+    // "XT57") in reply to the identify query that follows.
     uint8_t  bchip;           // 1 => a B-channel (XMICRO) chip answered the identify probe
     uint8_t  bchip_type_len;  // number of ASCII bytes in bchip_type[]
     uint8_t  bchip_type[8];   // ASCII family string the chip reported (e.g. "XT37")

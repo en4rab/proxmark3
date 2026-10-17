@@ -23,7 +23,6 @@
 #include "cmdlfxhorse.h"
 
 #include <ctype.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "cmdparser.h"    // command_t
@@ -33,7 +32,6 @@
 #include "pm3_cmd.h"
 #include "ui.h"           // PrintAndLogEx
 #include "util.h"
-#include "util_posix.h"   // msclock (random seed)
 #include "xhorse.h"       // shared struct / recipe enum
 
 static int CmdHelp(const char *Cmd);
@@ -41,7 +39,7 @@ static int CmdHelp(const char *Cmd);
 //-----------------------------------------------------------------------------
 // Type catalog
 //-----------------------------------------------------------------------------
-typedef enum { UID_NONE, UID_OPT4, UID_REQ4, UID_REQ5, UID_REQ8 } xh_uidrule_t;
+typedef enum { UID_NONE, UID_REQ4, UID_REQ5, UID_REQ8 } xh_uidrule_t;
 
 typedef struct {
     const char   *canon;     // canonical token
@@ -61,18 +59,18 @@ static const xh_type_t g_types[] = {
     { "ID12",  "",                                  XHORSE_R_ID12,     0x8C, true,  false, UID_REQ8, 0,      "Temic fixed-code" },
     { "ID13",  "",                                  XHORSE_R_ID13,     0x8C, true,  true,  UID_REQ5, 0,      "Megamos 13" },
     { "7935",  "ID33 ID40 ID41 ID42 ID43 ID44",     XHORSE_R_7935,     0x35, true,  false, UID_NONE, 0,      "PCF7935 (SECT) (blanked)" },
-    { "7936",  "ID46",                              XHORSE_R_HITAG2,   0x36, true,  false, UID_OPT4, 0,      "PCF7936 (HITAG2)" },
-    { "7937",  "",                                  XHORSE_R_HITAG2,   0x37, true,  false, UID_OPT4, 0,      "PCF7937 (HITAG2)" },
-    { "7938",  "ID47",                              XHORSE_R_7938,     0x47, true,  false, UID_OPT4, 0,      "PCF7938" },
+    { "7936",  "ID46",                              XHORSE_R_HITAG2,   0x36, true,  false, UID_REQ4, 0,      "PCF7936 (HITAG2)" },
+    { "7937",  "",                                  XHORSE_R_HITAG2,   0x37, true,  false, UID_REQ4, 0,      "PCF7937 (HITAG2)" },
+    { "7938",  "ID47",                              XHORSE_R_7938,     0x47, true,  false, UID_REQ4, 0,      "PCF7938" },
     { "7939",  "ID49",                              XHORSE_R_7939,     0x39, true,  false, UID_REQ4, 0,      "PCF7939" },
-    { "7946",  "",                                  XHORSE_R_HITAG2,   0x46, true,  false, UID_OPT4, 0,      "PCF7946 / HITAG2 plus" },
+    { "7946",  "",                                  XHORSE_R_HITAG2,   0x46, true,  false, UID_REQ4, 0,      "PCF7946 / HITAG2 plus" },
     { "ID48",  "",                                  XHORSE_R_ID48,     0x48, true,  false, UID_REQ4, 0,      "Megamos Crypto ID48" },
     { "ID4C",  "",                                  XHORSE_R_ID4C,     0x4C, true,  false, UID_REQ8, 0,      "Texas Instruments (TIRIS)" },
     { "ID4D",  "ID60 ID63",                         XHORSE_R_TEMPLATE, 0x4D, true,  false, UID_NONE, 0xAAF3, "Texas Crypto" },
     { "4D80",  "ID70 ID83",                         XHORSE_R_TEMPLATE, 0x80, true,  false, UID_NONE, 0x9201, "Texas Crypto DST80" },
     { "ID4E",  "ID64",                              XHORSE_R_TEMPLATE, 0x64, true,  false, UID_NONE, 0x33A6, "Texas Crypto ID64" },
-    { "ID8A",  "",                                  XHORSE_R_ID8A,     0x8A, false, false, UID_OPT4, 0,      "Texas Crypto DST128" },
-    { "ID8E",  "",                                  XHORSE_R_ID8E,     0x8E, true,  false, UID_OPT4, 0,      "Megamos Crypto 2" },
+    { "ID8A",  "",                                  XHORSE_R_ID8A,     0x8A, false, false, UID_REQ4, 0,      "Texas Crypto DST128" },
+    { "ID8E",  "",                                  XHORSE_R_ID8E,     0x8E, true,  false, UID_REQ4, 0,      "Megamos Crypto 2" },
 };
 #define XH_NTYPES (sizeof(g_types) / sizeof(g_types[0]))
 
@@ -141,8 +139,6 @@ static const char *uidrule_text(xh_uidrule_t r) {
             return "8 bytes";
         case UID_REQ5:
             return "5 bytes";
-        case UID_OPT4:
-            return "4 bytes";
         case UID_REQ4:
             return "4 bytes";
         case UID_NONE:
@@ -187,9 +183,7 @@ static int CmdLFXhorseTypes(const char *Cmd) {
     }
 
     PrintAndLogEx(INFO, "");
-    PrintAndLogEx(INFO, "  * ID13 writes 0x3C = 0x0080008C (high half set).");
-    PrintAndLogEx(INFO, "  Names are case-insensitive; " _YELLOW_("none") " = no UID accepted.");
-    PrintAndLogEx(INFO, "  " _YELLOW_("4 bytes") " = auto-generated if -u is omitted (as the app does); " _YELLOW_("4 (req)") " = -u required.");
+    PrintAndLogEx(INFO, "  Names are case-insensitive; " _YELLOW_("none") " = no UID accepted; otherwise -u is required.");
     PrintAndLogEx(INFO, "  Not supported: " _RED_("ID8C") " (opaque write, not decoded);");
     PrintAndLogEx(INFO, "                 " _RED_("ID4A / MQB / MQB49 / MQB-Renegade / MQB-4.5") " (XT27B / XT57 only).");
     PrintAndLogEx(NORMAL, "");
@@ -401,9 +395,9 @@ static int xh_send_wait(uint16_t cmd, const lf_xhorse_data_t *p, const char *wha
     clearCommandBuffer();
     SendCommandNG(cmd, (uint8_t *)p, p ? sizeof(lf_xhorse_data_t) : 0);
     PacketResponseNG resp;
-    // Configure/reset open two sessions; each can spend a second or so on handshake retries,
-    // and the first may add up to three ~2.3 s EM-recovery attempts (worst case ~12.5 s in total).
-    // Allow generous time.
+    // Configure/reset open two sessions; each can spend ~2.5 s on handshake retries (12 attempts
+    // over four timings), the first may add three ~2.3 s EM-recovery attempts, and the ID8A image
+    // takes a few seconds to write and verify: roughly 16-20 s in the worst case.  Allow generous time.
     if (WaitForResponseTimeout(cmd, &resp, 30000) == false) {
         PrintAndLogEx(WARNING, "timeout while waiting for reply");
         SendCommandNG(CMD_BREAK_LOOP, NULL, 0);
@@ -417,17 +411,6 @@ static int xh_send_wait(uint16_t cmd, const lf_xhorse_data_t *p, const char *wha
     return PM3_SUCCESS;
 }
 
-static void xh_fill_random4(uint8_t *u) {
-    static bool seeded = false;
-    if (!seeded) {
-        srand((unsigned)msclock());
-        seeded = true;
-    }
-    for (int i = 0; i < 4; i++) {
-        u[i] = (uint8_t)(rand() & 0xFF);
-    }
-}
-
 //-----------------------------------------------------------------------------
 // configure
 //-----------------------------------------------------------------------------
@@ -435,9 +418,10 @@ static int CmdLFXhorseConfigure(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "lf xhorse configure",
                   "Configure which transponder an Xhorse XT27A emulates.  -t is a personality\n"
-                  "type (see `lf xhorse types`); -u sets the emulated UID where the type takes one.",
-                  "lf xhorse configure -t ID46                 -> HITAG2, auto 4-byte UID\n"
-                  "lf xhorse configure -t 7936 -u 11223344     -> same type, chosen UID\n"
+                  "type (see `lf xhorse types`); -u sets the emulated UID and is required for\n"
+                  "every type that takes one.",
+                  "lf xhorse configure -t ID46 -u 11223344     -> HITAG2, 4-byte UID\n"
+                  "lf xhorse configure -t ID4D                 -> Texas Crypto, no UID\n"
                   "lf xhorse configure -t ID13 -u 20471BB01B   -> EM4102, 5-byte UID\n"
                   "lf xhorse configure -t 7939 -u 11223344     -> PCF7939, 4-byte UID\n"
                   "lf xhorse configure -t ID48 -u 11223344     -> Megamos, 4-byte UID\n"
@@ -446,7 +430,7 @@ static int CmdLFXhorseConfigure(const char *Cmd) {
     void *argtable[] = {
         arg_param_begin,
         arg_str1("t", "type", "<name>", "emulated-type name, e.g. ID46 / 7936 / ID13"),
-        arg_str0("u", "uid",  "<hex>",   "emulated UID (length depends on type)"),
+        arg_str0("u", "uid",  "<hex>",   "emulated UID, required where the type takes one (length depends on type)"),
         arg_lit0(NULL, "noverify", "do not read each write back to verify"),
         arg_param_end
     };
@@ -510,20 +494,6 @@ static int CmdLFXhorseConfigure(const char *Cmd) {
         case UID_REQ8:
             if (uidlen != 8) {
                 PrintAndLogEx(FAILED, "%s needs an 8-byte UID (got %d)", t->canon, uidlen);
-                return PM3_EINVARG;
-            }
-            break;
-        case UID_OPT4:
-            if (uidlen == 0) {
-                xh_fill_random4(uid);
-                if (t->recipe == XHORSE_R_ID8A) {   // auto-UID format: byte0==byte2, byte3=0x59
-                    uid[2] = uid[0];
-                    uid[3] = 0x59;
-                }
-                uidlen = 4;
-                PrintAndLogEx(INFO, "auto UID.. " _YELLOW_("%s"), sprint_hex_inrow(uid, 4));
-            } else if (uidlen != 4) {
-                PrintAndLogEx(FAILED, "%s needs a 4-byte UID (got %d)", t->canon, uidlen);
                 return PM3_EINVARG;
             }
             break;
