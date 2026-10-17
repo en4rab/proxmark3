@@ -237,6 +237,25 @@ static void xh_print_not_found(void) {
     PrintAndLogEx(HINT, "`" _YELLOW_("lf xhorse reset") "` or `" _YELLOW_("lf xhorse configure") "` can recover it.");
 }
 
+// Bank-0 pages whose reads never agreed are printed with a red '?' (see page_ok).
+static bool xh_page_ok(const lf_xhorse_info_t *nfo, uint8_t pg) {
+    return (nfo->page_ok[pg / 8] >> (pg % 8)) & 1;
+}
+
+static const char *xh_page_mark(const lf_xhorse_info_t *nfo, uint8_t pg) {
+    return xh_page_ok(nfo, pg) ? "" : " " _RED_("?");
+}
+
+static void xh_print_unconfirmed(const lf_xhorse_info_t *nfo) {
+    int bad = 0;
+    for (uint8_t pg = 0; pg < nfo->image_pages; pg++) {
+        bad += xh_page_ok(nfo, pg) ? 0 : 1;
+    }
+    if (bad) {
+        PrintAndLogEx(WARNING, "%d page(s) marked " _RED_("?") " unconfirmed: no two reads agreed, so they may be wrong; try again", bad);
+    }
+}
+
 static void xh_print_header(const lf_xhorse_info_t *nfo) {
     PrintAndLogEx(INFO, "Chip ID... " _GREEN_("%s"), sprint_hex_inrow(nfo->chipid, 16));
     PrintAndLogEx(INFO, "Type byte. " _YELLOW_("0x%02X") " (%s)", nfo->typebyte, typebyte_name(nfo->typebyte));
@@ -296,8 +315,9 @@ static int CmdLFXhorseInfo(const char *Cmd) {
     PrintAndLogEx(INFO, "--- " _CYAN_("Xhorse XT27A") " ---------------------------");
     xh_print_header(&nfo);
     for (uint8_t pg = 0; pg < nfo.image_pages; pg++) {
-        PrintAndLogEx(INFO, "  bank0 0x%02X: %s", pg, sprint_hex_inrow(&nfo.image[pg * 4], 4));
+        PrintAndLogEx(INFO, "  bank0 0x%02X: %s%s", pg, sprint_hex_inrow(&nfo.image[pg * 4], 4), xh_page_mark(&nfo, pg));
     }
+    xh_print_unconfirmed(&nfo);
     PrintAndLogEx(NORMAL, "");
     return PM3_SUCCESS;
 }
@@ -332,8 +352,9 @@ static int CmdLFXhorseDump(const char *Cmd) {
     PrintAndLogEx(INFO, " page | data");
     PrintAndLogEx(INFO, "------+------------");
     for (uint8_t pg = 0; pg < nfo.image_pages; pg++) {
-        PrintAndLogEx(INFO, "  0x%02X | %s", pg, sprint_hex_inrow(&nfo.image[pg * 4], 4));
+        PrintAndLogEx(INFO, "  0x%02X | %s%s", pg, sprint_hex_inrow(&nfo.image[pg * 4], 4), xh_page_mark(&nfo, pg));
     }
+    xh_print_unconfirmed(&nfo);
     PrintAndLogEx(NORMAL, "");
     return PM3_SUCCESS;
 }
