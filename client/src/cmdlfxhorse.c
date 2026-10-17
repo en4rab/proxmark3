@@ -64,7 +64,7 @@ static const xh_type_t g_types[] = {
     { "7936",  "ID46",                              XHORSE_R_HITAG2,   0x36, true,  false, UID_OPT4, 0,      "PCF7936 / HITAG2" },
     { "7937",  "",                                  XHORSE_R_HITAG2,   0x37, true,  false, UID_OPT4, 0,      "PCF7937 (HITAG2 image)" },
     { "7938",  "ID47",                              XHORSE_R_7938,     0x47, true,  false, UID_OPT4, 0,      "PCF7938" },
-    { "7939",  "ID49",                              XHORSE_R_7939,     0x39, true,  false, UID_NONE, 0,      "PCF7939 (config only)" },
+    { "7939",  "ID49",                              XHORSE_R_7939,     0x39, true,  false, UID_REQ4, 0,      "PCF7939" },
     { "7946",  "",                                  XHORSE_R_HITAG2,   0x46, true,  false, UID_OPT4, 0,      "PCF7946 / HITAG2 plus" },
     { "ID48",  "",                                  XHORSE_R_ID48,     0x48, true,  false, UID_REQ4, 0,      "Megamos / ID48" },
     { "ID4C",  "",                                  XHORSE_R_ID4C,     0x4C, true,  false, UID_REQ8, 0,      "CRC16-KERMIT UID" },
@@ -439,6 +439,7 @@ static int CmdLFXhorseConfigure(const char *Cmd) {
                   "lf xhorse configure -t ID46                 -> HITAG2, auto 4-byte UID\n"
                   "lf xhorse configure -t 7936 -u 11223344     -> same type, chosen UID\n"
                   "lf xhorse configure -t ID13 -u 20471BB01B   -> EM4102, 5-byte UID\n"
+                  "lf xhorse configure -t 7939 -u 11223344     -> PCF7939, 4-byte UID\n"
                   "lf xhorse configure -t ID48 -u 11223344     -> Megamos, 4-byte UID\n"
                   "lf xhorse configure -t ID4C -u D3DA834C7E39EE98");
 
