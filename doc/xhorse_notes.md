@@ -44,7 +44,7 @@ unsupported.
 |---|---|
 | `lf xhorse info` | Identify the chip: channel-B family, or XT27A chip ID, emulated type byte and the first 8 emulated pages |
 | `lf xhorse dump` | Read the XT27A chip ID, type byte and all 64 pages of bank 0 and of bank 1, one session per bank |
-| `lf xhorse configure -t <type> [-u <uid>]` | Set the emulated transponder type (and UID) |
+| `lf xhorse configure -t <type> [-u <uid>]` | Set the emulated transponder type, and its UID: `-u` is required for every type that takes one |
 | `lf xhorse reset` | Restore the factory-default ID46/HITAG2 personality; also recovers a chip stuck in an EM emulation |
 | `lf xhorse types` | List the `-t` type tokens |
 
@@ -397,7 +397,7 @@ follows is not decoded.
 * What the half-recovered ID13 state is (normal handshakes read 10 bits instead of 0 after a failed
   first run), and why ID13 needs a long power-down before it answers when ID11 and ID12 don't.
 * How much slack the copied 70 ms gap and 30.18 ms settle have.
-* Detecting the EM broadcast directly would save the ~0.8 s of failed normal handshakes.
+* Detecting the EM broadcast directly would save the failed normal handshakes before EM recovery: 12 attempts over four timings, about 2.5 s.
 * The channel-B (XT27B / XT57B) management protocol.
 
 # Credits
