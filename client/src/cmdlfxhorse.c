@@ -213,9 +213,10 @@ static const char *typebyte_name(uint8_t tb) {
     return "unknown";
 }
 
-static int xh_request_info(uint16_t cmd, lf_xhorse_info_t *out) {
+// payload/len may be NULL/0; dump sends one byte, the bank to read.
+static int xh_request_info(uint16_t cmd, const uint8_t *payload, uint16_t len, lf_xhorse_info_t *out) {
     clearCommandBuffer();
-    SendCommandNG(cmd, NULL, 0);
+    SendCommandNG(cmd, payload, len);
     PacketResponseNG resp;
     if (WaitForResponseTimeout(cmd, &resp, 4000) == false) {
         PrintAndLogEx(WARNING, "timeout while waiting for reply");
@@ -280,7 +281,7 @@ static int CmdLFXhorseInfo(const char *Cmd) {
     CLIParserFree(ctx);
 
     lf_xhorse_info_t nfo;
-    int res = xh_request_info(CMD_LF_XHORSE_INFO, &nfo);
+    int res = xh_request_info(CMD_LF_XHORSE_INFO, NULL, 0, &nfo);
     if (res != PM3_SUCCESS) {
         return res;
     }
@@ -329,32 +330,52 @@ static int CmdLFXhorseDump(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "lf xhorse dump",
                   "Read all reachable channel-A storage of an Xhorse XT27A: the 16-byte chip ID,\n"
-                  "the type byte, and bank-0 pages 0x00..0x3F (the emulated-tag image).",
+                  "the type byte, and pages 0x00..0x3F of both banks: bank 0 (the emulated-tag\n"
+                  "image) and bank 1 (configuration and identity).  Each bank is read in its own session.",
                   "lf xhorse dump");
     void *argtable[] = { arg_param_begin, arg_param_end };
     CLIExecWithReturn(ctx, Cmd, argtable, true);
     CLIParserFree(ctx);
 
-    lf_xhorse_info_t nfo;
-    int res = xh_request_info(CMD_LF_XHORSE_DUMP, &nfo);
-    if (res != PM3_SUCCESS) {
-        return res;
-    }
-    if (nfo.found == 0) {
-        xh_print_not_found();
-        return PM3_ESOFT;
+    // One firmware reply holds one bank (both would exceed the reply size), so ask for each in turn.
+    lf_xhorse_info_t nfo[2];
+    uint8_t got = 0;
+    for (uint8_t bank = 0; bank < 2; bank++) {
+        int res = xh_request_info(CMD_LF_XHORSE_DUMP, &bank, 1, &nfo[bank]);
+        if (res != PM3_SUCCESS) {
+            if (bank == 0) {
+                return res;
+            }
+            break;
+        }
+        if (nfo[bank].found == 0) {
+            if (bank == 0) {
+                xh_print_not_found();
+                return PM3_ESOFT;
+            }
+            PrintAndLogEx(WARNING, "The chip did not answer the second session; bank 1 not read, try again");
+            break;
+        }
+        if (nfo[bank].bank != bank) {
+            PrintAndLogEx(WARNING, "Device firmware returned bank %u for bank %u; update the firmware", nfo[bank].bank, bank);
+            break;
+        }
+        got++;
     }
 
     PrintAndLogEx(NORMAL, "");
     PrintAndLogEx(INFO, "--- " _CYAN_("Xhorse XT27A dump") " ----------------------");
-    xh_print_header(&nfo);
-    PrintAndLogEx(INFO, "");
-    PrintAndLogEx(INFO, " page | data");
-    PrintAndLogEx(INFO, "------+------------");
-    for (uint8_t pg = 0; pg < nfo.image_pages; pg++) {
-        PrintAndLogEx(INFO, "  0x%02X | %s%s", pg, sprint_hex_inrow(&nfo.image[pg * 4], 4), xh_page_mark(&nfo, pg));
+    xh_print_header(&nfo[0]);
+    for (uint8_t bank = 0; bank < got; bank++) {
+        PrintAndLogEx(INFO, "");
+        PrintAndLogEx(INFO, "bank %u %s", bank, (bank == 0) ? "(emulated-tag image)" : "(configuration and identity)");
+        PrintAndLogEx(INFO, " page | data");
+        PrintAndLogEx(INFO, "------+------------");
+        for (uint8_t pg = 0; pg < nfo[bank].image_pages; pg++) {
+            PrintAndLogEx(INFO, "  0x%02X | %s%s", pg, sprint_hex_inrow(&nfo[bank].image[pg * 4], 4), xh_page_mark(&nfo[bank], pg));
+        }
+        xh_print_unconfirmed(&nfo[bank]);
     }
-    xh_print_unconfirmed(&nfo);
     PrintAndLogEx(NORMAL, "");
     return PM3_SUCCESS;
 }
