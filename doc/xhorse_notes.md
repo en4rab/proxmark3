@@ -370,7 +370,10 @@ reader -> XMICRO (ASCII, 48 bits, 0x584D4943524F)    chip -> 0x5AA5
 reader -> 0011 (4 bits)                              chip -> ASCII family, e.g. "XT37" / "XT57", + 1 byte
 ```
 
-The XT27A never answers XMICRO. The 120 ms wait matters: an XT57B answers an XMICRO sent 3 ms after
+An XT27A in its normal state never answers XMICRO. Set to some types (7938 seen) it answers
+XMICRO with something but sends nothing back to the identify query, so `lf xhorse info` only treats
+a chip as channel B when the identify reply starts with the ASCII `XT`; anything else goes on to the
+XHORSE handshake. The 120 ms wait matters: an XT57B answers an XMICRO sent 3 ms after
 power-up, but an XT27B only answers once it has had the VVDI's 120 ms (confirmed on hardware). An
 XT27B reports itself as `XT37`. The byte after the family name varies; it may be a seed for
 channel-B encryption, as the `7372` reply is for channel A. The channel-B management protocol that
