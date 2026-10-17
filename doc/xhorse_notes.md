@@ -51,6 +51,11 @@ unsupported.
 `info` and `dump` never send the EM unlock burst (it changes the chip), so a chip emulating an EM
 type does not answer them; use `reset` or `configure`.
 
+The chip's replies are weak, and a reply that loses an edge can decode to a wrong value with no
+error. So `info` and `dump` read the type byte and each bank-0 page until two reads in a row agree
+(up to four reads). A type byte that never agrees gets a warning; a page that never agrees is marked
+with a red `?`.
+
 # Timing conventions
 ^[Top](#top)
 

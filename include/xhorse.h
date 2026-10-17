@@ -75,6 +75,7 @@ typedef struct {
     uint8_t  bchip;           // 1 => a B-channel (XMICRO) chip answered the identify probe
     uint8_t  bchip_type_len;  // number of ASCII bytes in bchip_type[]
     uint8_t  bchip_type[8];   // ASCII family string the chip reported (e.g. "XT37")
+    uint8_t  page_ok[8];      // bit (n % 8) of byte n / 8 set => two consecutive reads of bank-0 page n agreed
 } PACKED lf_xhorse_info_t;
 
 #endif // XHORSE_H__
