@@ -1007,6 +1007,22 @@ static int xh_xmicro_identify(xh_sess_t *s, uint8_t *type, size_t typesz, size_t
     return PM3_SUCCESS;                          // named its family: it is a B-channel chip
 }
 
+// Read bank-0 pages 0..pages-1 into out->image, each until two reads agree (xh_read_agreed), and
+// mark the pages that did in out->page_ok.  The current bank must already be 0.
+static void xh_read_image(xh_sess_t *s, lf_xhorse_info_t *out, uint8_t pages) {
+    out->image_pages = pages;
+    for (uint8_t pg = 0; pg < pages; pg++) {
+        uint32_t w = 0;
+        if (xh_read_agreed(s, pg, &w)) {
+            out->page_ok[pg / 8] |= (uint8_t)(1 << (pg % 8));
+        }
+        out->image[pg * 4 + 0] = (uint8_t)(w >> 24);
+        out->image[pg * 4 + 1] = (uint8_t)(w >> 16);
+        out->image[pg * 4 + 2] = (uint8_t)(w >> 8);
+        out->image[pg * 4 + 3] = (uint8_t)(w);
+    }
+}
+
 void Xhorse_Info(bool ledcontrol) {
     xh_sess_t s;
     lf_xhorse_info_t out;
@@ -1041,15 +1057,7 @@ void Xhorse_Info(bool ledcontrol) {
     out.typebyte = (uint8_t)(tb & 0xFF);
 
     xh_bank(&s, 0);
-    out.image_pages = 8;
-    for (uint8_t pg = 0; pg < out.image_pages; pg++) {
-        uint32_t w = 0;
-        xh_read(&s, pg, &w);
-        out.image[pg * 4 + 0] = (uint8_t)(w >> 24);
-        out.image[pg * 4 + 1] = (uint8_t)(w >> 16);
-        out.image[pg * 4 + 2] = (uint8_t)(w >> 8);
-        out.image[pg * 4 + 3] = (uint8_t)(w);
-    }
+    xh_read_image(&s, &out, 8);
     xh_ctl(&s, XH_PG_PAD);
 
     hitag_cleanup(ledcontrol);
@@ -1076,15 +1084,7 @@ void Xhorse_Dump(bool ledcontrol) {
     out.typebyte = (uint8_t)(tb & 0xFF);
 
     xh_bank(&s, 0);
-    out.image_pages = 64;
-    for (uint16_t pg = 0; pg < out.image_pages; pg++) {
-        uint32_t w = 0;
-        xh_read(&s, (uint8_t)pg, &w);
-        out.image[pg * 4 + 0] = (uint8_t)(w >> 24);
-        out.image[pg * 4 + 1] = (uint8_t)(w >> 16);
-        out.image[pg * 4 + 2] = (uint8_t)(w >> 8);
-        out.image[pg * 4 + 3] = (uint8_t)(w);
-    }
+    xh_read_image(&s, &out, 64);
     xh_ctl(&s, XH_PG_PAD);
 
     hitag_cleanup(ledcontrol);
