@@ -1989,7 +1989,7 @@ static void PacketReceived(PacketCommandNG *packet) {
             break;
         }
         case CMD_LF_XHORSE_DUMP: {
-            Xhorse_Dump(true);
+            Xhorse_Dump((packet->length > 0) ? (packet->data.asBytes[0] & 1) : 0, true);
             break;
         }
         case CMD_LF_XHORSE_CONFIGURE: {

@@ -24,7 +24,7 @@
 
 // dispatch functions (appmain.c)
 void Xhorse_Info(bool ledcontrol);
-void Xhorse_Dump(bool ledcontrol);
+void Xhorse_Dump(uint8_t bank, bool ledcontrol);
 void Xhorse_Configure(const lf_xhorse_data_t *packet, bool ledcontrol);
 void Xhorse_Reset(bool ledcontrol);
 
