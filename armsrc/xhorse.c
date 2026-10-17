@@ -809,9 +809,11 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
             }
             break;
 
-        case XHORSE_R_7939:         // ID49: config-bank-only
+        case XHORSE_R_7939:         // ID49: UID at bank-0 0x00, rest in bank 1
+            xh_bank(s, 0);
+            XH_WR(0x00, uid32);
             xh_bank(s, 1);
-            XH_WR(0x00, 0xF7F8251D);
+            XH_WR(0x00, 0xF7F8251D);  // The Xhorse app seem to write a random value here
             for (uint8_t pg = 0x01; pg <= 0x07; pg++) {
                 XH_WR(pg, 0x00000000UL);
             }
