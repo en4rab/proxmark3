@@ -214,7 +214,7 @@ static const char *typebyte_name(uint8_t tb) {
 }
 
 // payload/len may be NULL/0; dump sends one byte, the bank to read.
-static int xh_request_info(uint16_t cmd, const uint8_t *payload, uint16_t len, lf_xhorse_info_t *out) {
+static int xh_request_info(uint16_t cmd, uint8_t *payload, uint16_t len, lf_xhorse_info_t *out) {
     clearCommandBuffer();
     SendCommandNG(cmd, payload, len);
     PacketResponseNG resp;
