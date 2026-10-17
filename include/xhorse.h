@@ -65,7 +65,8 @@ typedef struct {
 typedef struct {
     uint8_t  found;           // 1 => an XT27A answered the handshake
     uint8_t  typebyte;        // emulated type byte read from bank-1 0x3C
-    uint8_t  rfu[2];
+    uint8_t  typebyte_ok;     // 1 => two consecutive reads of 0x3C agreed
+    uint8_t  rfu;
     uint8_t  chipid[16];      // 16-byte unique chip ID (bank-1 0x33..0x36)
     uint8_t  image[64 * 4];   // bank-0 pages 0x00..0x3F (dump); 0x00..0x07 (info)
     uint8_t  image_pages;     // how many bank-0 pages in image[] are valid

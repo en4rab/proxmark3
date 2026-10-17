@@ -240,6 +240,9 @@ static void xh_print_not_found(void) {
 static void xh_print_header(const lf_xhorse_info_t *nfo) {
     PrintAndLogEx(INFO, "Chip ID... " _GREEN_("%s"), sprint_hex_inrow(nfo->chipid, 16));
     PrintAndLogEx(INFO, "Type byte. " _YELLOW_("0x%02X") " (%s)", nfo->typebyte, typebyte_name(nfo->typebyte));
+    if (nfo->typebyte_ok == 0) {
+        PrintAndLogEx(WARNING, "Type byte unconfirmed: no two reads of it agreed, so it may be wrong; try again");
+    }
 }
 
 //-----------------------------------------------------------------------------

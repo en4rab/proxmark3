@@ -299,6 +299,26 @@ static int xh_read(xh_sess_t *s, uint8_t page, uint32_t *val) {
     return xh_cmd_reply(s, xh_op(XH_FUNC_READ, page), 32, val);
 }
 
+// READ a page until two answered reads in a row agree.  A weak reply can decode to a wrong value
+// with nothing to show for it (a type byte of 0x37 once read as 0xC8), so one read is not trusted.
+// Returns false, with the last value read, if no two consecutive reads agree.
+static bool xh_read_agreed(xh_sess_t *s, uint8_t page, uint32_t *val) {
+    uint32_t prev = 0;
+    bool prev_ok = (xh_read(s, page, &prev) == PM3_SUCCESS);
+    for (int i = 0; i < XH_VERIFY_READS; i++) {
+        uint32_t cur = 0;
+        bool cur_ok = (xh_read(s, page, &cur) == PM3_SUCCESS);
+        if (prev_ok && cur_ok && (cur == prev)) {
+            *val = cur;
+            return true;
+        }
+        prev = cur;
+        prev_ok = cur_ok;
+    }
+    *val = prev;
+    return false;
+}
+
 // WRITE a page in the current bank: command (+echo), then the 32-bit data frame
 // (reader -> tag, no reply), then an optional read-back verify.
 static int xh_write(xh_sess_t *s, uint8_t page, uint32_t data, bool verify) {
@@ -465,7 +485,7 @@ static int xh_open_session(xh_sess_t *s) {
             xh_delay_us(XH_T_ID8A_ON_US);
         } else if (mode == 1) {
             // The VVDI's timing: off 70 ms, on, XHORSE 30.18 ms later.  Always used once the chip has
-            // been freed from EM emulation this run, and on every third attempt otherwise: an ID13
+            // been freed from EM emulation this run, and in the timing rotation otherwise: an ID13
             // chip left half-recovered by an earlier run answers a 3 ms power-up only rarely
             // (rxlen=10) but does answer this one.
             Gpio_SSC_DOUT_High();
@@ -938,7 +958,7 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
 // Command handlers (called from appmain.c)
 //-----------------------------------------------------------------------------
 // Probe the XMICRO / "channel B" identify (XT57 / XT37-class super-chips).  The XT27A never
-// answers XMICRO, so any reply here means a newer family we do not yet support.  Sequence, as
+// answers XMICRO as itself, so a family name here means a newer family we do not yet support.  Sequence, as
 // the VVDI reads an XT27B / XT57B:
 //   field on, wait 120.14 ms
 //   reader -> XMICRO (48b)          tag -> 0x5AA5 ACK
@@ -960,6 +980,9 @@ static int xh_xmicro_identify(xh_sess_t *s, uint8_t *type, size_t typesz, size_t
 
     // 1) XMICRO probe -> expect the 0x5AA5 ACK (XT27A gives nothing here).
     rxlen = xh_xfer_clear(s, xmicro, 48, rx, sizeof(rx));
+    if (g_dbglevel >= DBG_EXTENDED) {
+        Dbprintf("xhorse: XMICRO reply %u bits: %02x %02x %02x %02x", (unsigned)rxlen, rx[0], rx[1], rx[2], rx[3]);
+    }
     if (rxlen < 16) {
         return PM3_EFAILED;                      // no B-channel response -> not an XT57/XT37-class chip
     }
@@ -967,13 +990,21 @@ static int xh_xmicro_identify(xh_sess_t *s, uint8_t *type, size_t typesz, size_t
     // 2) 4-bit identify query -> the chip answers with its ASCII family string.
     xh_delay_us(XH_T_XMICRO_ID_US);
     rxlen = xh_xfer_clear(s, query, 4, rx, sizeof(rx));
-    if (rxlen >= 8) {
-        size_t n = rxlen / 8;
-        if (n > typesz) n = typesz;
-        memcpy(type, rx, n);
-        *tlen = n;
+    if (g_dbglevel >= DBG_EXTENDED) {
+        Dbprintf("xhorse: identify reply %u bits: %02x %02x %02x %02x %02x", (unsigned)rxlen, rx[0], rx[1], rx[2], rx[3], rx[4]);
     }
-    return PM3_SUCCESS;                          // answered XMICRO: it is a B-channel chip
+
+    // Only a family name ("XT37", "XT57", ...) makes it a B-channel chip.  An XT27A emulating some
+    // types (7938 seen) answers XMICRO with something but says nothing to the identify query; it
+    // is still an XT27A, so let the caller go on to the channel-A handshake.
+    if ((rxlen < 32) || (rx[0] != 'X') || (rx[1] != 'T')) {
+        return PM3_EFAILED;
+    }
+    size_t n = rxlen / 8;
+    if (n > typesz) n = typesz;
+    memcpy(type, rx, n);
+    *tlen = n;
+    return PM3_SUCCESS;                          // named its family: it is a B-channel chip
 }
 
 void Xhorse_Info(bool ledcontrol) {
@@ -983,7 +1014,7 @@ void Xhorse_Info(bool ledcontrol) {
 
     xh_setup(&s, ledcontrol);
 
-    // Try the XMICRO / channel-B identify first.  A reply means a newer super-chip family
+    // Try the XMICRO / channel-B identify first.  A family name means a newer super-chip family
     // (XT57 / XT37-class) that this command does not yet support - report it and stop.
     size_t tlen = 0;
     if (xh_xmicro_identify(&s, out.bchip_type, sizeof(out.bchip_type), &tlen) == PM3_SUCCESS) {
@@ -1006,7 +1037,7 @@ void Xhorse_Info(bool ledcontrol) {
 
     uint32_t tb = 0;
     xh_bank(&s, 1);
-    xh_read(&s, XH_PG_TYPE, &tb);
+    out.typebyte_ok = xh_read_agreed(&s, XH_PG_TYPE, &tb) ? 1 : 0;
     out.typebyte = (uint8_t)(tb & 0xFF);
 
     xh_bank(&s, 0);
@@ -1041,7 +1072,7 @@ void Xhorse_Dump(bool ledcontrol) {
 
     uint32_t tb = 0;
     xh_bank(&s, 1);
-    xh_read(&s, XH_PG_TYPE, &tb);
+    out.typebyte_ok = xh_read_agreed(&s, XH_PG_TYPE, &tb) ? 1 : 0;
     out.typebyte = (uint8_t)(tb & 0xFF);
 
     xh_bank(&s, 0);
