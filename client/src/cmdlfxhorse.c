@@ -57,22 +57,22 @@ typedef struct {
 
 static const xh_type_t g_types[] = {
     // canon   aliases                              recipe             tb    htype tword  uidrule   aux     emulates
-    { "ID11",  "",                                  XHORSE_R_ID11,     0x8C, true,  false, UID_REQ8, 0,      "EM fixed-code (auto 7D5F..)" },
-    { "ID12",  "",                                  XHORSE_R_ID12,     0x8C, true,  false, UID_REQ8, 0,      "EM fixed-code (auto 660F..)" },
-    { "ID13",  "",                                  XHORSE_R_ID13,     0x8C, true,  true,  UID_REQ5, 0,      "EM4102 (auto 20..)" },
-    { "7935",  "ID33 ID40 ID41 ID42 ID43 ID44",     XHORSE_R_7935,     0x35, true,  false, UID_NONE, 0,      "PCF7935 / SECT (blanked)" },
-    { "7936",  "ID46",                              XHORSE_R_HITAG2,   0x36, true,  false, UID_OPT4, 0,      "PCF7936 / HITAG2" },
-    { "7937",  "",                                  XHORSE_R_HITAG2,   0x37, true,  false, UID_OPT4, 0,      "PCF7937 (HITAG2 image)" },
+    { "ID11",  "",                                  XHORSE_R_ID11,     0x8C, true,  false, UID_REQ8, 0,      "Temic fixed-code" },
+    { "ID12",  "",                                  XHORSE_R_ID12,     0x8C, true,  false, UID_REQ8, 0,      "Temic fixed-code" },
+    { "ID13",  "",                                  XHORSE_R_ID13,     0x8C, true,  true,  UID_REQ5, 0,      "Megamos 13" },
+    { "7935",  "ID33 ID40 ID41 ID42 ID43 ID44",     XHORSE_R_7935,     0x35, true,  false, UID_NONE, 0,      "PCF7935 (SECT) (blanked)" },
+    { "7936",  "ID46",                              XHORSE_R_HITAG2,   0x36, true,  false, UID_OPT4, 0,      "PCF7936 (HITAG2)" },
+    { "7937",  "",                                  XHORSE_R_HITAG2,   0x37, true,  false, UID_OPT4, 0,      "PCF7937 (HITAG2)" },
     { "7938",  "ID47",                              XHORSE_R_7938,     0x47, true,  false, UID_OPT4, 0,      "PCF7938" },
     { "7939",  "ID49",                              XHORSE_R_7939,     0x39, true,  false, UID_REQ4, 0,      "PCF7939" },
     { "7946",  "",                                  XHORSE_R_HITAG2,   0x46, true,  false, UID_OPT4, 0,      "PCF7946 / HITAG2 plus" },
-    { "ID48",  "",                                  XHORSE_R_ID48,     0x48, true,  false, UID_REQ4, 0,      "Megamos / ID48" },
-    { "ID4C",  "",                                  XHORSE_R_ID4C,     0x4C, true,  false, UID_REQ8, 0,      "CRC16-KERMIT UID" },
-    { "ID4D",  "ID60 ID63",                         XHORSE_R_TEMPLATE, 0x4D, true,  false, UID_NONE, 0xAAF3, "config-template" },
-    { "4D80",  "ID70 ID83",                         XHORSE_R_TEMPLATE, 0x80, true,  false, UID_NONE, 0x9201, "config-template" },
-    { "ID4E",  "ID64",                              XHORSE_R_TEMPLATE, 0x64, true,  false, UID_NONE, 0x33A6, "config-template" },
-    { "ID8A",  "",                                  XHORSE_R_ID8A,     0x8A, false, false, UID_OPT4, 0,      "full image, type byte last" },
-    { "ID8E",  "",                                  XHORSE_R_ID8E,     0x8E, true,  false, UID_OPT4, 0,      "UID at pages 0x0A/0x0B" },
+    { "ID48",  "",                                  XHORSE_R_ID48,     0x48, true,  false, UID_REQ4, 0,      "Megamos Crypto ID48" },
+    { "ID4C",  "",                                  XHORSE_R_ID4C,     0x4C, true,  false, UID_REQ8, 0,      "Texas Instruments (TIRIS)" },
+    { "ID4D",  "ID60 ID63",                         XHORSE_R_TEMPLATE, 0x4D, true,  false, UID_NONE, 0xAAF3, "Texas Crypto" },
+    { "4D80",  "ID70 ID83",                         XHORSE_R_TEMPLATE, 0x80, true,  false, UID_NONE, 0x9201, "Texas Crypto DST80" },
+    { "ID4E",  "ID64",                              XHORSE_R_TEMPLATE, 0x64, true,  false, UID_NONE, 0x33A6, "Texas Crypto ID64" },
+    { "ID8A",  "",                                  XHORSE_R_ID8A,     0x8A, false, false, UID_OPT4, 0,      "Texas Crypto DST128" },
+    { "ID8E",  "",                                  XHORSE_R_ID8E,     0x8E, true,  false, UID_OPT4, 0,      "Megamos Crypto 2" },
 };
 #define XH_NTYPES (sizeof(g_types) / sizeof(g_types[0]))
 
@@ -372,8 +372,8 @@ static int CmdLFXhorseDump(const char *Cmd) {
     // rather than with a field width, because its colour codes would count towards the width.
     PrintAndLogEx(INFO, "");
     PrintAndLogEx(INFO, "bank 0 (emulated-tag image)%s", (got > 1) ? "      bank 1 (configuration and identity)" : "");
-    PrintAndLogEx(INFO, " page | data%s", (got > 1) ? "                      page | data" : "");
-    PrintAndLogEx(INFO, "------+------------%s", (got > 1) ? "              ------+------------" : "");
+    PrintAndLogEx(INFO, "  page | data%s", (got > 1) ? "                      page | data" : "");
+    PrintAndLogEx(INFO, "-------+-----------%s", (got > 1) ? "              -------+-----------" : "");
     for (uint8_t pg = 0; pg < nfo[0].image_pages; pg++) {
         char cell[2][24] = {{0}};
         for (uint8_t bank = 0; bank < got; bank++) {
