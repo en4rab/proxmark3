@@ -1007,8 +1007,8 @@ static int xh_xmicro_identify(xh_sess_t *s, uint8_t *type, size_t typesz, size_t
     return PM3_SUCCESS;                          // named its family: it is a B-channel chip
 }
 
-// Read bank-0 pages 0..pages-1 into out->image, each until two reads agree (xh_read_agreed), and
-// mark the pages that did in out->page_ok.  The current bank must already be 0.
+// Read pages 0..pages-1 of the current bank into out->image, each until two reads agree
+// (xh_read_agreed), and mark the pages that did in out->page_ok.
 static void xh_read_image(xh_sess_t *s, lf_xhorse_info_t *out, uint8_t pages) {
     out->image_pages = pages;
     for (uint8_t pg = 0; pg < pages; pg++) {
@@ -1064,10 +1064,12 @@ void Xhorse_Info(bool ledcontrol) {
     reply_ng(CMD_LF_XHORSE_INFO, PM3_SUCCESS, (uint8_t *)&out, sizeof(out));
 }
 
-void Xhorse_Dump(bool ledcontrol) {
+// Dumps one bank (0 = emulated image, 1 = config/identity) per call: both would not fit in one reply.
+void Xhorse_Dump(uint8_t bank, bool ledcontrol) {
     xh_sess_t s;
     lf_xhorse_info_t out;
     memset(&out, 0, sizeof(out));
+    out.bank = bank;
 
     if (xh_begin(&s, ledcontrol) != PM3_SUCCESS) {
         hitag_cleanup(ledcontrol);
@@ -1083,7 +1085,7 @@ void Xhorse_Dump(bool ledcontrol) {
     out.typebyte_ok = xh_read_agreed(&s, XH_PG_TYPE, &tb) ? 1 : 0;
     out.typebyte = (uint8_t)(tb & 0xFF);
 
-    xh_bank(&s, 0);
+    xh_bank(&s, bank);
     xh_read_image(&s, &out, 64);
     xh_ctl(&s, XH_PG_PAD);
 
