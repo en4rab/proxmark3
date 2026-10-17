@@ -37,7 +37,7 @@ typedef enum {
     XHORSE_R_HITAG2 = 0,  // ID46/7936/7937/7946: type byte + UID + MIKR/ON/config image
     XHORSE_R_7935,        // PCF7935/SECT: full bank-0 wipe, 0x1F=0x07
     XHORSE_R_7938,        // ID47: distinct 5-page image
-    XHORSE_R_7939,        // ID49: config-bank-only (0xF7F8251D)
+    XHORSE_R_7939,        // ID49: UID at bank-0 0x00, bank-1 0x00 = 0xF7F8251D
     XHORSE_R_ID48,        // Megamos: full 16-word bank-0 image
     XHORSE_R_ID4C,        // 8-byte UID + CRC16-KERMIT -> bank-0 0x24..0x26
     XHORSE_R_ID11,        // EM fixed-code, header 0x0010, per-byte bitrev packing
