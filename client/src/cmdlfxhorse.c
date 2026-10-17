@@ -243,8 +243,9 @@ static bool xh_page_ok(const lf_xhorse_info_t *nfo, uint8_t pg) {
     return (nfo->page_ok[pg / 8] >> (pg % 8)) & 1;
 }
 
+// Always two visible characters, so a column after it stays aligned.
 static const char *xh_page_mark(const lf_xhorse_info_t *nfo, uint8_t pg) {
-    return xh_page_ok(nfo, pg) ? "" : " " _RED_("?");
+    return xh_page_ok(nfo, pg) ? "  " : " " _RED_("?");
 }
 
 static void xh_print_unconfirmed(const lf_xhorse_info_t *nfo) {
@@ -253,7 +254,7 @@ static void xh_print_unconfirmed(const lf_xhorse_info_t *nfo) {
         bad += xh_page_ok(nfo, pg) ? 0 : 1;
     }
     if (bad) {
-        PrintAndLogEx(WARNING, "%d page(s) marked " _RED_("?") " unconfirmed: no two reads agreed, so they may be wrong; try again", bad);
+        PrintAndLogEx(WARNING, "bank %u: %d page(s) marked " _RED_("?") " unconfirmed: no two reads agreed, so they may be wrong; try again", (unsigned)nfo->bank, bad);
     }
 }
 
@@ -357,7 +358,7 @@ static int CmdLFXhorseDump(const char *Cmd) {
             break;
         }
         if (nfo[bank].bank != bank) {
-            PrintAndLogEx(WARNING, "Device firmware returned bank %u for bank %u; update the firmware", nfo[bank].bank, bank);
+            PrintAndLogEx(WARNING, "Device firmware returned bank %u for bank %u; update the firmware", (unsigned)nfo[bank].bank, (unsigned)bank);
             break;
         }
         got++;
@@ -366,14 +367,26 @@ static int CmdLFXhorseDump(const char *Cmd) {
     PrintAndLogEx(NORMAL, "");
     PrintAndLogEx(INFO, "--- " _CYAN_("Xhorse XT27A dump") " ----------------------");
     xh_print_header(&nfo[0]);
-    for (uint8_t bank = 0; bank < got; bank++) {
-        PrintAndLogEx(INFO, "");
-        PrintAndLogEx(INFO, "bank %u %s", bank, (bank == 0) ? "(emulated-tag image)" : "(configuration and identity)");
-        PrintAndLogEx(INFO, " page | data");
-        PrintAndLogEx(INFO, "------+------------");
-        for (uint8_t pg = 0; pg < nfo[bank].image_pages; pg++) {
-            PrintAndLogEx(INFO, "  0x%02X | %s%s", pg, sprint_hex_inrow(&nfo[bank].image[pg * 4], 4), xh_page_mark(&nfo[bank], pg));
+
+    // The banks side by side, bank 1 starting at column 33.  The unconfirmed mark is padded by hand
+    // rather than with a field width, because its colour codes would count towards the width.
+    PrintAndLogEx(INFO, "");
+    PrintAndLogEx(INFO, "bank 0 (emulated-tag image)%s", (got > 1) ? "      bank 1 (configuration and identity)" : "");
+    PrintAndLogEx(INFO, " page | data%s", (got > 1) ? "                      page | data" : "");
+    PrintAndLogEx(INFO, "------+------------%s", (got > 1) ? "              ------+------------" : "");
+    for (uint8_t pg = 0; pg < nfo[0].image_pages; pg++) {
+        char cell[2][24] = {{0}};
+        for (uint8_t bank = 0; bank < got; bank++) {
+            const uint8_t *d = &nfo[bank].image[pg * 4];
+            snprintf(cell[bank], sizeof(cell[bank]), "0x%02X | %02X%02X%02X%02X", pg, d[0], d[1], d[2], d[3]);
         }
+        if (got > 1) {
+            PrintAndLogEx(INFO, "  %s%s                %s%s", cell[0], xh_page_mark(&nfo[0], pg), cell[1], xh_page_mark(&nfo[1], pg));
+        } else {
+            PrintAndLogEx(INFO, "  %s%s", cell[0], xh_page_mark(&nfo[0], pg));
+        }
+    }
+    for (uint8_t bank = 0; bank < got; bank++) {
         xh_print_unconfirmed(&nfo[bank]);
     }
     PrintAndLogEx(NORMAL, "");
