@@ -29,6 +29,13 @@
 
 #define XHORSE_UID_MAXLEN   8
 
+// Channel-A family that answered (lf_xhorse_info_t.family).  XT136: doc/xhorse_notes.md.
+typedef enum {
+    XHORSE_FAM_NONE = 0,
+    XHORSE_FAM_XT27A,
+    XHORSE_FAM_XT136,
+} xhorse_family_t;
+
 // Per-emulated-type page-write recipe the firmware applies in configure().
 // These are the only XT27A types whose on-air write path is fully decoded.
 // ID8C (opaque) and the XT27B/XT57-only blob types are
@@ -63,12 +70,13 @@ typedef struct {
 
 // Firmware -> client reply for info/dump.
 typedef struct {
-    uint8_t  found;           // 1 => an XT27A answered the handshake
-    uint8_t  typebyte;        // emulated type byte read from bank-1 0x3C
+    uint8_t  found;           // 1 => an XT27A or XT136 answered the handshake (see family)
+    uint8_t  typebyte;        // emulated type byte read from bank-1 0x3C (XT27A only)
     uint8_t  typebyte_ok;     // 1 => two consecutive reads of 0x3C agreed
     uint8_t  bank;            // bank image[] was read from (dump: 0 or 1, as requested; info: 0)
-    uint8_t  chipid[16];      // 16-byte unique chip ID (bank-1 0x33..0x36)
-    uint8_t  image[64 * 4];   // pages 0x00..0x3F of `bank` (dump); bank-0 0x00..0x07 (info)
+    uint8_t  chipid[16];      // 16-byte unique chip ID (bank-1 0x33..0x36; XT27A only)
+    uint8_t  image[64 * 4];   // XT27A: pages 0x00..0x3F of `bank` (dump), bank-0 0x00..0x07 (info);
+                              // XT136: pages 0x00..0x3F (dump), 0x00..0x0F (info), no banks
     uint8_t  image_pages;     // how many pages of `bank` are in image[]
     // XMICRO / "channel B" probe (XT57 / XT37-class chips).  An XT27A set to some types (7938)
     // answers XMICRO too, but only a newer, not-yet-supported family names itself ("XT37",
@@ -77,6 +85,7 @@ typedef struct {
     uint8_t  bchip_type_len;  // number of ASCII bytes in bchip_type[]
     uint8_t  bchip_type[8];   // ASCII family string the chip reported (e.g. "XT37")
     uint8_t  page_ok[8];      // bit (n % 8) of byte n / 8 set => two consecutive reads of page n agreed
+    uint8_t  family;          // xhorse_family_t
 } PACKED lf_xhorse_info_t;
 
 #endif // XHORSE_H__
