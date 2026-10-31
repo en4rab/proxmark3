@@ -13,7 +13,8 @@
 //
 // See LICENSE.txt for the text of the license.
 //-----------------------------------------------------------------------------
-// Low frequency Xhorse super-chip (XT27A) commands.
+// Low frequency Xhorse super-chip (XT27A) commands.  An XT136 is identified and read
+// (info / dump); configure and reset refuse it.
 //
 // `-t` is a chip type (IDnn, or the PCF 79nn form where one exists).
 // Only XT27A types whose on-air write path is fully decoded are offered;
@@ -212,7 +213,9 @@ static int xh_request_info(uint16_t cmd, uint8_t *payload, uint16_t len, lf_xhor
     clearCommandBuffer();
     SendCommandNG(cmd, payload, len);
     PacketResponseNG resp;
-    if (WaitForResponseTimeout(cmd, &resp, 4000) == false) {
+    // An XT136 is only tried after every XT27A handshake timing has failed (~1.4 s), and its own
+    // session open uses the VVDI's 130 ms off / 220 ms on: a few seconds before the reads start.
+    if (WaitForResponseTimeout(cmd, &resp, 10000) == false) {
         PrintAndLogEx(WARNING, "timeout while waiting for reply");
         return PM3_ETIMEOUT;
     }
@@ -227,7 +230,7 @@ static int xh_request_info(uint16_t cmd, uint8_t *payload, uint16_t len, lf_xhor
 // info/dump never send the EM-recovery burst or the ID8A probe (both change the chip), so a chip
 // stuck in an EM, ID48, ID8E or ID8A emulation simply doesn't answer them.  Say so.
 static void xh_print_not_found(void) {
-    PrintAndLogEx(FAILED, "No XT27A answered the " _YELLOW_("XHORSE") " handshake");
+    PrintAndLogEx(FAILED, "No XT27A or XT136 answered the " _YELLOW_("XHORSE") " handshake");
     PrintAndLogEx(HINT, "An XT27A emulating an EM type (ID11/12/13), ID48, ID8E or ID8A never answers it;");
     PrintAndLogEx(HINT, "`" _YELLOW_("lf xhorse reset") "` or `" _YELLOW_("lf xhorse configure") "` can recover it.");
 }
@@ -252,6 +255,55 @@ static void xh_print_unconfirmed(const lf_xhorse_info_t *nfo) {
     }
 }
 
+// XT136 page meanings, from the VVDI's reset image (doc/xhorse_notes.md).
+static const char *xh136_page_label(uint8_t pg) {
+    switch (pg) {
+        case 0x00:
+            return "UID";
+        case 0x01:
+            return "HITAG2 password";
+        case 0x02:
+            return "HITAG2 key high";
+        case 0x03:
+            return "HITAG2 config";
+        case 0x0D:
+            return "config word 0";
+        case 0x0E:
+            return "config word 1 (high byte = type?)";
+        case 0x0F:
+            return "config word 2";
+        default:
+            break;
+    }
+    if (pg >= 0x04 && pg <= 0x07) {
+        return "HITAG2 user page";
+    }
+    if (pg >= 0x08 && pg <= 0x0C) {
+        return "unknown";
+    }
+    return "not known to exist";
+}
+
+// XT136: one flat page space, no chip ID or type page.
+static void xh136_print(const lf_xhorse_info_t *nfo, const char *title) {
+    PrintAndLogEx(NORMAL, "");
+    PrintAndLogEx(INFO, "--- " _CYAN_("%s") " ---------------------------", title);
+    PrintAndLogEx(INFO, "Family.... " _GREEN_("XT136") " (channel A, E20E signature 604A027E)");
+    PrintAndLogEx(INFO, "  page | data");
+    PrintAndLogEx(INFO, "-------+-----------");
+    for (uint8_t pg = 0; pg < nfo->image_pages; pg++) {
+        PrintAndLogEx(INFO, "  0x%02X | %s%s %s", pg, sprint_hex_inrow(&nfo->image[pg * 4], 4), xh_page_mark(nfo, pg), xh136_page_label(pg));
+    }
+    xh_print_unconfirmed(nfo);
+    if (nfo->image_pages > 0x0F) {
+        PrintAndLogEx(INFO, "Config word 1 high byte " _YELLOW_("0x%02X") " (%s, if it is the type byte)", nfo->image[0x0E * 4], typebyte_name(nfo->image[0x0E * 4]));
+    }
+    if (nfo->image_pages > 0x10) {
+        PrintAndLogEx(HINT, "Pages above 0x0F have never been seen used; their values may be aliases or noise.");
+    }
+    PrintAndLogEx(NORMAL, "");
+}
+
 static void xh_print_header(const lf_xhorse_info_t *nfo) {
     PrintAndLogEx(INFO, "Chip ID... " _GREEN_("%s"), sprint_hex_inrow(nfo->chipid, 16));
     PrintAndLogEx(INFO, "Type byte. " _YELLOW_("0x%02X") " (%s)", nfo->typebyte, typebyte_name(nfo->typebyte));
@@ -269,7 +321,8 @@ static int CmdLFXhorseInfo(const char *Cmd) {
                   "Identify an Xhorse super-chip.  First probes the XMICRO / channel-B identify:\n"
                   "newer families (XT57 / XT37-class) answer it and are reported as unsupported.\n"
                   "Otherwise reads the XT27A over channel A: unique chip ID, emulated type byte,\n"
-                  "and the first 8 emulated-image pages.",
+                  "and the first 8 emulated-image pages.  If no XT27A answers, tries the XT136\n"
+                  "handshake and reads its pages 0x00..0x0F.",
                   "lf xhorse info");
     void *argtable[] = { arg_param_begin, arg_param_end };
     CLIExecWithReturn(ctx, Cmd, argtable, true);
@@ -307,6 +360,11 @@ static int CmdLFXhorseInfo(const char *Cmd) {
         return PM3_ESOFT;
     }
 
+    if (nfo.family == XHORSE_FAM_XT136) {
+        xh136_print(&nfo, "Xhorse XT136");
+        return PM3_SUCCESS;
+    }
+
     PrintAndLogEx(NORMAL, "");
     PrintAndLogEx(INFO, "--- " _CYAN_("Xhorse XT27A") " ---------------------------");
     xh_print_header(&nfo);
@@ -326,7 +384,9 @@ static int CmdLFXhorseDump(const char *Cmd) {
     CLIParserInit(&ctx, "lf xhorse dump",
                   "Read all reachable channel-A storage of an Xhorse XT27A: the 16-byte chip ID,\n"
                   "the type byte, and pages 0x00..0x3F of both banks: bank 0 (the emulated-tag\n"
-                  "image) and bank 1 (configuration and identity).  Each bank is read in its own session.",
+                  "image) and bank 1 (configuration and identity).  Each bank is read in its own session.\n"
+                  "An XT136 has no banks: its pages 0x00..0x3F are read in one session (only\n"
+                  "0x00..0x0F are known to exist).",
                   "lf xhorse dump");
     void *argtable[] = { arg_param_begin, arg_param_end };
     CLIExecWithReturn(ctx, Cmd, argtable, true);
@@ -356,6 +416,10 @@ static int CmdLFXhorseDump(const char *Cmd) {
             break;
         }
         got++;
+        if (nfo[bank].family == XHORSE_FAM_XT136) {
+            xh136_print(&nfo[bank], "Xhorse XT136 dump");
+            return PM3_SUCCESS;
+        }
     }
 
     PrintAndLogEx(NORMAL, "");
@@ -402,6 +466,11 @@ static int xh_send_wait(uint16_t cmd, const lf_xhorse_data_t *p, const char *wha
         PrintAndLogEx(WARNING, "timeout while waiting for reply");
         SendCommandNG(CMD_BREAK_LOOP, NULL, 0);
         return PM3_ETIMEOUT;
+    }
+    if (resp.status == PM3_ENOTIMPL) {
+        PrintAndLogEx(FAILED, "Found an " _YELLOW_("XT136") "; %s is not supported on it yet, nothing was written", what);
+        PrintAndLogEx(HINT, "`" _YELLOW_("lf xhorse info") "` and `" _YELLOW_("lf xhorse dump") "` read it");
+        return PM3_ENOTIMPL;
     }
     if (resp.status != PM3_SUCCESS) {
         PrintAndLogEx(FAILED, "%s failed on-chip (status %d) - read-back verify mismatch or no tag", what, resp.status);
@@ -541,9 +610,9 @@ static int CmdLFXhorseReset(const char *Cmd) {
 //-----------------------------------------------------------------------------
 static command_t CommandTable[] = {
     {"help",      CmdHelp,             AlwaysAvailable, "This help"},
-    {"-----------", CmdHelp,           AlwaysAvailable, "----------------- " _CYAN_("Xhorse XT27A") " -----------------"},
+    {"-----------", CmdHelp,           AlwaysAvailable, "----------------- " _CYAN_("Xhorse XT27A / XT136") " -----------------"},
     {"types",     CmdLFXhorseTypes,    AlwaysAvailable, "List the -t type names accepted by configure"},
-    {"info",      CmdLFXhorseInfo,     IfPm3Hitag,      "Identify a chip: ID, type, emulated image"},
+    {"info",      CmdLFXhorseInfo,     IfPm3Hitag,      "Identify a chip: family, ID, type, emulated image"},
     {"dump",      CmdLFXhorseDump,     IfPm3Hitag,      "Read all reachable channel-A storage"},
     {"configure", CmdLFXhorseConfigure, IfPm3Hitag,     "Set which transponder the chip emulates"},
     {"reset",     CmdLFXhorseReset,    IfPm3Hitag,      "Restore the default ID46 personality"},

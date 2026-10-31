@@ -18,6 +18,8 @@
   - [The unlock burst](#the-unlock-burst)
   - [Evidence](#evidence)
   - [How it was found](#how-it-was-found)
+- [XT136](#xt136)
+- [Config words (ctl 0x30+n)](#config-words-ctl-0x30n)
 - [Channel B identify (XT27B / XT57B)](#channel-b-identify-xt27b--xt57b)
 - [Open questions](#open-questions)
 - [Credits](#credits)
@@ -33,6 +35,9 @@ with Xhorse's own programmers (e.g. the VVDI Mini).
 **channel A**: it rides on the HITAG2 physical layer, and after a short cleartext handshake every
 frame is XOR-encrypted with a 16-bit LFSR keystream.
 
+The **XT136** also uses channel A, with a different handshake and seed constant and no banks.
+`lf xhorse info` and `dump` read it; `configure` and `reset` refuse it for now (see [XT136](#xt136)).
+
 Newer families (**XT27B**, **XT57B**) answer a different probe, **XMICRO** ("channel B"). Their
 management protocol is not decoded; `lf xhorse info` identifies them and reports them as
 unsupported.
@@ -42,8 +47,8 @@ unsupported.
 
 | Command | Purpose |
 |---|---|
-| `lf xhorse info` | Identify the chip: channel-B family, or XT27A chip ID, emulated type byte and the first 8 emulated pages |
-| `lf xhorse dump` | Read the XT27A chip ID, type byte and all 64 pages of bank 0 and of bank 1, one session per bank |
+| `lf xhorse info` | Identify the chip: channel-B family, or XT27A chip ID, emulated type byte and the first 8 emulated pages, or XT136 pages `0x00`-`0x0F` |
+| `lf xhorse dump` | Read the XT27A chip ID, type byte and all 64 pages of bank 0 and of bank 1, one session per bank; on an XT136, pages `0x00`-`0x3F` in one session |
 | `lf xhorse configure -t <type> [-u <uid>]` | Set the emulated transponder type, and its UID: `-u` is required for every type that takes one |
 | `lf xhorse reset` | Restore the factory-default ID46/HITAG2 personality; also recovers a chip stuck in an EM emulation |
 | `lf xhorse types` | List the `-t` type tokens |
@@ -364,6 +369,54 @@ first time.
 5. Replaying the full VVDI sequence with the bursts reset the chip; a sniff of that success showed
    only the first burst mattered.
 
+# XT136
+^[Top](#top)
+
+Decoded from VVDI captures (`docs/xt136.md` in the project folder). Same LFSR, same `op,~op` commands,
+but its own handshake:
+
+| | XT27A | XT136 |
+|---|---|---|
+| after `XHORSE`/`5AA5` | `072F` -> `C8F6B638` | `E20E` -> `604A027E` (same reply from two chips) |
+| seed query | `7372` | `E430` |
+| seed | `bitrev16(reply) ^ 0xE12E` | `bitrev16(reply) ^ 0x8C07` |
+| first encrypted command | `sel bank 1` (4R) | none fixed |
+| banks | 2 | none (`sel` never seen); pages `0x00`-`0x0F` seen |
+
+An XT136 ignores `072F`, so the firmware tries every XT27A timing first, as the VVDI does, then the
+XT136 handshake: field off 130.1 ms, `XHORSE` 220.3 ms after power-up (the VVDI's timing; the XT27A's
+short power-up is tried in between), `E20E`, `E430` about 90 T0 after the signature, and 21.3 ms before
+the first encrypted command. There is no 4R check; the exact 32-bit signature is what proves the
+session, and a wrong seed shows up as reads that never agree.
+
+The VVDI's reset image, pages `0x00`-`0x0C` written with `WRITE`, `0x0D`-`0x0F` with ctl 0x30-0x32:
+
+| Page | Value | Meaning |
+|---|---|---|
+| `0x00` | `64B55D12` | UID |
+| `0x01`/`0x02` | `4D494B52` / `00004F4E` | HITAG2 password `"MIKRON"` |
+| `0x03` | `06AA4854` | HITAG2 config |
+| `0x04`-`0x07` | `0` | HITAG2 user pages |
+| `0x08`-`0x0C` | `00000018` `00282010` `00004141` `28148389` `55555555` | unknown |
+| `0x0D`-`0x0F` | `0000000E` `361818CA` `56781234` | config words 0-2; `0x36` in word 1 may be the type |
+
+`configure` and `reset` stop with "not supported" on an XT136 before anything is written, and before
+the XT27A EM-recovery bursts, whose effect on an XT136 is unknown.
+
+# Config words (ctl 0x30+n)
+^[Top](#top)
+
+`ctl 0x30+n` followed by a 32-bit data frame writes config word `n`; the chip echoes the ctl swapped
+(`~op,op`), needs a program wait, and the word reads back with `READ` at bank-1 `0x3D+n` on the XT27A
+(`0x0D+n` on the XT136). It does not clear the bank selection. The VVDI uses it:
+
+* at the end of a 7935 set: bank-1 `0x00`-`0x0F` cleared, word 1 (`0x3E`) = `F370CA18` (`0370CA18` on
+  another chip), word 0 (`0x3D`) rewritten with bit `0x200` set (`409` -> `609`; `0002021F` kept).
+  The 7935 recipe does this.
+* at the end of an ID8A set: word 0 rewritten with the value just read (the ID8A recipe does this).
+* in some older captures, the same unchanged rewrite after 4C/4D/4E sets; newer captures read
+  `0x3D` and leave it, so those recipes don't.
+
 # Channel B identify (XT27B / XT57B)
 ^[Top](#top)
 
@@ -399,6 +452,9 @@ follows is not decoded.
 * How much slack the copied 70 ms gap and 30.18 ms settle have.
 * Detecting the EM broadcast directly would save the failed normal handshakes before EM recovery: 12 attempts over four timings, about 2.5 s.
 * The channel-B (XT27B / XT57B) management protocol.
+* XT136: which config word holds the emulated type, what pages `0x08`-`0x0C` hold, whether pages
+  above `0x0F` exist, and whether the XT136 needs the XT27A's EM recovery when set to an EM type.
+* Where the top nibble of the 7935 config word 1 (`F370CA18` / `0370CA18`) comes from.
 
 # Credits
 ^[Top](#top)

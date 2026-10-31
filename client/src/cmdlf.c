@@ -2446,7 +2446,7 @@ static command_t CommandTable[] = {
     {"trovan",      CmdLFTrovan,        AlwaysAvailable, "{ Trovan animal IDs...       }"},
     {"viking",      CmdLFViking,        AlwaysAvailable, "{ Viking RFIDs...            }"},
     {"visa2000",    CmdLFVisa2k,        AlwaysAvailable, "{ Visa2000 RFIDs...          }"},
-    {"xhorse",      CmdLFXhorse,        AlwaysAvailable, "{ Xhorse XT27A super-chip... }"},
+    {"xhorse",      CmdLFXhorse,        AlwaysAvailable, "{ Xhorse XT27A / XT136 super-chip... }"},
 //    {"zx",          CmdLFZx8211,        AlwaysAvailable, "{ ZX8211 RFIDs...            }"},
     {"-----------", CmdHelp,            AlwaysAvailable, "--------------------- " _CYAN_("General") " ---------------------"},
     {"config",      CmdLFConfig,        IfPm3Lf,         "Get/Set config for LF sampling, bit/sample, decimation, frequency"},
