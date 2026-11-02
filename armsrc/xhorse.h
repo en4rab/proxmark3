@@ -27,5 +27,6 @@ void Xhorse_Info(bool ledcontrol);
 void Xhorse_Dump(uint8_t bank, bool ledcontrol);
 void Xhorse_Configure(const lf_xhorse_data_t *packet, bool ledcontrol);
 void Xhorse_Reset(bool ledcontrol);
+void Xhorse_Xt57Nonce(const lf_xhorse_xt57_t *packet, bool ledcontrol);
 
 #endif // XHORSE_FW_H
