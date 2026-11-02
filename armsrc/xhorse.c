@@ -1348,3 +1348,147 @@ void Xhorse_Reset(bool ledcontrol) {
 
     xh_configure_run(&p, CMD_LF_XHORSE_RESET, ledcontrol);
 }
+
+//-----------------------------------------------------------------------------
+// XT57B (channel B / XMICRO) nonce collection: `lf xhorse xt57 nonce`.
+//
+// The XT57B's authentication is not understood yet (doc/xhorse_notes.md).  The 32-bit nonce it
+// returns to the fixed 104-bit select is a window of a bit stream that looks the same on every tag,
+// and the reader's 32-bit answer and the tag's 64-bit reply depend only on that nonce.  This runs
+// the VVDI's session many times while one gap is stepped, to see which timing selects the window
+// and to gather enough nonces to rebuild the stream.  The VVDI's gaps (T0 since the last tag edge):
+// 0x5AA5 -> 0011 88, "XT57X" -> select 82, nonce -> answer 144, power-up -> XMICRO 120.14 ms.
+//-----------------------------------------------------------------------------
+#define XT57_DEF_POWERUP_US   XH_T_XMICRO_POWERUP_US
+#define XT57_DEF_ACK_ID_T0    88
+#define XT57_DEF_ID_SEL_T0    82
+#define XT57_DEF_NONCE_ANS_T0 144
+#define XT57_MAX_T0           5000     // the precision counter is 16 bit: 5461 T0 at most
+
+typedef struct {
+    uint32_t nonce;
+    uint32_t answer;
+} xt57_known_t;
+
+static const xt57_known_t xt57_known[] = {
+#define X(n, a, h, l) { n, a },
+    XHORSE_XT57_KNOWN
+#undef X
+};
+
+static int xt57_t0(int32_t v) {
+    if (v < 0) return 0;
+    return (v > XT57_MAX_T0) ? XT57_MAX_T0 : (int)v;
+}
+
+static uint32_t xt57_us(int32_t v) {
+    return (v < 0) ? 0 : (uint32_t)v;
+}
+
+// One session, up to and including the reply to the answer.  Whatever got that far is in *r.
+static void xt57_session(xh_sess_t *s, const lf_xhorse_xt57_t *p, int32_t val, lf_xhorse_xt57_rec_t *r) {
+    static const uint8_t xmicro[6] = { 'X', 'M', 'I', 'C', 'R', 'O' };
+    static const uint8_t query[1]  = { 0x30 };   // 4 bits, 0b0011
+
+    uint32_t off_us = p->off_us ? p->off_us : XH_T_FIELD_OFF_US;
+    uint32_t pwr_us = XT57_DEF_POWERUP_US;
+    int t_ack_id = XT57_DEF_ACK_ID_T0;
+    int t_id_sel = XT57_DEF_ID_SEL_T0;
+    int t_non_ans = XT57_DEF_NONCE_ANS_T0;
+
+    switch (p->sweep) {
+        case XT57_SWEEP_POWERUP:    pwr_us = xt57_us(val); break;
+        case XT57_SWEEP_ACK_ID:     t_ack_id = xt57_t0(val); break;
+        case XT57_SWEEP_ID_SEL:     t_id_sel = xt57_t0(val); break;
+        case XT57_SWEEP_NONCE_ANS:  t_non_ans = xt57_t0(val); break;
+        case XT57_SWEEP_FIELD_OFF:  off_us = xt57_us(val); break;
+        default: break;
+    }
+
+    uint8_t rx[32];
+    size_t rxlen;
+
+    memset(r, 0, sizeof(*r));
+
+    Gpio_SSC_DOUT_High();            // field off
+    xh_delay_us(off_us);
+    Gpio_SSC_DOUT_Low();             // field on
+    xh_delay_us(pwr_us);
+
+    rxlen = xh_xfer_clear(s, xmicro, 48, rx, sizeof(rx), 0);
+    if (rxlen < 16) {
+        return;
+    }
+    r->flags |= XT57_F_ACK;
+    r->ack[0] = rx[0];
+    r->ack[1] = rx[1];
+
+    rxlen = xh_xfer_clear(s, query, 4, rx, sizeof(rx), t_ack_id);
+    if (rxlen < 16) {
+        return;
+    }
+    memcpy(r->ident, rx, sizeof(r->ident));
+    if ((rxlen < 32) || (rx[0] != 'X') || (rx[1] != 'T')) {
+        return;
+    }
+    r->flags |= XT57_F_IDENT;
+
+    rxlen = xh_xfer_clear(s, p->select, XHORSE_XT57_SELLEN * 8, rx, sizeof(rx), t_id_sel);
+    r->nonce_bits = (uint8_t)((rxlen > 255) ? 255 : rxlen);
+    memcpy(r->nonce, rx, sizeof(r->nonce));
+    if (rxlen < 32) {
+        return;
+    }
+    r->flags |= XT57_F_NONCE;
+
+    uint32_t nonce = xh_bits_to_u32(rx, 32);
+    uint32_t answer = 0;
+    bool send = false;
+    if (p->answer_mode == XT57_ANS_FIXED) {
+        answer = p->answer;
+        send = true;
+    } else if (p->answer_mode == XT57_ANS_KNOWN) {
+        for (size_t i = 0; i < ARRAYLEN(xt57_known); i++) {
+            if (xt57_known[i].nonce == nonce) {
+                answer = xt57_known[i].answer;
+                send = true;
+                break;
+            }
+        }
+    }
+    if (send == false) {
+        return;
+    }
+
+    uint8_t tx[4] = { (uint8_t)(answer >> 24), (uint8_t)(answer >> 16), (uint8_t)(answer >> 8), (uint8_t)answer };
+    memcpy(r->answer, tx, sizeof(tx));
+    r->flags |= XT57_F_ANSWER;
+
+    rxlen = xh_xfer_clear(s, tx, 32, rx, sizeof(rx), t_non_ans);
+    r->reply_bits = (uint8_t)((rxlen > 255) ? 255 : rxlen);
+    memcpy(r->reply, rx, sizeof(r->reply));
+}
+
+void Xhorse_Xt57Nonce(const lf_xhorse_xt57_t *p, bool ledcontrol) {
+    xh_sess_t s;
+    lf_xhorse_xt57_reply_t out;
+    memset(&out, 0, sizeof(out));
+
+    xh_setup(&s, ledcontrol);
+
+    uint8_t n = (p->count > XHORSE_XT57_MAXSESS) ? XHORSE_XT57_MAXSESS : p->count;
+    for (uint8_t i = 0; i < n; i++) {
+        // the sweep is a signed 32-bit sum; keep it from overflowing on a silly base/step
+        int64_t v = (int64_t)p->base + (int64_t)i * p->step;
+        if (v > INT32_MAX) v = INT32_MAX;
+        if (v < INT32_MIN) v = INT32_MIN;
+        xt57_session(&s, p, (int32_t)v, &out.rec[i]);
+        out.count++;
+        if (BUTTON_PRESS() || data_available()) {
+            break;
+        }
+    }
+
+    hitag_cleanup(ledcontrol);
+    reply_ng(CMD_LF_XHORSE_XT57_NONCE, PM3_SUCCESS, (uint8_t *)&out, sizeof(out));
+}

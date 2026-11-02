@@ -608,6 +608,283 @@ static int CmdLFXhorseReset(const char *Cmd) {
 }
 
 //-----------------------------------------------------------------------------
+// xt57 nonce
+//-----------------------------------------------------------------------------
+// The 11 nonces seen from a VVDI mini are windows of one tag-independent bit stream (doc/xt57-auth.md);
+// this is the 68 contiguous bits recovered so far, used to print the window offset of each nonce.
+static const char xt57_stream[] = "00101100111111100001001100101110011111001"
+                                  "1011011100110101110100011" "00";
+
+typedef struct {
+    uint32_t nonce, answer, rhi, rlo;
+} xt57_known_t;
+
+static const xt57_known_t xt57_known[] = {
+#define X(n, a, h, l) { n, a, h, l },
+    XHORSE_XT57_KNOWN
+#undef X
+};
+
+static int xt57_offset(uint32_t nonce) {
+    char pat[33];
+    for (int i = 0; i < 32; i++) {
+        pat[i] = ((nonce >> (31 - i)) & 1) ? '1' : '0';
+    }
+    pat[32] = '\0';
+    const char *p = strstr(xt57_stream, pat);
+    return p ? (int)(p - xt57_stream) : -1;
+}
+
+static const char *const xt57_sweep_names[] = { "powerup", "ackid", "idsel", "nonans", "off", "none" };
+static const char *const xt57_sweep_units[] = { "us", "T0", "T0", "T0", "us", "" };
+static const int32_t xt57_sweep_defs[] = { 120140, 88, 82, 144, 20000, 0 };
+
+static uint32_t xt57_be32(const uint8_t *b) {
+    return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | b[3];
+}
+
+static int CmdLFXhorseXt57Nonce(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "lf xhorse xt57 nonce",
+                  "Run the XT57B XMICRO session over and over and log the 32-bit nonce each one returns.\n"
+                  "One gap is stepped each time (--sweep) so that the timing that selects the nonce can be found.\n"
+                  "A nonce that is a known one is answered with the recorded answer, which also records the\n"
+                  "64-bit reply; use --answer to always send one value or --noanswer to leave it.\n"
+                  "Gaps (VVDI): powerup = field on -> XMICRO 120140 us, ackid = 0x5AA5 -> 0011 88 T0,\n"
+                  "idsel = XT57X -> select 82 T0, nonans = nonce -> answer 144 T0, off = field off 20000 us.\n"
+                  "T0 = 8 us, counted from the last tag edge.  Press Enter to stop.",
+                  "lf xhorse xt57 nonce -n 100                           -> 100 sessions, default timing\n"
+                  "lf xhorse xt57 nonce --sweep powerup --step 8 -n 200   -> field-on delay 120140, 120148, ...\n"
+                  "lf xhorse xt57 nonce --sweep idsel --base 70 --step 1 -n 40\n"
+                  "lf xhorse xt57 nonce --noanswer -f nonces.csv -n 500");
+    void *argtable[] = {
+        arg_param_begin,
+        arg_int0("n", "count", "<dec>", "number of sessions (def 32)"),
+        arg_str0(NULL, "sweep", "<name>", "gap to step: powerup, ackid, idsel, nonans, off or none (def none)"),
+        arg_int0(NULL, "base", "<dec>", "swept gap for session 0, us or T0 (def: the VVDI's)"),
+        arg_int0(NULL, "step", "<dec>", "added to the swept gap each session (def 1)"),
+        arg_str0(NULL, "select", "<hex>", "13 byte select frame (def C0 'XT57' 123456789ABCDEF0)"),
+        arg_str0(NULL, "answer", "<hex>", "always send this 32-bit answer"),
+        arg_lit0(NULL, "noanswer", "do not answer, only record nonces"),
+        arg_str0("f", "file", "<fn>", "also write a CSV of the sessions"),
+        arg_int0(NULL, "off", "<dec>", "field-off time before each session in us (def 20000; the chip keeps its nonce state through ~33000)"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, true);
+
+    int total = arg_get_int_def(ctx, 1, 32);
+
+    char sweepstr[16] = {0};
+    int slen = 0;
+    CLIParamStrToBuf(arg_get_str(ctx, 2), (uint8_t *)sweepstr, sizeof(sweepstr) - 1, &slen);
+    int sweep = XT57_SWEEP_NONE;
+    if (slen > 0) {
+        sweep = -1;
+        for (int i = 0; i < (int)ARRAYLEN(xt57_sweep_names); i++) {
+            if (strcmp(sweepstr, xt57_sweep_names[i]) == 0) {
+                sweep = i;
+            }
+        }
+        if (sweep < 0) {
+            PrintAndLogEx(FAILED, "unknown sweep '%s' (powerup, ackid, idsel, nonans, off, none)", sweepstr);
+            CLIParserFree(ctx);
+            return PM3_EINVARG;
+        }
+    }
+    int base = arg_get_int_def(ctx, 3, xt57_sweep_defs[sweep]);
+    int step = arg_get_int_def(ctx, 4, (sweep == XT57_SWEEP_NONE) ? 0 : 1);
+
+    uint8_t sel[XHORSE_XT57_SELLEN] = { 0xC0, 'X', 'T', '5', '7', 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0 };
+    int sellen = 0;
+    uint8_t selin[XHORSE_XT57_SELLEN + 1] = {0};
+    CLIGetHexWithReturn(ctx, 5, selin, &sellen);
+    if (sellen > 0) {
+        if (sellen != XHORSE_XT57_SELLEN) {
+            PrintAndLogEx(FAILED, "select must be %d bytes (got %d)", XHORSE_XT57_SELLEN, sellen);
+            CLIParserFree(ctx);
+            return PM3_EINVARG;
+        }
+        memcpy(sel, selin, sizeof(sel));
+    }
+
+    uint8_t ansb[5] = {0};
+    int anslen = 0;
+    CLIGetHexWithReturn(ctx, 6, ansb, &anslen);
+    if (anslen > 0 && anslen != 4) {
+        PrintAndLogEx(FAILED, "answer must be 4 bytes (got %d)", anslen);
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+    bool noanswer = arg_get_lit(ctx, 7);
+
+    char fname[FILE_PATH_SIZE] = {0};
+    int fnlen = 0;
+    CLIParamStrToBuf(arg_get_str(ctx, 8), (uint8_t *)fname, FILE_PATH_SIZE - 1, &fnlen);
+    int off_us = arg_get_int_def(ctx, 9, 0);
+    CLIParserFree(ctx);
+
+    FILE *csv = NULL;
+    if (fnlen > 0) {
+        csv = fopen(fname, "w");
+        if (csv == NULL) {
+            PrintAndLogEx(FAILED, "cannot open %s", fname);
+            return PM3_EFILE;
+        }
+        fprintf(csv, "session,%s,flags,ident,nonce_bits,nonce,answer,reply_bits,reply,check\n", xt57_sweep_names[sweep]);
+    }
+
+    lf_xhorse_xt57_t p;
+    memset(&p, 0, sizeof(p));
+    p.sweep = (uint8_t)sweep;
+    p.answer_mode = noanswer ? XT57_ANS_NONE : ((anslen == 4) ? XT57_ANS_FIXED : XT57_ANS_KNOWN);
+    p.answer = (anslen == 4) ? xt57_be32(ansb) : 0;
+    memcpy(p.select, sel, sizeof(sel));
+    p.off_us = (off_us > 0) ? (uint32_t)off_us : 0;
+
+    PrintAndLogEx(INFO, "%d sessions, sweep " _YELLOW_("%s") " from %d step %d %s.  Press " _GREEN_("Enter") " to stop",
+                  total, xt57_sweep_names[sweep], base, step, xt57_sweep_units[sweep]);
+    PrintAndLogEx(INFO, "  #  %-9s flg nonce     off  answer    reply             check",
+                  (sweep == XT57_SWEEP_NONE) ? "" : xt57_sweep_names[sweep]);
+
+    uint32_t seen[512];
+    uint16_t seen_n[512];
+    int nseen = 0, got = 0, done = 0, mismatch = 0, noack = 0;
+    int res = PM3_SUCCESS;
+
+    while (done < total) {
+        int batch = total - done;
+        if (batch > XHORSE_XT57_MAXSESS) batch = XHORSE_XT57_MAXSESS;
+        p.count = (uint8_t)batch;
+        p.base = base + step * done;
+        p.step = step;
+
+        clearCommandBuffer();
+        SendCommandNG(CMD_LF_XHORSE_XT57_NONCE, (uint8_t *)&p, sizeof(p));
+        PacketResponseNG resp;
+        // a session is ~0.2 s; allow a lot more than the batch needs
+        if (WaitForResponseTimeout(CMD_LF_XHORSE_XT57_NONCE, &resp, 15000 + 600 * batch) == false) {
+            PrintAndLogEx(WARNING, "timeout while waiting for reply");
+            SendCommandNG(CMD_BREAK_LOOP, NULL, 0);
+            res = PM3_ETIMEOUT;
+            break;
+        }
+        if (resp.status != PM3_SUCCESS || resp.length < sizeof(lf_xhorse_xt57_reply_t)) {
+            PrintAndLogEx(FAILED, "device error (status %d, %u bytes)", resp.status, (unsigned)resp.length);
+            res = PM3_ESOFT;
+            break;
+        }
+        const lf_xhorse_xt57_reply_t *rp = (const lf_xhorse_xt57_reply_t *)resp.data.asBytes;
+
+        for (int i = 0; i < rp->count && i < batch; i++) {
+            const lf_xhorse_xt57_rec_t *r = &rp->rec[i];
+            int idx = done + i;
+            int32_t val = (int32_t)(base + (int64_t)step * idx);
+
+            uint32_t nonce = xt57_be32(r->nonce);
+            char nstr[16] = "", ostr[16] = "", astr[16] = "", rstr[24] = "", cstr[40] = "";
+
+            if (r->flags & XT57_F_NONCE) {
+                got++;
+                snprintf(nstr, sizeof(nstr), "%08X", nonce);
+                int off = xt57_offset(nonce);
+                if (off < 0) {
+                    snprintf(ostr, sizeof(ostr), "new");
+                } else {
+                    snprintf(ostr, sizeof(ostr), "%d", off);
+                }
+                int k;
+                for (k = 0; k < nseen; k++) {
+                    if (seen[k] == nonce) break;
+                }
+                if (k == nseen && nseen < (int)ARRAYLEN(seen)) {
+                    seen[nseen] = nonce;
+                    seen_n[nseen++] = 1;
+                } else if (k < nseen) {
+                    seen_n[k]++;
+                }
+            } else if ((r->flags & XT57_F_ACK) == 0) {
+                noack++;
+                snprintf(cstr, sizeof(cstr), "no XMICRO ack");
+            } else if ((r->flags & XT57_F_IDENT) == 0) {
+                snprintf(cstr, sizeof(cstr), "no XT57X: %s", sprint_hex_inrow(r->ident, 5));
+            } else {
+                snprintf(cstr, sizeof(cstr), "no nonce (%u bits)", r->nonce_bits);
+            }
+
+            if (r->flags & XT57_F_ANSWER) {
+                snprintf(astr, sizeof(astr), "%08X", xt57_be32(r->answer));
+                snprintf(rstr, sizeof(rstr), "%s", sprint_hex_inrow(r->reply, 8));
+                if (r->reply_bits < 64) {
+                    snprintf(cstr, sizeof(cstr), "reply %u bits", r->reply_bits);
+                } else {
+                    uint32_t hi = xt57_be32(r->reply);
+                    uint32_t lo = xt57_be32(r->reply + 4);
+                    const xt57_known_t *kn = NULL;
+                    for (size_t k = 0; k < ARRAYLEN(xt57_known); k++) {
+                        if (xt57_known[k].nonce == nonce) kn = &xt57_known[k];
+                    }
+                    if (kn == NULL) {
+                        snprintf(cstr, sizeof(cstr), "answered, reply unknown");
+                    } else if (kn->rhi == hi && kn->rlo == lo) {
+                        snprintf(cstr, sizeof(cstr), "reply matches");
+                    } else {
+                        snprintf(cstr, sizeof(cstr), "REPLY DIFFERS");
+                        mismatch++;
+                    }
+                }
+            }
+
+            PrintAndLogEx(INFO, "%3d %9d  %c%c%c %-9s %-4s %-9s %-17s %s", idx + 1, val,
+                          (r->flags & XT57_F_ACK) ? 'A' : '-', (r->flags & XT57_F_IDENT) ? 'I' : '-',
+                          (r->flags & XT57_F_NONCE) ? 'N' : '-', nstr, ostr, astr, rstr, cstr);
+            if (csv) {
+                fprintf(csv, "%d,%d,%02X,%s,%u,%s,%s,%u,%s,%s\n", idx + 1, val, r->flags, sprint_hex_inrow(r->ident, 5),
+                        r->nonce_bits, nstr, astr, r->reply_bits, rstr, cstr);
+            }
+        }
+        done += rp->count;
+        if (rp->count < batch) break;                 // the device stopped early (button / host data)
+        if (kbd_enter_pressed()) {
+            SendCommandNG(CMD_BREAK_LOOP, NULL, 0);
+            PrintAndLogEx(INFO, "aborted");
+            break;
+        }
+    }
+    if (csv) fclose(csv);
+
+    PrintAndLogEx(NORMAL, "");
+    PrintAndLogEx(SUCCESS, "%d sessions, %d nonces (%d distinct), %d without a nonce (%d without an XMICRO ack), %d reply mismatches",
+                  done, got, nseen, done - got, noack, mismatch);
+    for (int k = 0; k < nseen; k++) {
+        int off = xt57_offset(seen[k]);
+        if (off < 0) {
+            PrintAndLogEx(INFO, "  %08X x%-3u not in the known stream", seen[k], seen_n[k]);
+        } else {
+            PrintAndLogEx(INFO, "  %08X x%-3u stream offset %d", seen[k], seen_n[k], off);
+        }
+    }
+    return res;
+}
+
+static int CmdHelpXt57(const char *Cmd);
+static command_t Xt57CommandTable[] = {
+    {"help",  CmdHelpXt57,           AlwaysAvailable, "This help"},
+    {"nonce", CmdLFXhorseXt57Nonce,  IfPm3Hitag,      "Collect XT57B nonces over a range of timings"},
+    {NULL, NULL, 0, NULL}
+};
+
+static int CmdHelpXt57(const char *Cmd) {
+    (void)Cmd;
+    CmdsHelp(Xt57CommandTable);
+    return PM3_SUCCESS;
+}
+
+static int CmdLFXhorseXt57(const char *Cmd) {
+    clearCommandBuffer();
+    return CmdsParse(Xt57CommandTable, Cmd);
+}
+
+//-----------------------------------------------------------------------------
 static command_t CommandTable[] = {
     {"help",      CmdHelp,             AlwaysAvailable, "This help"},
     {"-----------", CmdHelp,           AlwaysAvailable, "----------------- " _CYAN_("Xhorse XT27A / XT136") " -----------------"},
@@ -616,6 +893,7 @@ static command_t CommandTable[] = {
     {"dump",      CmdLFXhorseDump,     IfPm3Hitag,      "Read all reachable channel-A storage"},
     {"configure", CmdLFXhorseConfigure, IfPm3Hitag,     "Set which transponder the chip emulates"},
     {"reset",     CmdLFXhorseReset,    IfPm3Hitag,      "Restore the default ID46 personality"},
+    {"xt57",      CmdLFXhorseXt57,     AlwaysAvailable, "XT57B (XMICRO channel) experiments"},
     {NULL, NULL, 0, NULL}
 };
 

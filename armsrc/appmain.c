@@ -2005,6 +2005,14 @@ static void PacketReceived(PacketCommandNG *packet) {
             Xhorse_Reset(true);
             break;
         }
+        case CMD_LF_XHORSE_XT57_NONCE: {
+            if (packet->length < sizeof(lf_xhorse_xt57_t)) {
+                reply_ng(CMD_LF_XHORSE_XT57_NONCE, PM3_EINVARG, NULL, 0);
+                break;
+            }
+            Xhorse_Xt57Nonce((const lf_xhorse_xt57_t *)packet->data.asBytes, true);
+            break;
+        }
 #endif
 
 #ifdef WITH_EM4x50
