@@ -2074,6 +2074,22 @@ static void PacketReceived(PacketCommandNG *packet) {
             Xhorse_Reset(true);
             break;
         }
+        case CMD_LF_XHORSE_READ: {
+            if (packet->length < sizeof(lf_xhorse_io_t)) {
+                reply_ng(CMD_LF_XHORSE_READ, PM3_EINVARG, NULL, 0);
+                break;
+            }
+            Xhorse_Read((const lf_xhorse_io_t *)packet->data.asBytes, true);
+            break;
+        }
+        case CMD_LF_XHORSE_WRITE: {
+            if (packet->length < sizeof(lf_xhorse_io_t)) {
+                reply_ng(CMD_LF_XHORSE_WRITE, PM3_EINVARG, NULL, 0);
+                break;
+            }
+            Xhorse_Write((const lf_xhorse_io_t *)packet->data.asBytes, true);
+            break;
+        }
         case CMD_LF_XHORSE_XT57_NONCE: {
             if (packet->length < sizeof(lf_xhorse_xt57_t)) {
                 reply_ng(CMD_LF_XHORSE_XT57_NONCE, PM3_EINVARG, NULL, 0);

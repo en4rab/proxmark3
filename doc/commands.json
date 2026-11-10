@@ -12901,7 +12901,7 @@
         },
         "lf help": {
             "command": "lf help",
-            "description": "help This help ----------- -------------- Low Frequency -------------- awid { AWID RFIDs... } cotag { COTAG CHIPs... } destron { FDX-A Destron RFIDs... } em { EM CHIPs & RFIDs... } fdxb { FDX-B RFIDs... } gallagher { GALLAGHER RFIDs... } gproxii { Guardall Prox II RFIDs... } hid { HID Prox RFIDs... } hitag { Hitag CHIPs... } ict { ICT RFIDs... } idteck { Idteck RFIDs... } indala { Indala RFIDs... } io { ioProx RFIDs... } jablotron { Jablotron RFIDs... } keri { KERI RFIDs... } motorola { Motorola Flexpass RFIDs... } nedap { Nedap RFIDs... } nexwatch { NexWatch RFIDs... } noralsy { Noralsy RFIDs... } pac { PAC/Stanley RFIDs... } paradox { Paradox RFIDs... } pcf7931 { PCF7931 CHIPs... } presco { Presco RFIDs... } pyramid { Farpointe/Pyramid RFIDs... } securakey { Securakey RFIDs... } ti { TI CHIPs... } t55xx { T55xx CHIPs... } trovan { Trovan animal IDs... } viking { Viking RFIDs... } visa2000 { Visa2000 RFIDs... } watchnet { WatchNET RFIDs... } ----------- --------------------- General --------------------- search Read and Search for valid known tag --------------------------------------------------------------------------------------- lf config available offline: no Get/Set config for LF sampling, bit/sample, decimation, frequency These changes are temporary, will be reset after a power cycle. - use `lf read` performs a read (active field) - use `lf sniff` performs a sniff (no active field)",
+            "description": "help This help ----------- -------------- Low Frequency -------------- awid { AWID RFIDs... } cotag { COTAG CHIPs... } destron { FDX-A Destron RFIDs... } em { EM CHIPs & RFIDs... } fdxb { FDX-B RFIDs... } gallagher { GALLAGHER RFIDs... } gproxii { Guardall Prox II RFIDs... } hid { HID Prox RFIDs... } hitag { Hitag CHIPs... } ict { ICT RFIDs... } idteck { Idteck RFIDs... } indala { Indala RFIDs... } io { ioProx RFIDs... } jablotron { Jablotron RFIDs... } keri { KERI RFIDs... } motorola { Motorola Flexpass RFIDs... } nedap { Nedap RFIDs... } nexwatch { NexWatch RFIDs... } noralsy { Noralsy RFIDs... } pac { PAC/Stanley RFIDs... } paradox { Paradox RFIDs... } pcf7931 { PCF7931 CHIPs... } presco { Presco RFIDs... } pyramid { Farpointe/Pyramid RFIDs... } securakey { Securakey RFIDs... } ti { TI CHIPs... } t55xx { T55xx CHIPs... } trovan { Trovan animal IDs... } viking { Viking RFIDs... } visa2000 { Visa2000 RFIDs... } watchnet { WatchNET RFIDs... } xhorse { Xhorse XT27A / XT136 super-chip... } ----------- --------------------- General --------------------- search Read and Search for valid known tag --------------------------------------------------------------------------------------- lf config available offline: no Get/Set config for LF sampling, bit/sample, decimation, frequency These changes are temporary, will be reset after a power cycle. - use `lf read` performs a read (active field) - use `lf sniff` performs a sniff (no active field)",
             "notes": [
                 "lf config -> shows current config",
                 "lf config -b 8 --125 -> samples at 125 kHz, 8 bps",
@@ -15501,6 +15501,136 @@
             ],
             "usage": "lf watchnet sim [-h] [--fc <dec>] [--cn <dec>] [-r <hex>]"
         },
+        "lf xhorse configure": {
+            "command": "lf xhorse configure",
+            "description": "Configure which transponder an Xhorse super chip emulates. -t is a personality type (see `lf xhorse types`); -u sets the emulated UID and is required for every type that takes one. An XT136 takes only ID46/7936 and 7946, the two its own app offers; any other type is refused before anything is written. `lf xhorse reset` undoes a set.",
+            "notes": [
+                "lf xhorse configure -t ID46 -u 11223344 -> HITAG2, 4-byte UID",
+                "lf xhorse configure -t ID4D -> Texas Crypto, no UID",
+                "lf xhorse configure -t ID13 -u 20471BB01B -> EM4102, 5-byte UID",
+                "lf xhorse configure -t 7939 -u 11223344 -> PCF7939, 4-byte UID",
+                "lf xhorse configure -t ID48 -u 11223344 -> Megamos, 4-byte UID",
+                "lf xhorse configure -t ID4C -u D3DA834C7E39EE98",
+                "lf xhorse configure -t 7946 -u DE269A2F -> PCF7946 (XT27A or XT136)"
+            ],
+            "offline": false,
+            "options": [
+                "-h, --help This help",
+                "-t, --type <name> emulated-type name, e.g. ID46 / 7936 / ID13",
+                "-u, --uid <hex> emulated UID, required where the type takes one (length depends on type)",
+                "--noverify do not read each write back to verify"
+            ],
+            "usage": "lf xhorse configure [-h] -t <name> [-u <hex>] [--noverify]"
+        },
+        "lf xhorse dump": {
+            "command": "lf xhorse dump",
+            "description": "Read all reachable channel-A storage of an Xhorse XT27A: the 16-byte chip ID, the type byte, and pages 0x00..0x3F of both banks: bank 0 (the emulated-tag image) and bank 1 (configuration and identity). Each bank is read in its own session. An XT136 has no banks: its pages 0x00..0x3F are read in one session (only 0x00..0x0F are known to exist).",
+            "notes": [
+                "lf xhorse dump"
+            ],
+            "offline": false,
+            "options": [
+                "-h, --help This help"
+            ],
+            "usage": "lf xhorse dump [-h]"
+        },
+        "lf xhorse help": {
+            "command": "lf xhorse help",
+            "description": "help This help ----------- ----------------- Xhorse XT27A / XT136 ----------------- types List the -t type names accepted by configure xt57 XT57B (XMICRO channel) experiments --------------------------------------------------------------------------------------- lf xhorse types available offline: yes List the emulated-type names accepted by `lf xhorse configure -t`.",
+            "notes": [
+                "lf xhorse types"
+            ],
+            "offline": true,
+            "options": [
+                "-h, --help This help"
+            ],
+            "usage": "lf xhorse types [-h]"
+        },
+        "lf xhorse info": {
+            "command": "lf xhorse info",
+            "description": "Identify an Xhorse super-chip. First probes the XMICRO / channel-B identify: newer families (XT57 / XT37-class) answer it and are reported as unsupported. Otherwise reads the XT27A over channel A: unique chip ID, emulated type byte, and the first 8 emulated-image pages. If no XT27A answers, tries the XT136 handshake and reads its pages 0x00..0x0F.",
+            "notes": [
+                "lf xhorse info"
+            ],
+            "offline": false,
+            "options": [
+                "-h, --help This help"
+            ],
+            "usage": "lf xhorse info [-h]"
+        },
+        "lf xhorse read": {
+            "command": "lf xhorse read",
+            "description": "Read raw channel-A pages from an Xhorse super-chip. A page address is 6 bits, so 0x00..0x3F is the whole of a bank and there is no page above it. An XT27A has two banks, selected with -b: bank 0 is the emulated transponder's image, bank 1 is configuration and identity (chip ID 0x33..0x36, emulated type byte 0x3C, config words 0x3D..0x3E). An XT136 has no banks and -b is ignored on one. Every page is read until two reads agree; one marked ? never did and may be wrong.",
+            "notes": [
+                "lf xhorse read -p 0 -> bank-0 page 0x00",
+                "lf xhorse read -b 1 -p 0x3C -> the emulated type byte",
+                "lf xhorse read -b 1 -p 0x33 -n 4 -> the 16-byte chip ID",
+                "lf xhorse read -p 0 -n 64 -> all of bank 0"
+            ],
+            "offline": false,
+            "options": [
+                "-h, --help This help",
+                "-b, --bank <dec> bank to read, 0..63 (def 0); ignored on an XT136",
+                "-p, --page <dec> first page, 0..63",
+                "-n, --count <dec> pages to read (def 1)"
+            ],
+            "usage": "lf xhorse read [-h] [-b <dec>] -p <dec> [-n <dec>]"
+        },
+        "lf xhorse reset": {
+            "command": "lf xhorse reset",
+            "description": "Restore an Xhorse super chip to its factory-default ID46/HITAG2 personality. Does not blank the chip. XT27A: type byte 0x36 + the default UID/password/config. Also recovers a chip stuck emulating an EM type (ID11/12/13), ID48, ID8E or ID8A, which never answers the normal handshake. XT136: the VVDI's fixed reset image - config words 0x0D-0x0F then pages 0x00-0x0C, UID 64B55D12. There is no EM-style recovery for an XT136: this only works while the chip still answers channel A.",
+            "notes": [
+                "lf xhorse reset"
+            ],
+            "offline": false,
+            "options": [
+                "-h, --help This help"
+            ],
+            "usage": "lf xhorse reset [-h]"
+        },
+        "lf xhorse write": {
+            "command": "lf xhorse write",
+            "description": "Write one raw channel-A page of an Xhorse super-chip and read it back. This writes whatever you give it with no regard for what the page means, so it can leave the chip emulating nothing useful. `lf xhorse reset` rewrites bank 0. Bank 1 holds pages that are dangerous to write: 0x33..0x36 the 16-byte unique chip ID. It IS writable, nothing else on the chip holds a copy, and overwriting it cannot be undone. Read it first (`lf xhorse read -b 1 -p 0x33 -n 4`) and keep the value. 0x3C the emulated type byte. A type that silences channel A (0x8C, 0x48, 0x8A) needs `lf xhorse reset` to recover. 0x3D..0x3F config words; they ignore a WRITE. Use -c, which writes them the only way that works: ctl 0x30+n (see -c below). An XT136 has no banks and -b is ignored on one. -c writes a config word, which can change what the chip emulates. On an XT27A `lf xhorse reset` can recover that; on an XT136 there is no reset recipe, and config word 1's high byte is the suspected type field. Read the word first and keep the value.",
+            "notes": [
+                "lf xhorse write -p 0 -d 11223344 -> bank-0 page 0x00 (emulated UID)",
+                "lf xhorse write -b 1 -p 0x3C -d 00000036 -> set the emulated type to ID46",
+                "lf xhorse write -p 0x05 -d A5A5A5A5 --nv -> write without the read-back verify",
+                "lf xhorse write -c 0 -d 0000000F -> config word 0 via ctl 0x30"
+            ],
+            "offline": false,
+            "options": [
+                "-h, --help This help",
+                "-b, --bank <dec> bank to write, 0..63 (def 0); ignored on an XT136",
+                "-p, --page <dec> page to write, 0..63",
+                "-c, --cfg <dec> config word n to write via ctl 0x30+n, 0..2 (instead of -p)",
+                "-d, --data <hex> 4 byte value to write",
+                "--nv skip the read-back verify (the page is still read back and shown)"
+            ],
+            "usage": "lf xhorse write [-h] [-b <dec>] [-p <dec>] [-c <dec>] -d <hex> [--nv]"
+        },
+        "lf xhorse xt57": {
+            "command": "lf xhorse xt57",
+            "description": "help This help ======================================================================================= mad { MAD commands... } --------------------------------------------------------------------------------------- mad help available offline: yes -------- ------------- General --------------- help This help -------- --------------- MAD ----------------- -------- ------------- Operations --------------- decode Decode MAD byte array encode Encode MAD byte array from AID mappings test Perform MAD regression self-tests --------------------------------------------------------------------------------------- mad read available offline: no Read application data from sectors matching a MAD AID",
+            "notes": [
+                "mad read --aid e103 -> read NDEF data",
+                "mad read --aid e103 -k ffffffffffff -b -> Classic, key B",
+                "mad read --aid e103 -k d3f7d3f7d3f7d3f7d3f7d3f7d3f7d3f7 -> Plus",
+                "mad read --aid e103 -v -f mydata.bin"
+            ],
+            "offline": true,
+            "options": [
+                "-h, --help This help",
+                "--aid <hex> application ID (2 hex bytes)",
+                "-k, --key <hex> key for data sectors",
+                "-b, --keyb use key B",
+                "--madkey <hex> key for MAD sectors",
+                "--be big-endian AID byte swap",
+                "--override override failed CRC check",
+                "-f, --file <fn> save raw data to file",
+                "-v, --verbose verbose output"
+            ],
+            "usage": "mad read [-hbv] --aid <hex> [-k <hex>] [--madkey <hex>] [--be] [--override] [-f <fn>]"
+        },
         "mad decode": {
             "command": "mad decode",
             "description": "Decode a MAD byte array and print the directory. Use Sector 0 == MAD 1 Sector 16 == MAD 2",
@@ -15534,29 +15664,6 @@
                 "--be big-endian AID byte swap"
             ],
             "usage": "mad encode [-hq] --aid <hex:sectors> [--aid <hex:sectors>]... [--be]"
-        },
-        "mad help": {
-            "command": "mad help",
-            "description": "-------- ------------- General --------------- help This help -------- --------------- MAD ----------------- -------- ------------- Operations --------------- decode Decode MAD byte array encode Encode MAD byte array from AID mappings test Perform MAD regression self-tests --------------------------------------------------------------------------------------- mad read available offline: no Read application data from sectors matching a MAD AID",
-            "notes": [
-                "mad read --aid e103 -> read NDEF data",
-                "mad read --aid e103 -k ffffffffffff -b -> Classic, key B",
-                "mad read --aid e103 -k d3f7d3f7d3f7d3f7d3f7d3f7d3f7d3f7 -> Plus",
-                "mad read --aid e103 -v -f mydata.bin"
-            ],
-            "offline": true,
-            "options": [
-                "-h, --help This help",
-                "--aid <hex> application ID (2 hex bytes)",
-                "-k, --key <hex> key for data sectors",
-                "-b, --keyb use key B",
-                "--madkey <hex> key for MAD sectors",
-                "--be big-endian AID byte swap",
-                "--override override failed CRC check",
-                "-f, --file <fn> save raw data to file",
-                "-v, --verbose verbose output"
-            ],
-            "usage": "mad read [-hbv] --aid <hex> [-k <hex>] [--madkey <hex>] [--be] [--override] [-f <fn>]"
         },
         "mad test": {
             "command": "mad test",

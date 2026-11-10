@@ -289,6 +289,9 @@ static void xh136_print(const lf_xhorse_info_t *nfo, const char *title) {
     PrintAndLogEx(NORMAL, "");
     PrintAndLogEx(INFO, "--- " _CYAN_("%s") " ---------------------------", title);
     PrintAndLogEx(INFO, "Family.... " _GREEN_("XT136") " (channel A, E20E signature 604A027E)");
+    // The E430 reply wanders over 9BF2..9BF7 across sessions and chips - a timing counter, not a
+    // per-chip value (docs/xt136.md SS2).  Shown because it is what seeds the cipher.
+    PrintAndLogEx(INFO, "Seed...... E430 reply 0x%04X", nfo->seed_reply);
     PrintAndLogEx(INFO, "  page | data");
     PrintAndLogEx(INFO, "-------+-----------");
     for (uint8_t pg = 0; pg < nfo->image_pages; pg++) {
@@ -306,6 +309,7 @@ static void xh136_print(const lf_xhorse_info_t *nfo, const char *title) {
 
 static void xh_print_header(const lf_xhorse_info_t *nfo) {
     PrintAndLogEx(INFO, "Chip ID... " _GREEN_("%s"), sprint_hex_inrow(nfo->chipid, 16));
+    PrintAndLogEx(INFO, "Seed...... 7372 reply 0x%04X", nfo->seed_reply);
     PrintAndLogEx(INFO, "Type byte. " _YELLOW_("0x%02X") " (%s)", nfo->typebyte, typebyte_name(nfo->typebyte));
     if (nfo->typebyte_ok == 0) {
         PrintAndLogEx(WARNING, "Type byte unconfirmed: no two reads of it agreed, so it may be wrong; try again");
@@ -452,6 +456,256 @@ static int CmdLFXhorseDump(const char *Cmd) {
 }
 
 //-----------------------------------------------------------------------------
+// read / write - raw channel-A page primitives
+//-----------------------------------------------------------------------------
+// Shared by both: send the request, wait, and sanity-check the reply.
+static int xh_io_send(uint16_t cmd, const lf_xhorse_io_t *p, lf_xhorse_io_reply_t *out, int *status) {
+    clearCommandBuffer();
+    SendCommandNG(cmd, (uint8_t *)p, sizeof(*p));
+    PacketResponseNG resp;
+    // A write opens two sessions (~2.5 s each over four timings) and waits out a 13 ms program
+    // cycle; a 64-page read reads every page at least twice.  30 s covers both with room to spare.
+    if (WaitForResponseTimeout(cmd, &resp, 30000) == false) {
+        PrintAndLogEx(WARNING, "timeout while waiting for reply");
+        SendCommandNG(CMD_BREAK_LOOP, NULL, 0);
+        return PM3_ETIMEOUT;
+    }
+    if (resp.length < sizeof(lf_xhorse_io_reply_t)) {
+        PrintAndLogEx(FAILED, "short reply from device");
+        return PM3_ESOFT;
+    }
+    memcpy(out, resp.data.asBytes, sizeof(*out));
+    *status = resp.status;
+    if (out->found == 0) {
+        xh_print_not_found();
+        return PM3_ESOFT;
+    }
+    return PM3_SUCCESS;
+}
+
+// Always two visible characters, like xh_page_mark, so a following column stays aligned.
+static const char *xh_io_mark(const lf_xhorse_io_reply_t *r, uint8_t i) {
+    return ((r->ok[i / 8] >> (i % 8)) & 1) ? "  " : " " _RED_("?");
+}
+
+// An XT136 has one flat page space: say so when a bank was asked for, so -b is never silently lost.
+static void xh_io_note_family(const lf_xhorse_io_reply_t *r, int bank, bool bank_given) {
+    if (r->family == XHORSE_FAM_XT136) {
+        PrintAndLogEx(INFO, "Family.... " _GREEN_("XT136") " (no banks: one flat page space)");
+        if (bank_given && bank != 0) {
+            PrintAndLogEx(WARNING, "-b %d ignored: an XT136 has no banks", bank);
+        }
+    }
+}
+
+static int CmdLFXhorseRead(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "lf xhorse read",
+                  "Read raw channel-A pages from an Xhorse super-chip.\n"
+                  "\n"
+                  "A page address is 6 bits, so 0x00..0x3F is the whole of a bank and there is no\n"
+                  "page above it.  An XT27A has two banks, selected with -b: bank 0 is the emulated\n"
+                  "transponder's image, bank 1 is configuration and identity (chip ID 0x33..0x36,\n"
+                  "emulated type byte 0x3C, config words 0x3D..0x3E).  An XT136 has no banks and -b\n"
+                  "is ignored on one.\n"
+                  "\n"
+                  "Every page is read until two reads agree; one marked " _RED_("?") " never did and may be wrong.",
+                  "lf xhorse read -p 0                      -> bank-0 page 0x00\n"
+                  "lf xhorse read -b 1 -p 0x3C              -> the emulated type byte\n"
+                  "lf xhorse read -b 1 -p 0x33 -n 4         -> the 16-byte chip ID\n"
+                  "lf xhorse read -p 0 -n 64                -> all of bank 0");
+    void *argtable[] = {
+        arg_param_begin,
+        arg_int0("b", "bank",  "<dec>", "bank to read, 0..63 (def 0); ignored on an XT136"),
+        arg_int1("p", "page",  "<dec>", "first page, 0..63"),
+        arg_int0("n", "count", "<dec>", "pages to read (def 1)"),
+        arg_param_end
+    };
+    // false: a bare `lf xhorse read` prints the help rather than quietly reading bank 0 page 0.
+    CLIExecWithReturn(ctx, Cmd, argtable, false);
+    int bank  = arg_get_int_def(ctx, 1, 0);
+    int page  = arg_get_int_def(ctx, 2, 0);
+    int count = arg_get_int_def(ctx, 3, 1);
+    bool bank_given = (arg_get_int_def(ctx, 1, -1) != -1);
+    CLIParserFree(ctx);
+
+    if (bank < 0 || bank > 63) {
+        PrintAndLogEx(FAILED, "bank must be 0..63 (the sel operand is 6 bits)");
+        return PM3_EINVARG;
+    }
+    if (page < 0 || page > 63) {
+        PrintAndLogEx(FAILED, "page must be 0..63 (the address field is 6 bits)");
+        return PM3_EINVARG;
+    }
+    if (count < 1 || count > 64) {
+        PrintAndLogEx(FAILED, "-n must be 1..64");
+        return PM3_EINVARG;
+    }
+    if (page + count > 64) {
+        PrintAndLogEx(FAILED, "page 0x%02X + %d pages runs past 0x3F, the last page of a bank", page, count);
+        return PM3_EINVARG;
+    }
+
+    lf_xhorse_io_t p;
+    memset(&p, 0, sizeof(p));
+    p.bank = (uint8_t)bank;
+    p.page = (uint8_t)page;
+    p.count = (uint8_t)count;
+
+    lf_xhorse_io_reply_t r;
+    int status = PM3_SUCCESS;
+    int res = xh_io_send(CMD_LF_XHORSE_READ, &p, &r, &status);
+    if (res != PM3_SUCCESS) {
+        return res;
+    }
+
+    PrintAndLogEx(NORMAL, "");
+    xh_io_note_family(&r, bank, bank_given);
+    if (status != PM3_SUCCESS) {
+        PrintAndLogEx(FAILED, "sel bank %d was not echoed: the chip has no such bank, or the session faltered", bank);
+        return PM3_ESOFT;
+    }
+    if (r.family == XHORSE_FAM_XT27A) {
+        PrintAndLogEx(INFO, "bank %d", bank);
+    }
+    PrintAndLogEx(INFO, "  page | data");
+    PrintAndLogEx(INFO, "-------+-----------");
+    for (uint8_t i = 0; i < r.count; i++) {
+        PrintAndLogEx(INFO, "  0x%02X | %s%s", (unsigned)(r.page + i), sprint_hex_inrow(&r.data[i * 4], 4), xh_io_mark(&r, i));
+    }
+    int bad = 0;
+    for (uint8_t i = 0; i < r.count; i++) {
+        bad += ((r.ok[i / 8] >> (i % 8)) & 1) ? 0 : 1;
+    }
+    if (bad) {
+        PrintAndLogEx(WARNING, "%d page(s) marked " _RED_("?") " unconfirmed: no two reads agreed, so they may be wrong; try again", bad);
+    }
+    PrintAndLogEx(NORMAL, "");
+    return PM3_SUCCESS;
+}
+
+static int CmdLFXhorseWrite(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "lf xhorse write",
+                  "Write one raw channel-A page of an Xhorse super-chip and read it back.\n"
+                  "\n"
+                  "This writes whatever you give it with no regard for what the page means, so it\n"
+                  "can leave the chip emulating nothing useful.  `lf xhorse reset` rewrites bank 0.\n"
+                  "\n"
+                  _RED_("Bank 1 holds pages that are dangerous to write:") "\n"
+                  "  0x33..0x36  the 16-byte unique chip ID.  It IS writable, nothing else on the\n"
+                  "              chip holds a copy, and overwriting it cannot be undone.  Read it\n"
+                  "              first (`lf xhorse read -b 1 -p 0x33 -n 4`) and keep the value.\n"
+                  "  0x3C        the emulated type byte.  A type that silences channel A (0x8C,\n"
+                  "              0x48, 0x8A) needs `lf xhorse reset` to recover.\n"
+                  "  0x3D..0x3F  config words; they ignore a WRITE.  Use -c, which writes them the\n"
+                  "              only way that works: ctl 0x30+n (" _RED_("see -c below") ").\n"
+                  "\n"
+                  "An XT136 has no banks and -b is ignored on one.\n"
+                  "\n"
+                  _RED_("-c writes a config word, which can change what the chip emulates.") "  On an XT27A\n"
+                  "`lf xhorse reset` can recover that; " _RED_("on an XT136 there is no reset recipe") ", and\n"
+                  "config word 1's high byte is the suspected type field.  Read the word first and\n"
+                  "keep the value.",
+                  "lf xhorse write -p 0 -d 11223344             -> bank-0 page 0x00 (emulated UID)\n"
+                  "lf xhorse write -b 1 -p 0x3C -d 00000036     -> set the emulated type to ID46\n"
+                  "lf xhorse write -p 0x05 -d A5A5A5A5 --nv     -> write without the read-back verify\n"
+                  "lf xhorse write -c 0 -d 0000000F             -> config word 0 via ctl 0x30");
+    void *argtable[] = {
+        arg_param_begin,
+        arg_int0("b", "bank", "<dec>", "bank to write, 0..63 (def 0); ignored on an XT136"),
+        arg_int0("p", "page", "<dec>", "page to write, 0..63"),
+        arg_int0("c", "cfg",  "<dec>", "config word n to write via ctl 0x30+n, 0..2 (instead of -p)"),
+        arg_str1("d", "data", "<hex>", "4 byte value to write"),
+        arg_lit0(NULL, "nv",  "skip the read-back verify (the page is still read back and shown)"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, false);
+    int bank = arg_get_int_def(ctx, 1, 0);
+    int page = arg_get_int_def(ctx, 2, -1);
+    int cfg = arg_get_int_def(ctx, 3, -1);
+    uint8_t data[4] = {0};
+    int dlen = 0;
+    CLIGetHexWithReturn(ctx, 4, data, &dlen);
+    bool nv = arg_get_lit(ctx, 5);
+    bool bank_given = (arg_get_int_def(ctx, 1, -1) != -1);
+    CLIParserFree(ctx);
+
+    if (dlen != 4) {
+        PrintAndLogEx(FAILED, "-d takes exactly 4 bytes, got %d", dlen);
+        return PM3_EINVARG;
+    }
+    // Exactly one target: -p is not defaulted to page 0, and -c is a different address space.
+    if ((page == -1) == (cfg == -1)) {
+        PrintAndLogEx(FAILED, "give exactly one of -p (a page) or -c (a config word), %s",
+                      (page == -1) ? "neither was given" : "both were given");
+        return PM3_EINVARG;
+    }
+    if (bank < 0 || bank > 63) {
+        PrintAndLogEx(FAILED, "bank must be 0..63 (the sel operand is 6 bits)");
+        return PM3_EINVARG;
+    }
+    if (cfg != -1 && (cfg < 0 || cfg > 2)) {
+        PrintAndLogEx(FAILED, "config word must be 0..2 (ctl 0x30..0x32)");
+        return PM3_EINVARG;
+    }
+    if (page != -1 && (page < 0 || page > 63)) {
+        PrintAndLogEx(FAILED, "page must be 0..63 (the address field is 6 bits)");
+        return PM3_EINVARG;
+    }
+
+    lf_xhorse_io_t p;
+    memset(&p, 0, sizeof(p));
+    p.bank = (uint8_t)bank;
+    p.cfg = (cfg != -1) ? 1 : 0;
+    p.page = (uint8_t)((cfg != -1) ? cfg : page);
+    p.verify = nv ? 0 : 1;
+    p.value = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) | ((uint32_t)data[2] << 8) | data[3];
+
+    lf_xhorse_io_reply_t r;
+    int status = PM3_SUCCESS;
+    int res = xh_io_send(CMD_LF_XHORSE_WRITE, &p, &r, &status);
+    if (res != PM3_SUCCESS) {
+        return res;
+    }
+
+    PrintAndLogEx(NORMAL, "");
+    xh_io_note_family(&r, bank, bank_given);
+    if (r.count == 0) {
+        PrintAndLogEx(FAILED, "sel bank %d was not echoed; nothing was written", bank);
+        return PM3_ESOFT;
+    }
+
+    if (cfg != -1) {
+        // r.page is where the word reads back from: 0x0D+n on an XT136, bank-1 0x3D+n on an XT27A.
+        PrintAndLogEx(INFO, "wrote config word %d (ctl 0x%02X) = %s", cfg, 0x30 + cfg, sprint_hex_inrow(data, 4));
+        PrintAndLogEx(INFO, "page 0x%02X reads back %s%s", r.page, sprint_hex_inrow(&r.data[0], 4), xh_io_mark(&r, 0));
+    } else if (r.family == XHORSE_FAM_XT136) {
+        PrintAndLogEx(INFO, "wrote page 0x%02X = %s", page, sprint_hex_inrow(data, 4));
+        PrintAndLogEx(INFO, "reads back      %s%s", sprint_hex_inrow(&r.data[0], 4), xh_io_mark(&r, 0));
+    } else {
+        PrintAndLogEx(INFO, "wrote bank %d page 0x%02X = %s", bank, page, sprint_hex_inrow(data, 4));
+        PrintAndLogEx(INFO, "reads back      %s%s", sprint_hex_inrow(&r.data[0], 4), xh_io_mark(&r, 0));
+    }
+
+    if (memcmp(r.data, data, 4) == 0) {
+        PrintAndLogEx(SUCCESS, "write " _GREEN_("ok"));
+    } else if (status == PM3_SUCCESS) {
+        // The firmware's verify saw the value but our read-back does not: a weak reply, or the
+        // page changed again.  Report it rather than claiming success.
+        PrintAndLogEx(WARNING, "verify passed on-chip but the read-back differs; try reading the page again");
+    } else {
+        PrintAndLogEx(FAILED, "write " _RED_("did not take") " - the page still reads %s", sprint_hex_inrow(&r.data[0], 4));
+        if (cfg == -1) {
+            PrintAndLogEx(HINT, "config words ignore a WRITE; write them with -c (ctl 0x30+n)");
+        }
+        return PM3_ESOFT;
+    }
+    PrintAndLogEx(NORMAL, "");
+    return PM3_SUCCESS;
+}
+
+//-----------------------------------------------------------------------------
 // shared send-and-wait for a mutating command
 //-----------------------------------------------------------------------------
 // p may be NULL for a command without a payload (reset).
@@ -472,6 +726,12 @@ static int xh_send_wait(uint16_t cmd, const lf_xhorse_data_t *p, const char *wha
         PrintAndLogEx(HINT, "`" _YELLOW_("lf xhorse info") "` and `" _YELLOW_("lf xhorse dump") "` read it");
         return PM3_ENOTIMPL;
     }
+    if (resp.status == PM3_EINVARG) {
+        // The firmware refuses the type before it opens a session, so the chip is untouched.
+        PrintAndLogEx(FAILED, "Found an " _YELLOW_("XT136") ", which cannot emulate that type; nothing was written");
+        PrintAndLogEx(HINT, "an XT136 takes " _YELLOW_("ID46") " / " _YELLOW_("7936") " or " _YELLOW_("7946") " with a 4 byte UID - the only two its own app offers");
+        return PM3_EINVARG;
+    }
     if (resp.status != PM3_SUCCESS) {
         PrintAndLogEx(FAILED, "%s failed on-chip (status %d) - read-back verify mismatch or no tag", what, resp.status);
         return PM3_ESOFT;
@@ -486,15 +746,19 @@ static int xh_send_wait(uint16_t cmd, const lf_xhorse_data_t *p, const char *wha
 static int CmdLFXhorseConfigure(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "lf xhorse configure",
-                  "Configure which transponder an Xhorse XT27A emulates.  -t is a personality\n"
+                  "Configure which transponder an Xhorse super chip emulates.  -t is a personality\n"
                   "type (see `lf xhorse types`); -u sets the emulated UID and is required for\n"
-                  "every type that takes one.",
+                  "every type that takes one.\n"
+                  "\n"
+                  "An " _YELLOW_("XT136") " takes only " _YELLOW_("ID46") "/" _YELLOW_("7936") " and " _YELLOW_("7946") ", the two its own app offers; any other\n"
+                  "type is refused before anything is written.  `lf xhorse reset` undoes a set.",
                   "lf xhorse configure -t ID46 -u 11223344     -> HITAG2, 4-byte UID\n"
                   "lf xhorse configure -t ID4D                 -> Texas Crypto, no UID\n"
                   "lf xhorse configure -t ID13 -u 20471BB01B   -> EM4102, 5-byte UID\n"
                   "lf xhorse configure -t 7939 -u 11223344     -> PCF7939, 4-byte UID\n"
                   "lf xhorse configure -t ID48 -u 11223344     -> Megamos, 4-byte UID\n"
-                  "lf xhorse configure -t ID4C -u D3DA834C7E39EE98");
+                  "lf xhorse configure -t ID4C -u D3DA834C7E39EE98\n"
+                  "lf xhorse configure -t 7946 -u DE269A2F     -> PCF7946 (XT27A or XT136)");
 
     void *argtable[] = {
         arg_param_begin,
@@ -579,6 +843,20 @@ static int CmdLFXhorseConfigure(const char *Cmd) {
     p.verify   = noverify ? 0 : 1;
     memcpy(p.uid, uid, sizeof(p.uid));
 
+    // A HITAG2 reader names the exact PCF part from bits 4..7 of the UID (getHitagTypeStr() in
+    // cmdlfhitag.c; the VVDI's own "specific chip" field is the same nibble, docs/xt136.md SS5a).
+    // Both VVDI set captures picked a UID whose nibble matches the type, so a mismatch is almost
+    // certainly a mistake - but it is the caller's UID, so warn rather than refuse or rewrite it.
+    if ((t->recipe == XHORSE_R_HITAG2) && (uidlen == 4)) {
+        uint8_t want = (t->typebyte == 0x36) ? 1 : (t->typebyte == 0x46) ? 2 : 0;
+        uint8_t have = (uid[3] >> 4) & 0x0F;
+        if (want && (have != want)) {
+            PrintAndLogEx(WARNING, "UID nibble is %u, but %s is read from a UID whose nibble is %u;",
+                          have, t->canon, want);
+            PrintAndLogEx(WARNING, "      a reader will name the chip from the UID, not from the type byte.");
+        }
+    }
+
     if (t->recipe == XHORSE_R_ID8E) {
         PrintAndLogEx(WARNING, "ID8E: only the UID store (pages 0x0A/0x0B) + type byte are written;");
         PrintAndLogEx(WARNING, "      the emulation block at 0x00..0x04 is not yet fully derived.");
@@ -595,10 +873,15 @@ static int CmdLFXhorseConfigure(const char *Cmd) {
 static int CmdLFXhorseReset(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "lf xhorse reset",
-                  "Restore an Xhorse XT27A to its factory-default ID46/HITAG2 personality\n"
-                  "(type 0x36 + default UID/password/config).  Does not blank the chip.\n"
-                  "Also recovers a chip stuck emulating an EM type (ID11/12/13), ID48, ID8E or\n"
-                  "ID8A, which never answers the normal handshake.",
+                  "Restore an Xhorse super chip to its factory-default ID46/HITAG2 personality.\n"
+                  "Does not blank the chip.\n"
+                  "\n"
+                  "XT27A: type byte 0x36 + the default UID/password/config.  Also recovers a chip\n"
+                  "       stuck emulating an EM type (ID11/12/13), ID48, ID8E or ID8A, which never\n"
+                  "       answers the normal handshake.\n"
+                  "XT136: the VVDI's fixed reset image - config words 0x0D-0x0F then pages\n"
+                  "       0x00-0x0C, UID 64B55D12.  There is no EM-style recovery for an XT136:\n"
+                  "       this only works while the chip still answers channel A.",
                   "lf xhorse reset");
     void *argtable[] = { arg_param_begin, arg_param_end };
     CLIExecWithReturn(ctx, Cmd, argtable, true);
@@ -893,6 +1176,8 @@ static command_t CommandTable[] = {
     {"dump",      CmdLFXhorseDump,     IfPm3Hitag,      "Read all reachable channel-A storage"},
     {"configure", CmdLFXhorseConfigure, IfPm3Hitag,     "Set which transponder the chip emulates"},
     {"reset",     CmdLFXhorseReset,    IfPm3Hitag,      "Restore the default ID46 personality"},
+    {"read",      CmdLFXhorseRead,     IfPm3Hitag,      "Read raw channel-A pages"},
+    {"write",     CmdLFXhorseWrite,    IfPm3Hitag,      "Write one raw channel-A page"},
     {"xt57",      CmdLFXhorseXt57,     AlwaysAvailable, "XT57B (XMICRO channel) experiments"},
     {NULL, NULL, 0, NULL}
 };

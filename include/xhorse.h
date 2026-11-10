@@ -86,7 +86,35 @@ typedef struct {
     uint8_t  bchip_type[8];   // ASCII family string the chip reported (e.g. "XT37")
     uint8_t  page_ok[8];      // bit (n % 8) of byte n / 8 set => two consecutive reads of page n agreed
     uint8_t  family;          // xhorse_family_t
+    uint16_t seed_reply;      // the tag's reply to 7372 (XT27A) / E430 (XT136) that seeds the cipher
 } PACKED lf_xhorse_info_t;
+
+// Client -> firmware payload for `lf xhorse read` / `lf xhorse write`: the raw channel-A page
+// primitives.  A page address is 6 bits, so 0x00..0x3F is the whole of a bank; the XT136 has no
+// banks and `bank` is ignored on one (doc/xhorse_notes.md).
+typedef struct {
+    uint8_t  bank;        // sel operand, 0..63 (XT27A: 0 = emulated image, 1 = config/identity)
+    uint8_t  page;        // first page, 0x00..0x3F
+    uint8_t  count;       // read: pages to read, 1..64; write: unused
+    uint8_t  verify;      // write: 1 => read the page back and compare before reporting success
+    uint8_t  cfg;         // write: 1 => `page` is a config-word index n, written by ctl 0x30+n
+    uint8_t  rfu[3];
+    uint32_t value;       // write: the 32-bit value
+} PACKED lf_xhorse_io_t;
+
+// Firmware -> client reply for both.  A write returns count = 1 and the page as it reads after the
+// write, so the caller always sees what is actually there.
+typedef struct {
+    uint8_t  found;       // 1 => a chip answered the handshake
+    uint8_t  family;      // xhorse_family_t that answered
+    uint8_t  bank;        // bank the pages came from; meaningless on an XT136
+    uint8_t  page;        // page number of data[0]
+    uint8_t  count;       // pages in data[]
+    uint8_t  verified;    // write: 1 => a read-back matched the value written
+    uint8_t  rfu[2];
+    uint8_t  ok[8];       // bit (i % 8) of byte i / 8 set => data[i] had two agreeing reads
+    uint8_t  data[64 * 4];
+} PACKED lf_xhorse_io_reply_t;
 
 // XT57B (channel B / XMICRO) nonce collection, `lf xhorse xt57 nonce`.  doc/xhorse_notes.md.
 // Session: field on, XMICRO -> 0x5AA5, 0011 -> "XT57X", 104-bit select -> 32-bit nonce, 32-bit answer -> 64-bit reply.

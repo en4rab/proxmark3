@@ -1666,6 +1666,23 @@ Check column "offline" for their availability.
 |`lf watchnet sim        `|N       |`simulate WatchNET tag`
 
 
+### lf xhorse
+
+ { Xhorse XT27A / XT136 super-chip... }
+
+|command                  |offline |description
+|-------                  |------- |-----------
+|`lf xhorse help         `|Y       |`This help`
+|`lf xhorse types        `|Y       |`List the -t type names accepted by configure`
+|`lf xhorse info         `|N       |`Identify a chip: family, ID, type, emulated image`
+|`lf xhorse dump         `|N       |`Read all reachable channel-A storage`
+|`lf xhorse configure    `|N       |`Set which transponder the chip emulates`
+|`lf xhorse reset        `|N       |`Restore the default ID46 personality`
+|`lf xhorse read         `|N       |`Read raw channel-A pages`
+|`lf xhorse write        `|N       |`Write one raw channel-A page`
+|`lf xhorse xt57         `|Y       |`XT57B (XMICRO channel) experiments`
+
+
 ### mad
 
  { MAD commands... }
