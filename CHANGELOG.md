@@ -3,6 +3,7 @@ All notable changes to this project will be documented in this file.
 This project uses the changelog in accordance with [keepchangelog](http://keepachangelog.com/). Please use this to write notable changes, which is not the same as git commit log...
 
 ## [unreleased][unreleased]
+- Added `lf autel` - Autel AT100 programmable transponder support: `list`, `dump`, `read`, `write`, `configure`, `reset`. 18 emulated types, each image replayed byte-for-byte from a decrypted Autel capture. See `docs/at100.md` (@en4rab)
 - Added `lf xhorse` - Xhorse XT27A super-chip support: `info`, `dump`, `configure`, `reset`, `types`; `reset`/`configure` also recover a chip stuck emulating an EM type; `info` identifies XT27B/XT57B (channel B) chips as unsupported. See `doc/xhorse_notes.md` (@CHANGEME)
 - Fixed `hf search` - the OpenPGP AID probe sent 8 bytes for a 6-byte AID, reading past the string, so no OpenPGP card was found (@matrix)
 - Fixed `hf 15 raw -r` - the device reply was left unread, so every later command printed the answer of the one before (@matrix)

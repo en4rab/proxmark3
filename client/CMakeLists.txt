@@ -487,6 +487,7 @@ set (TARGET_SOURCES
         ${PM3_ROOT}/client/src/cmdlftrovan.c
         ${PM3_ROOT}/client/src/cmdlfviking.c
         ${PM3_ROOT}/client/src/cmdlfvisa2000.c
+        ${PM3_ROOT}/client/src/cmdlfautel.c
         ${PM3_ROOT}/client/src/cmdlfwatchnet.c
         ${PM3_ROOT}/client/src/cmdlfxhorse.c
         ${PM3_ROOT}/client/src/cmdlfzx8211.c

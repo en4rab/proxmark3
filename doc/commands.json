@@ -11753,6 +11753,105 @@
             ],
             "usage": "hw version [-h]"
         },
+        "lf autel configure": {
+            "command": "lf autel configure",
+            "description": "Configure which transponder an AT100 emulates. -t is a type name (see `lf autel list`); -u sets the emulated serial and is required for every type that takes one. The whole burst runs in one authenticated session: page 0xFE first (which selects the type), then that type's image pages, exactly as the Autel does. Each page takes about 100 ms to commit, so a large image (ID8A writes 41 pages) takes several seconds. `lf autel reset` restores the factory type.",
+            "notes": [
+                "lf autel configure -t ID46 -u 11223344 -> HITAG2 / MIKRON image",
+                "lf autel configure -t ID13 -u 0456B307C8 -> EM4102, 5-byte ID",
+                "lf autel configure -t ID48 -u 785626A1 -> Megamos ID48",
+                "lf autel configure -t ID4D -u 033A09B0 -> Texas Crypto DST40",
+                "lf autel configure -t ID4C -u D210A09A00000000",
+                "lf autel configure -t ID8A -u 59D4E00A --nv -> skip the per-page verify"
+            ],
+            "offline": false,
+            "options": [
+                "-h, --help This help",
+                "-t, --type <name> emulated-type name, e.g. ID46 / 7936 / ID13",
+                "-u, --uid <hex> emulated serial, required where the type takes one",
+                "-k, --key <hex> 48-bit device key (def 9F63A5E8B14B)",
+                "--nv skip the per-page read-back verify (much faster)"
+            ],
+            "usage": "lf autel configure [-h] -t <name> [-u <hex>] [-k <hex>] [--nv]"
+        },
+        "lf autel dump": {
+            "command": "lf autel dump",
+            "description": "Read every page of an AT100 that the Autel programmer is ever seen to use: the emulated image at 0x00-0x27, the ID4D/ID4E registers at 0x3A-0x3D, 0x50, 0x78-0x7B, 0xC8, 0xF0-0xF4, the device-key page 0xFC and the type register 0xFE. The rest of the 256-page space is untouched in every capture; reach it with `lf autel read` if you want to probe it. Every page is read until two reads agree; one marked ? never did and may be wrong.",
+            "notes": [
+                "lf autel dump",
+                "lf autel dump -k 9F63A5E8B14B"
+            ],
+            "offline": false,
+            "options": [
+                "-h, --help This help",
+                "-k, --key <hex> 48-bit device key (def 9F63A5E8B14B)"
+            ],
+            "usage": "lf autel dump [-h] [-k <hex>]"
+        },
+        "lf autel help": {
+            "command": "lf autel help",
+            "description": "----------- ----------------- Autel AT100 ----------------- help This help list List the emulated types `configure` accepts --------------------------------------------------------------------------------------- lf autel list available offline: yes List the emulated-type names accepted by `lf autel configure -t`, with the page-0xFE type code each one writes and the UID it takes. Every image is the exact byte sequence the Autel programmer writes, decrypted out of data/traces/at100/. Where an image contains constants whose meaning is not decoded they are written as captured, and the type is noted below.",
+            "notes": [
+                "lf autel list"
+            ],
+            "offline": true,
+            "options": [
+                "-h, --help This help"
+            ],
+            "usage": "lf autel list [-h]"
+        },
+        "lf autel read": {
+            "command": "lf autel read",
+            "description": "Read raw pages from an AT100. The page address is 8 bits, so 0x00-0xFF is the whole space. Only the pages `lf autel dump` lists are ever used by the Autel programmer; the rest have never been seen read or written and may not be real storage. Every page is read until two reads agree; one marked ? never did and may be wrong.",
+            "notes": [
+                "lf autel read -p 0xFE -> the emulated-type register",
+                "lf autel read -p 0xFC -> the device-key page",
+                "lf autel read -p 0 -n 8 -> the first 8 image pages",
+                "lf autel read -p 0 -n 64 -k 9F63A5E8B14B"
+            ],
+            "offline": false,
+            "options": [
+                "-h, --help This help",
+                "-p, --page <dec> first page, 0..255",
+                "-n, --count <dec> pages to read, 1..64 (def 1)",
+                "-k, --key <hex> 48-bit device key (def 9F63A5E8B14B)"
+            ],
+            "usage": "lf autel read [-h] -p <dec> [-n <dec>] [-k <hex>]"
+        },
+        "lf autel reset": {
+            "command": "lf autel reset",
+            "description": "Restore an AT100 to its factory-shipped configuration. Every blank read before it was ever programmed held page 0xFE = 9B290A9B, which is exactly the type code the Autel's own ID4D entry writes, so this writes the ID4D image and that type code. Caveat: only the type register is known to match a blank. A blank's image pages were never read (the Autel reads only 0xFC and 0xFE), so the image written here is the one its ID4D menu entry produces, not a captured factory image. The serial at page 0x06 is random unless you give -u; every captured one began 0x03, so a generated one does too.",
+            "notes": [
+                "lf autel reset",
+                "lf autel reset -u 033A09B0"
+            ],
+            "offline": false,
+            "options": [
+                "-h, --help This help",
+                "-u, --uid <hex> 4 byte serial for page 0x06 (def: random, high byte 0x03)",
+                "-k, --key <hex> 48-bit device key (def 9F63A5E8B14B)",
+                "--nv skip the per-page read-back verify"
+            ],
+            "usage": "lf autel reset [-h] [-u <hex>] [-k <hex>] [--nv]"
+        },
+        "lf autel write": {
+            "command": "lf autel write",
+            "description": "Write one raw page of an AT100 and read it back. This writes whatever you give it with no regard for what the page means, so it can leave the chip emulating nothing useful. `lf autel configure` writes whole coherent images and `lf autel reset` restores the factory type. The chip cannot be locked out this way: its UID, its device key and pages 0xFC / 0xFE live outside the emulated image, and every capture shows the management interface answering whatever the chip is emulating. Page 0xFE is still the type register - write a code no emulation engine knows and the chip may emulate nothing until you set a valid one again (`lf autel list`).",
+            "notes": [
+                "lf autel write -p 0 -d 11223344 -> emulated image page 0x00",
+                "lf autel write -p 0xFE -d 8F08029B -> set the emulated type to ID46",
+                "lf autel write -p 0x06 -d 033A09B0 --nv -> write without the read-back verify"
+            ],
+            "offline": false,
+            "options": [
+                "-h, --help This help",
+                "-p, --page <dec> page to write, 0..255",
+                "-d, --data <hex> 4 byte value to write",
+                "-k, --key <hex> 48-bit device key (def 9F63A5E8B14B)",
+                "--nv skip the read-back verify (the page is still read back and shown)"
+            ],
+            "usage": "lf autel write [-h] -p <dec> -d <hex> [-k <hex>] [--nv]"
+        },
         "lf awid clone": {
             "command": "lf awid clone",
             "description": "clone a AWID Prox tag to a T55x7, Q5/T5555 or EM4305/4469 tag",
@@ -12901,7 +13000,7 @@
         },
         "lf help": {
             "command": "lf help",
-            "description": "help This help ----------- -------------- Low Frequency -------------- awid { AWID RFIDs... } cotag { COTAG CHIPs... } destron { FDX-A Destron RFIDs... } em { EM CHIPs & RFIDs... } fdxb { FDX-B RFIDs... } gallagher { GALLAGHER RFIDs... } gproxii { Guardall Prox II RFIDs... } hid { HID Prox RFIDs... } hitag { Hitag CHIPs... } ict { ICT RFIDs... } idteck { Idteck RFIDs... } indala { Indala RFIDs... } io { ioProx RFIDs... } jablotron { Jablotron RFIDs... } keri { KERI RFIDs... } motorola { Motorola Flexpass RFIDs... } nedap { Nedap RFIDs... } nexwatch { NexWatch RFIDs... } noralsy { Noralsy RFIDs... } pac { PAC/Stanley RFIDs... } paradox { Paradox RFIDs... } pcf7931 { PCF7931 CHIPs... } presco { Presco RFIDs... } pyramid { Farpointe/Pyramid RFIDs... } securakey { Securakey RFIDs... } ti { TI CHIPs... } t55xx { T55xx CHIPs... } trovan { Trovan animal IDs... } viking { Viking RFIDs... } visa2000 { Visa2000 RFIDs... } watchnet { WatchNET RFIDs... } xhorse { Xhorse XT27A / XT136 super-chip... } ----------- --------------------- General --------------------- search Read and Search for valid known tag --------------------------------------------------------------------------------------- lf config available offline: no Get/Set config for LF sampling, bit/sample, decimation, frequency These changes are temporary, will be reset after a power cycle. - use `lf read` performs a read (active field) - use `lf sniff` performs a sniff (no active field)",
+            "description": "help This help ----------- -------------- Low Frequency -------------- awid { AWID RFIDs... } cotag { COTAG CHIPs... } destron { FDX-A Destron RFIDs... } em { EM CHIPs & RFIDs... } fdxb { FDX-B RFIDs... } gallagher { GALLAGHER RFIDs... } gproxii { Guardall Prox II RFIDs... } hid { HID Prox RFIDs... } hitag { Hitag CHIPs... } ict { ICT RFIDs... } idteck { Idteck RFIDs... } indala { Indala RFIDs... } io { ioProx RFIDs... } jablotron { Jablotron RFIDs... } keri { KERI RFIDs... } motorola { Motorola Flexpass RFIDs... } nedap { Nedap RFIDs... } nexwatch { NexWatch RFIDs... } noralsy { Noralsy RFIDs... } pac { PAC/Stanley RFIDs... } paradox { Paradox RFIDs... } pcf7931 { PCF7931 CHIPs... } presco { Presco RFIDs... } pyramid { Farpointe/Pyramid RFIDs... } securakey { Securakey RFIDs... } ti { TI CHIPs... } t55xx { T55xx CHIPs... } trovan { Trovan animal IDs... } viking { Viking RFIDs... } visa2000 { Visa2000 RFIDs... } autel { Autel AT100 programmable transponder... } watchnet { WatchNET RFIDs... } xhorse { Xhorse XT27A / XT136 super-chip... } ----------- --------------------- General --------------------- search Read and Search for valid known tag --------------------------------------------------------------------------------------- lf config available offline: no Get/Set config for LF sampling, bit/sample, decimation, frequency These changes are temporary, will be reset after a power cycle. - use `lf read` performs a read (active field) - use `lf sniff` performs a sniff (no active field)",
             "notes": [
                 "lf config -> shows current config",
                 "lf config -b 8 --125 -> samples at 125 kHz, 8 bps",
@@ -17265,8 +17364,8 @@
         }
     },
     "metadata": {
-        "commands_extracted": 952,
+        "commands_extracted": 958,
         "extracted_by": "PM3Help2JSON v1.00",
-        "extracted_on": "2026-11-13T00:56:11+00:00"
+        "extracted_on": "2026-11-10T18:43:30+00:00"
     }
 }

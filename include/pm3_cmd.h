@@ -1175,6 +1175,13 @@ typedef struct {
 
 #define CMD_LF_SNIFF_RAW_ADC 0x0360
 
+// For Autel AT100 programmable transponder
+#define CMD_LF_AUTEL_READ 0x0361
+#define CMD_LF_AUTEL_WRITE 0x0362
+#define CMD_LF_AUTEL_DUMP 0x0363
+#define CMD_LF_AUTEL_CONFIGURE 0x0364
+#define CMD_LF_AUTEL_RESET 0x0365
+
 // For Xhorse super-chip (XT27A, channel A)
 #define CMD_LF_XHORSE_INFO 0x0369
 #define CMD_LF_XHORSE_RESET 0x036A

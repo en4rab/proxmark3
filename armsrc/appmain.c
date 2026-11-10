@@ -58,6 +58,7 @@
 #include "hitagS.h"
 #include "hitagu.h"
 #include "xhorse.h"
+#include "autel.h"
 #include "em4x50.h"
 #include "em4x70.h"
 #include "iclass.h"
@@ -2055,6 +2056,33 @@ static void PacketReceived(PacketCommandNG *packet) {
         }
         case CMD_LF_HITAGU_UID: {
             htu_read_uid(NULL, true, true);
+            break;
+        }
+
+        case CMD_LF_AUTEL_READ:
+        case CMD_LF_AUTEL_WRITE:
+        case CMD_LF_AUTEL_DUMP: {
+            if (packet->length < sizeof(lf_autel_io_t)) {
+                reply_ng(packet->cmd, PM3_EINVARG, NULL, 0);
+                break;
+            }
+            const lf_autel_io_t *io = (const lf_autel_io_t *)packet->data.asBytes;
+            if (packet->cmd == CMD_LF_AUTEL_READ) {
+                Autel_Read(io, true);
+            } else if (packet->cmd == CMD_LF_AUTEL_WRITE) {
+                Autel_Write(io, true);
+            } else {
+                Autel_Dump(io, true);
+            }
+            break;
+        }
+        case CMD_LF_AUTEL_CONFIGURE:
+        case CMD_LF_AUTEL_RESET: {
+            if (packet->length < sizeof(lf_autel_cfg_t)) {
+                reply_ng(packet->cmd, PM3_EINVARG, NULL, 0);
+                break;
+            }
+            Autel_Configure((const lf_autel_cfg_t *)packet->data.asBytes, packet->cmd, true);
             break;
         }
 

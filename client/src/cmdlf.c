@@ -74,6 +74,7 @@
 #include "cmdlftrovan.h"    // for trovan menu
 #include "cmdlfviking.h"    // for viking menu
 #include "cmdlfvisa2000.h"  // for VISA2000 menu
+#include "cmdlfautel.h"    // for Autel AT100 menu
 #include "cmdlfwatchnet.h"  // for WatchNET menu
 #include "cmdlfxhorse.h"    // for Xhorse super-chip menu
 #include "cmdlfzx8211.h"    // for ZX8211 menu
@@ -2465,6 +2466,7 @@ static command_t CommandTable[] = {
     {"trovan",      CmdLFTrovan,        AlwaysAvailable, "{ Trovan animal IDs...       }"},
     {"viking",      CmdLFViking,        AlwaysAvailable, "{ Viking RFIDs...            }"},
     {"visa2000",    CmdLFVisa2k,        AlwaysAvailable, "{ Visa2000 RFIDs...          }"},
+    {"autel",       CmdLFAutel,         AlwaysAvailable, "{ Autel AT100 programmable transponder... }"},
     {"watchnet",    CmdLFWatchnet,      AlwaysAvailable, "{ WatchNET RFIDs...          }"},
     {"xhorse",      CmdLFXhorse,        AlwaysAvailable, "{ Xhorse XT27A / XT136 super-chip... }"},
 //    {"zx",          CmdLFZx8211,        AlwaysAvailable, "{ ZX8211 RFIDs...            }"},

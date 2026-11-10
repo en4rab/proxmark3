@@ -1653,6 +1653,21 @@ Check column "offline" for their availability.
 |`lf visa2000 sim        `|N       |`simulate Visa2000 tag`
 
 
+### lf autel
+
+ { Autel AT100 programmable transponder... }
+
+|command                  |offline |description
+|-------                  |------- |-----------
+|`lf autel help          `|Y       |`This help`
+|`lf autel list          `|Y       |`List the emulated types `configure` accepts`
+|`lf autel dump          `|N       |`Read every page the Autel programmer uses`
+|`lf autel read          `|N       |`Read raw pages`
+|`lf autel write         `|N       |`Write one raw page`
+|`lf autel configure     `|N       |`Set which transponder the chip emulates`
+|`lf autel reset         `|N       |`Restore the factory-shipped configuration`
+
+
 ### lf watchnet
 
  { WatchNET RFIDs...          }
