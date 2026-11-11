@@ -3,7 +3,9 @@ All notable changes to this project will be documented in this file.
 This project uses the changelog in accordance with [keepchangelog](http://keepachangelog.com/). Please use this to write notable changes, which is not the same as git commit log...
 
 ## [unreleased][unreleased]
-- Added `lf autel` - Autel AT100 programmable transponder support: `list`, `dump`, `read`, `write`, `configure`, `reset`. 18 emulated types, each image replayed byte-for-byte from a decrypted Autel capture. See `docs/at100.md` (@en4rab)
+- Added `lf autel` - Autel AT100 programmable transponder support: `list`, `dump`, `read`, `write`, `configure`, `reset`. 18 emulated types, each image replayed byte-for-byte from a decrypted Autel capture. Reads and reconfigures a chip in any emulated type, including the talk-first EM4102 types (ID11/ID12/ID13), which need a wider reader gap than the Hitag default. See `docs/at100.md` (@en4rab)
+- Changed `lf autel` session open - a real power-down is tried first instead of the DOUT-only field gap, which a continuously-transmitting chip does not reboot from; a chip emulating ID4C now reads 8/8 where it managed 4/33 (@en4rab)
+- Added `g_hitag_t_low` - the reader's field-off pulse width is now settable at runtime instead of fixed at `HITAG_T_LOW`; `lf autel` uses 12 T0, matching the Autel programmer's own gaps, and restores the default on teardown (@en4rab)
 - Added `lf xhorse` - Xhorse XT27A super-chip support: `info`, `dump`, `configure`, `reset`, `types`; `reset`/`configure` also recover a chip stuck emulating an EM type; `info` identifies XT27B/XT57B (channel B) chips as unsupported. See `doc/xhorse_notes.md` (@CHANGEME)
 - Fixed `hf search` - the OpenPGP AID probe sent 8 bytes for a 6-byte AID, reading past the string, so no OpenPGP card was found (@matrix)
 - Fixed `hf 15 raw -r` - the device reply was left unread, so every later command printed the answer of the one before (@matrix)

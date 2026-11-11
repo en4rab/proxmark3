@@ -182,6 +182,8 @@ void hitag_cleanup(bool ledcontrol) {
 }
 
 // Reader functions
+uint8_t g_hitag_t_low = HITAG_T_LOW;
+
 static void hitag_reader_send_bit(int bit, bool ledcontrol) {
     // Time this bit from its own start.  Taking a reference and measuring the
     // difference leaves the free running counter alone, so nothing here depends
@@ -196,7 +198,7 @@ static void hitag_reader_send_bit(int bit, bool ledcontrol) {
     Gpio_SSC_DOUT_High();
 
     // Wait for 4-10 times the carrier period
-    while (GetPrecisionCounterDelta(t_ref) < T0 * HITAG_T_LOW) {};
+    while (GetPrecisionCounterDelta(t_ref) < T0 * g_hitag_t_low) {};
 
     Gpio_SSC_DOUT_Low();
 
@@ -223,7 +225,7 @@ void hitag_reader_send_frame(const uint8_t *frame, size_t frame_len, bool ledcon
 
         // SOF is HIGH for HITAG_T_LOW
         Gpio_SSC_DOUT_High();
-        while (GetPrecisionCounterDelta(t_sof) < T0 * HITAG_T_LOW) {};
+        while (GetPrecisionCounterDelta(t_sof) < T0 * g_hitag_t_low) {};
 
         // Then LOW for HITAG_T_CODE_VIOLATION
         Gpio_SSC_DOUT_Low();
@@ -243,7 +245,7 @@ void hitag_reader_send_frame(const uint8_t *frame, size_t frame_len, bool ledcon
     Gpio_SSC_DOUT_High();
 
     // Wait for 4-10 times the carrier period
-    while (GetPrecisionCounter() < T0 * HITAG_T_LOW) {};
+    while (GetPrecisionCounter() < T0 * g_hitag_t_low) {};
 
     Gpio_SSC_DOUT_Low();
 }

@@ -38,6 +38,7 @@
 #include "string.h"
 #include "proxmark3_arm.h"
 #include "cmd.h"             // reply_ng (pulls in pm3_cmd.h: CMD_*/PM3_* codes)
+#include "fpga_loader.h"     // FpgaWriteConfWord / FpgaSendCommand / FpgaSetupSsc
 #include "fpga_apis.h"       // FPGA_LF_EDGE_DETECT_*
 #include "ticks_apis.h"
 #include "gpio_apis.h"    // Gpio_SSC_DOUT_High/Low (field on/off)
@@ -64,8 +65,14 @@
 // 16 bit (5461 T0), so anything longer is spun out with at_delay_us() instead.
 //-----------------------------------------------------------------------------
 #define AT_T_WAKE_T0        0        // first frame of a session: no tag edge to wait from
-#define AT_T_UID_T0       725        // tag echoes 1010 -> reader sends get-UID
-#define AT_T_AUTH_T0      456        // tag sends UID    -> reader sends {nR}{aR}
+// t_wait is counted from the tag's last captured edge, which the device's own trace
+// shows landing ~79 T0 before the frame-end that the trace timestamps.  Commanding
+// the Autel's gaps verbatim therefore put our frames ~78 T0 early on air (646 vs 725,
+// 377 vs 455).  These are the Autel's gaps plus that offset, so the on-air spacing
+// matches; check with `lf autel read ... ; trace list -t ht2`.
+#define AT_T_EDGE_OFFSET   79
+#define AT_T_UID_T0       (725 + AT_T_EDGE_OFFSET)   // tag echoes 1010 -> reader sends get-UID
+#define AT_T_AUTH_T0      (455 + AT_T_EDGE_OFFSET)   // tag sends UID    -> reader sends {nR}{aR}
 #define AT_T_CMD_T0       520        // tag reply        -> next 20-bit command (observed 513)
 #define AT_T_DATA_T0      513        // tag echoes a WRITE -> reader sends the 32-bit data frame
 
@@ -84,6 +91,8 @@
 #define AT_T_FIELD_OFF_US 20000
 #define AT_T_POWERUP_US    1000
 #define AT_T_POWERUP_ALT_US 20000    // second timing tried if the first gets no answer
+// Field-off between the probe session and the authenticated one (the Autel: 116 ms).
+#define AT_T_SESSION_OFF_US 120000
 
 #define AT_TRIES            2        // session-open attempts per entry of at_timings[]
 #define AT_VERIFY_READS     3        // re-reads looking for two that agree
@@ -103,18 +112,38 @@
 // for the wake again.  Before its first wake to such a chip the Autel holds the
 // field off for seconds (data/traces/at100/autel-at100-set-ID11.pm3 is dead air for
 // 3.0 s), then sends the wake ~1 ms after the field returns.
+// Session-open variants (lf_autel_io_t.mode, and the per-entry mode below).
+#define AT_M_ONESESSION  1   // skip the Autel's probe session; authenticate in the first
+#define AT_M_REWAKE      2   // re-send the wake just before the auth
+#define AT_M_SOFTRESET   4   // DOUT-only field reset instead of taking the FPGA mode off
+#define AT_M_FORCEUID    8   // skip get-UID, authenticate with a caller-supplied UID
+#define AT_M_EMBURST    16   // send the EM-freeing burst + cold boot first
+
 typedef struct {
     uint32_t off_us;
     uint32_t on_us;
+    uint8_t  mode;
 } at_timing_t;
 
 static const at_timing_t at_timings[] = {
-    {  AT_T_FIELD_OFF_US, AT_T_POWERUP_US     },
-    {  AT_T_FIELD_OFF_US, AT_T_POWERUP_ALT_US },
-    {  120000,            AT_T_POWERUP_US     },
-    {  500000,            AT_T_POWERUP_US     },
-    { 1500000,            AT_T_POWERUP_US     },
-    { 3000000,            AT_T_POWERUP_US     },
+    // A real power-down, one session.  This is the only form measured to reach every
+    // emulated type, and it is what the Autel's own captures show.  A chip emulating a
+    // continuously-transmitting type (ID4C/TIRIS is the worst; EM4102 next) only opens its
+    // management window after it genuinely loses power, and driving DOUT high does not take
+    // it away - measured, see docs/at100.md SS13.  In ID4C mode this form authenticates
+    // 5 times out of 5 where the DOUT-only entries below manage 4 out of 33.
+    { 120000,            AT_T_POWERUP_US,     AT_M_ONESESSION },
+    // Then the quicker DOUT-only resets: 20 ms instead of 120, and enough for any chip
+    // emulating a type that stays quiet until spoken to.
+    { AT_T_FIELD_OFF_US, AT_T_POWERUP_US,     AT_M_ONESESSION | AT_M_SOFTRESET },
+    { AT_T_FIELD_OFF_US, AT_T_POWERUP_ALT_US, AT_M_ONESESSION | AT_M_SOFTRESET },
+    // Last, the Autel's probe-session-then-auth-session pair over longer power-downs.
+    // Kept because it reaches a chip the forms above cannot, but it is not the first
+    // choice: against a talk-first chip the probe session leaves it less reachable, not
+    // more (ID4C: stage 0 on every attempt where the one-session form above succeeded).
+    { AT_T_FIELD_OFF_US, AT_T_POWERUP_US,     0 },
+    { 120000,            AT_T_POWERUP_US,     0 },
+    { 1500000,           AT_T_POWERUP_US,     0 },
 };
 
 //-----------------------------------------------------------------------------
@@ -184,12 +213,81 @@ static void at_setup(at_sess_t *s, bool ledcontrol) {
     hitag_setup_fpga(AT_EDGE_MODE, AT_FPGA_THR, ledcontrol);
 }
 
-// Power-cycle the chip: coil off (DOUT high = modulation), then on again.
-static void at_field_reset(uint32_t off_us, uint32_t powerup_us) {
+// The AT100 needs a wider reader gap than the stock HITAG_T_LOW of 8.  Measured on
+// the bench against a chip emulating EM4102 (which is the demanding case - it is
+// load-modulating continuously while it listens): at 8 the chip echoed the 4-bit
+// wake but reached a full authentication 0 times in 12; at 10, 12, 14 and 16 it
+// authenticated 6 times out of 6, at every width.  That is the signature of missed
+// gaps, whose effect compounds with frame length - which is why a 4-bit wake got
+// through, a 10-bit command usually did not, and a 64-bit auth never did.
+// 12 sits in the middle of the working range and matches the Autel programmer's own
+// gaps, which measure 9..15 T0 (median 11..12) in the captures.
+#define AT_T_LOW 12
+
+// Widen (or restore) the reader's field-off pulse.  The Autel programmer's gaps
+// measure 9..15 T0 in the captures against the stock HITAG_T_LOW of 8, and a tag
+// that misses gaps fails frames in proportion to their length - which is what a
+// chip that echoes a 4-bit wake, usually drops a 10-bit command and never answers
+// a 64-bit one looks like.  Bring-up knob: 0 restores the default.
+static void at_set_tlow(uint8_t tlow) {
+    g_hitag_t_low = tlow ? tlow : AT_T_LOW;
+}
+
+// Every autel entry point must come through here, so a widened pulse can never
+// leak into the next `lf hitag` command.
+static void at_teardown(bool ledcontrol) {
+    g_hitag_t_low = HITAG_T_LOW;
+    hitag_cleanup(ledcontrol);
+}
+
+// Power-cycle the chip, for real.
+//
+// Driving DOUT high is how a BPLM gap is made, and it is what xhorse.c calls a field
+// reset - but it only stops the modulation drive.  Measured against an AT100 left
+// emulating EM4102: after three seconds of DOUT-high the chip had *not* rebooted
+// (it was still in whatever mode the previous frame put it in), so a chip that is
+// broadcasting never cold-boots and never re-opens its management window.
+//
+// Taking the FPGA's major mode off removes the carrier itself, which does power the
+// chip down.  Coming back is the tail of hitag_setup_fpga() - divisor, conf word,
+// threshold, ADC mux, SSC - and the edge capture has to be restarted around it:
+// FpgaWriteConfWord()/FpgaSendCommand() bit-bang the same SSC lines that
+// StartLoEdgeCapture() claims via PIO_BSR, so routing set up before them is undone
+// (see the comment in hitag_common.c).
+static void at_field_reset_ex(uint32_t off_us, uint32_t powerup_us, bool real) {
+    if (real == false) {
+        // The DOUT-only form: how xhorse.c does it, and how this file did until the
+        // AT100 turned out not to reboot from it.  Kept for A/B on the bench.
+        Gpio_SSC_DOUT_High();
+        at_delay_us(off_us);
+        Gpio_SSC_DOUT_Low();
+        at_delay_us(powerup_us);
+        return;
+    }
+    StopLoEdgeCapture();
     Gpio_SSC_DOUT_High();
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_OFF);
+
     at_delay_us(off_us);
-    Gpio_SSC_DOUT_Low();
+
+    FpgaSendCommand(FPGA_CMD_SET_DIVISOR, LF_DIVISOR_125);
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_LF_EDGE_DETECT | AT_EDGE_MODE);
+    if (AT_FPGA_THR != 127) {
+        FpgaSendCommand(FPGA_CMD_SET_EDGE_DETECT_THRESHOLD, AT_FPGA_THR);
+    }
+    SetAdcMuxFor(ADC_MUXSEL_LOPKD);
+    FpgaSetupSsc(FPGA_MAJOR_MODE_LF_READER);
+    StartLoEdgeCapture();
+    gpio_fpga_mod_only_setup();
+
+    Gpio_SSC_DOUT_Low();            // modulation off -> field ON
     at_delay_us(powerup_us);
+}
+
+static bool at_real_reset = true;   // bring-up knob (mode)
+
+static void at_field_reset(uint32_t off_us, uint32_t powerup_us) {
+    at_field_reset_ex(off_us, powerup_us, at_real_reset);
 }
 
 // Send a cleartext reader frame and demodulate the tag's reply.  Returns reply bits.
@@ -297,37 +395,177 @@ static int at_write(at_sess_t *s, uint8_t page, uint32_t data, bool verify) {
 //-----------------------------------------------------------------------------
 // Session open: wake, get-UID, authenticate.
 //-----------------------------------------------------------------------------
-static int at_open_once(at_sess_t *s, uint64_t key, uint32_t off_us, uint32_t powerup_us) {
-    static const uint8_t wake[1]   = { 0xA0 };          // 4 bits: 1010
-    static const uint8_t getuid[2] = { 0xF8, 0x00 };    // 10 bits: 11111 00000
+static const uint8_t at_wake[1]   = { 0xA0 };        // 4 bits: 1010
+static const uint8_t at_getuid[2] = { 0xF8, 0x00 };  // 10 bits: 11111 00000 ({W}{~W}, W = 0b11111)
 
-    at_field_reset(off_us, powerup_us);
-
+// Wake the chip and read its UID.  Returns PM3_SUCCESS with *uid set.
+// Stage reached, for the bring-up log: 0 = no wake reply, 1 = wake reply was not
+// the 1010 echo, 2 = wake ok but no UID, 3 = UID read.
+static int at_wake_uid(at_sess_t *s, uint32_t *uid, int uid_t0) {
     uint8_t rx[8];
-    if (at_xfer(s, wake, 4, rx, sizeof(rx), AT_T_WAKE_T0) < 4) {
-        return PM3_EFAILED;                             // nothing on the coil
+    if (at_xfer(s, at_wake, 4, rx, sizeof(rx), AT_T_WAKE_T0) < 4) {
+        return 0;                                       // nothing on the coil, or buried in noise
     }
     if (at_bits_to_u32(rx, 4) != 0x0A) {
-        return PM3_EFAILED;                             // something answered, but not an AT100
+        return 1;                                       // answered, but not with the AT100's echo
+    }
+    if (at_xfer(s, at_getuid, 10, rx, sizeof(rx), uid_t0) < 32) {
+        return 2;
+    }
+    *uid = at_bits_to_u32(rx, 32);
+    return 3;
+}
+
+
+//-----------------------------------------------------------------------------
+// EM-freeing burst (ported from armsrc/xhorse.c, doc/xhorse_notes.md)
+//
+// A chip left emulating a talk-first type broadcasts continuously.  The Xhorse VVDI
+// frees an XT27A with a timed sequence of field gaps landing at a fixed position in
+// the chip's EM frame, then a 1.57 s cold boot, then its handshake - and the Autel
+// captures have exactly that shape off-screen: all three traces that begin against an
+// EM-type AT100 open with 2.6-3.0 s of dead air preceded by the tail of something the
+// sniff did not catch.  Whether the AT100 answers the same burst is an open question;
+// this is here to find out.
+//-----------------------------------------------------------------------------
+#define AT_T_EM_OFF_US        70050     // field off before and after each burst window
+#define AT_T_EM_COLDBOOT_US 1570940     // power-down between the bursts and the handshake
+#define AT_T_EM_SETTLE_US     30180     // field on this long before the wake
+
+static const uint16_t at_emb_start[43] = {
+    0, 36, 68, 129, 163, 224, 258, 290, 351, 415, 449, 511, 576, 610, 641, 702, 767, 832, 865, 927,
+    961, 992, 1024, 1054, 1115, 1180, 1214, 1245, 1306, 1340, 1372, 1433, 1497, 1562, 1596, 1658,
+    1692, 1753, 1787, 1818, 1880, 1944, 1978
+};
+static const uint8_t at_emb_width[43] = {
+    20, 16, 15, 19, 16, 19, 15, 15, 19, 19, 15, 19, 19, 16, 15, 19, 19, 19, 16, 19, 16, 15, 15, 15,
+    19, 19, 16, 15, 19, 16, 15, 19, 19, 19, 16, 19, 16, 19, 16, 15, 19, 19, 16
+};
+
+// Emit the burst with the field on.  One counter reference covers it (1994 T0 = 23928
+// ticks < 65536), so pulse positions do not accumulate per-pulse error.
+static void at_em_burst(void) {
+    const uint16_t ref = GetPrecisionCounterRaw();
+    for (size_t i = 0; i < ARRAYLEN(at_emb_start); i++) {
+        while (GetPrecisionCounterDelta(ref) < (uint16_t)(T0 * at_emb_start[i])) {};
+        Gpio_SSC_DOUT_High();
+        while (GetPrecisionCounterDelta(ref) < (uint16_t)(T0 * (at_emb_start[i] + at_emb_width[i]))) {};
+        Gpio_SSC_DOUT_Low();
+    }
+}
+
+// Burst windows: field-on window length, and when in it the burst is commanded.
+static const uint32_t at_em_on_us[2]    = { 155940, 60300 };
+static const uint32_t at_em_at_us[2]    = { 109540, 13990 };   // ID11 frame 6; ID12/ID13 first frame
+
+// One round of the VVDI's shape: a burst per timing, each in its own power cycle, then
+// a single long cold boot.  Leaves the field on, settled, ready for the wake.
+static void at_em_free(void) {
+    const uint32_t burst_len_us = ((uint32_t)at_emb_start[ARRAYLEN(at_emb_start) - 1]
+                                   + at_emb_width[ARRAYLEN(at_emb_width) - 1]) * 8;
+    for (size_t t = 0; t < ARRAYLEN(at_em_on_us); t++) {
+        Gpio_SSC_DOUT_High();
+        at_delay_us(AT_T_EM_OFF_US);
+        Gpio_SSC_DOUT_Low();
+        at_delay_us(at_em_at_us[t]);
+        at_em_burst();
+        at_delay_us(at_em_on_us[t] - at_em_at_us[t] - burst_len_us);
+    }
+    Gpio_SSC_DOUT_High();
+    at_delay_us(AT_T_EM_COLDBOOT_US);
+    Gpio_SSC_DOUT_Low();
+    at_delay_us(AT_T_EM_SETTLE_US);
+}
+
+static uint32_t forced_uid = 0;   // bring-up knob (mode bit 3)
+
+// Furthest point any open attempt reached, and the UID if one was read.  Kept
+// across the whole at_open_ex() schedule so a failed open still reports what it
+// saw: "echoed the wake, then ignored the auth" and "nothing on the coil" are
+// very different problems and must not print the same message.
+static uint8_t at_best_stage = AUTEL_STAGE_NONE;
+static uint32_t at_best_uid = 0;
+
+static int at_open_once(at_sess_t *s, uint64_t key, uint32_t off_us, uint32_t powerup_us, int uid_t0, int auth_t0, uint8_t mode) {
+    uint8_t rx[8];
+
+    // The Autel never authenticates in the session it first reaches the chip in.  In
+    // all 29 captures it opens a UID-only session, drops the field, and authenticates
+    // in the next one - so do the same.  It matters: against a chip left emulating
+    // EM4102 the one-session form reads the UID correctly and then gets no answer at
+    // all to {nR}{aR}.  The first session is also what silences a talk-first chip,
+    // which is why its own UID read is allowed to fail.
+    // mode: bit 0 clear => the Autel's two sessions (probe, field reset, auth session);
+    //       bit 0 set   => one session.  bit 1 set => re-send the wake just before the
+    //       auth.  bit 2 set => use the DOUT-only field reset instead of a real one.
+    at_real_reset = ((mode & AT_M_SOFTRESET) == 0);
+
+    if (mode & AT_M_EMBURST) {
+        at_em_free();                    // bursts + cold boot, field left on and settled
     }
 
-    if (at_xfer(s, getuid, 10, rx, sizeof(rx), AT_T_UID_T0) < 32) {
+    int st0 = -1;
+    uint32_t probe = 0;
+    if ((mode & AT_M_EMBURST) != 0) {
+        // the burst sequence already left the chip powered and settled
+    } else if ((mode & AT_M_ONESESSION) == 0) {
+        at_field_reset(off_us, powerup_us);
+        st0 = at_wake_uid(s, &probe, uid_t0);
+        at_field_reset(AT_T_SESSION_OFF_US, powerup_us);
+    } else {
+        at_field_reset(off_us, powerup_us);
+    }
+
+    int st1;
+    if (mode & AT_M_FORCEUID) {
+        // Wake only, then authenticate with a UID the caller already knows: tests
+        // whether the get-UID frame is what leaves the chip unable to authenticate.
+        uint8_t wrx[8];
+        st1 = (at_xfer(s, at_wake, 4, wrx, sizeof(wrx), AT_T_WAKE_T0) >= 4
+               && at_bits_to_u32(wrx, 4) == 0x0A) ? 3 : 0;
+        s->uid = forced_uid;
+    } else {
+        st1 = at_wake_uid(s, &s->uid, uid_t0);
+    }
+    if (st1 > at_best_stage) {
+        at_best_stage = (uint8_t)st1;        // at_wake_uid()'s 0..3 are AUTEL_STAGE_NONE..UID
+    }
+    if (st1 == 3) {
+        at_best_uid = s->uid;
+    }
+
+    if (st1 != 3) {
+        // Logged at DBG_DEBUG, not DBG_EXTENDED: at extended the hitag frame dumps
+        // flood the USB log and these lines get dropped.
+        if (g_dbglevel >= DBG_DEBUG) {
+            Dbprintf("autel: m%d off %u on %u | s0 %d %08x | s1 stage %d uid %08x | no auth",
+                     mode, off_us, powerup_us, st0, probe, st1, s->uid);
+        }
         return PM3_EFAILED;
     }
-    s->uid = at_bits_to_u32(rx, 32);
 
     s->cs = ht2_hitag2_init(at_rev(key, 48), (uint32_t)at_rev(s->uid, 32), (uint32_t)at_rev(AUTEL_READER_NR, 32));
     uint32_t aR = at_ks(s, 32) ^ 0xFFFFFFFFUL;
+
+    if (mode & AT_M_REWAKE) {
+        uint8_t wrx[8];
+        at_xfer(s, at_wake, 4, wrx, sizeof(wrx), AT_T_WAKE_T0);
+    }
 
     uint8_t tx[8];
     at_u32_to_bits(AUTEL_READER_NR, 32, tx);
     at_u32_to_bits(aR, 32, tx + 4);
 
-    size_t rxlen = at_xfer(s, tx, 64, rx, sizeof(rx), AT_T_AUTH_T0);
+    size_t rxlen = at_xfer(s, tx, 64, rx, sizeof(rx), auth_t0);
     s->config = at_bits_to_u32(rx, 32) ^ at_ks(s, 32);
+    if (g_dbglevel >= DBG_DEBUG) {
+        Dbprintf("autel: m%d off %u on %u | s0 %d %08x | s1 uid %08x aR %08x | auth rx %d cfg %08x",
+                 mode, off_us, powerup_us, st0, probe, s->uid, aR, (int)rxlen, s->config);
+    }
     if (rxlen < 32) {
         return PM3_EFAILED;
     }
+    at_best_stage = AUTEL_STAGE_AUTH;
     s->auth_ok = ((s->config & 0xFF) == AT_CFG_TAIL);
 
     // The Autel's own gap before its first command.
@@ -341,13 +579,9 @@ static int at_open_once(at_sess_t *s, uint64_t key, uint32_t off_us, uint32_t po
 // not look like a config word (usually a mis-demodulated UID, hence the wrong cipher
 // init - but possibly the wrong key) is only retried while retries remain; on the
 // last one it is returned as-is, and the caller warns about it.
-static int at_open_tuned(at_sess_t *s, uint64_t key, uint32_t off_us, uint32_t on_us, int tries) {
+static int at_open_tuned(at_sess_t *s, uint64_t key, uint32_t off_us, uint32_t on_us, int tries, int uid_t0, int auth_t0, uint8_t mode) {
     for (int attempt = 0; attempt < tries; attempt++) {
-        int res = at_open_once(s, key, off_us, on_us);
-        if (g_dbglevel >= DBG_EXTENDED) {
-            Dbprintf("autel: off %u us on %u us try %d: res %d uid %08x cfg %08x",
-                     off_us, on_us, attempt, res, s->uid, s->config);
-        }
+        int res = at_open_once(s, key, off_us, on_us, uid_t0, auth_t0, mode);
         if (res != PM3_SUCCESS) {
             continue;
         }
@@ -358,13 +592,22 @@ static int at_open_tuned(at_sess_t *s, uint64_t key, uint32_t off_us, uint32_t o
     return PM3_EFAILED;
 }
 
-static int at_open_ex(at_sess_t *s, uint64_t key, uint32_t off_us, uint32_t on_us) {
-    if (off_us || on_us) {
+static int at_open_ex(at_sess_t *s, uint64_t key, uint32_t off_us, uint32_t on_us, int uid_t0, int auth_t0, uint8_t mode) {
+    at_best_stage = AUTEL_STAGE_NONE;
+    at_best_uid = 0;
+    if (uid_t0 <= 0) {
+        uid_t0 = AT_T_UID_T0;
+    }
+    if (auth_t0 <= 0) {
+        auth_t0 = AT_T_AUTH_T0;
+    }
+    if (off_us || on_us || mode) {
         return at_open_tuned(s, key, off_us ? off_us : AT_T_FIELD_OFF_US,
-                             on_us ? on_us : AT_T_POWERUP_US, AT_TRIES);
+                             on_us ? on_us : AT_T_POWERUP_US, AT_TRIES, uid_t0, auth_t0, mode);
     }
     for (size_t i = 0; i < ARRAYLEN(at_timings); i++) {
-        if (at_open_tuned(s, key, at_timings[i].off_us, at_timings[i].on_us, AT_TRIES) == PM3_SUCCESS) {
+        if (at_open_tuned(s, key, at_timings[i].off_us, at_timings[i].on_us, AT_TRIES,
+                          uid_t0, auth_t0, at_timings[i].mode) == PM3_SUCCESS) {
             return PM3_SUCCESS;
         }
     }
@@ -372,7 +615,7 @@ static int at_open_ex(at_sess_t *s, uint64_t key, uint32_t off_us, uint32_t on_u
 }
 
 static int at_open(at_sess_t *s, uint64_t key) {
-    return at_open_ex(s, key, 0, 0);
+    return at_open_ex(s, key, 0, 0, 0, 0, 0);
 }
 
 //-----------------------------------------------------------------------------
@@ -395,9 +638,19 @@ static void at_store(lf_autel_io_reply_t *out, uint8_t i, uint8_t page, uint32_t
 
 static void at_fill_found(lf_autel_io_reply_t *out, const at_sess_t *s) {
     out->found = 1;
+    out->stage = AUTEL_STAGE_AUTH;
     out->auth_ok = s->auth_ok ? 1 : 0;
     out->uid = s->uid;
     out->config = s->config;
+}
+
+// A session open that never completed.  found is still set whenever anything at all
+// answered, so the caller can tell a silent antenna from a chip that talks up to a
+// point and then stops.
+static void at_fill_partial(lf_autel_io_reply_t *out) {
+    out->stage = at_best_stage;
+    out->found = (at_best_stage > AUTEL_STAGE_NONE) ? 1 : 0;
+    out->uid = at_best_uid;
 }
 
 //-----------------------------------------------------------------------------
@@ -405,6 +658,7 @@ static void at_fill_found(lf_autel_io_reply_t *out, const at_sess_t *s) {
 //-----------------------------------------------------------------------------
 void Autel_Read(const lf_autel_io_t *p, bool ledcontrol) {
     at_sess_t s;
+    forced_uid = p->value;   // only consulted when mode bit 3 is set
     lf_autel_io_reply_t out;
     memset(&out, 0, sizeof(out));
 
@@ -417,8 +671,10 @@ void Autel_Read(const lf_autel_io_t *p, bool ledcontrol) {
     }
 
     at_setup(&s, ledcontrol);
-    if (at_open_ex(&s, at_key(p->key), (uint32_t)p->off_ms * 1000, p->on_us) != PM3_SUCCESS) {
-        hitag_cleanup(ledcontrol);
+    at_set_tlow(p->tlow);
+    if (at_open_ex(&s, at_key(p->key), (uint32_t)p->off_ms * 1000, p->on_us, p->uid_t0, p->auth_t0, p->mode) != PM3_SUCCESS) {
+        at_fill_partial(&out);
+        at_teardown(ledcontrol);
         reply_ng(CMD_LF_AUTEL_READ, PM3_SUCCESS, (uint8_t *)&out, sizeof(out));   // found == 0
         return;
     }
@@ -432,7 +688,7 @@ void Autel_Read(const lf_autel_io_t *p, bool ledcontrol) {
     }
     out.count = count;
 
-    hitag_cleanup(ledcontrol);
+    at_teardown(ledcontrol);
     reply_ng(CMD_LF_AUTEL_READ, PM3_SUCCESS, (uint8_t *)&out, sizeof(out));
 }
 
@@ -442,8 +698,10 @@ void Autel_Write(const lf_autel_io_t *p, bool ledcontrol) {
     memset(&out, 0, sizeof(out));
 
     at_setup(&s, ledcontrol);
-    if (at_open_ex(&s, at_key(p->key), (uint32_t)p->off_ms * 1000, p->on_us) != PM3_SUCCESS) {
-        hitag_cleanup(ledcontrol);
+    at_set_tlow(p->tlow);
+    if (at_open_ex(&s, at_key(p->key), (uint32_t)p->off_ms * 1000, p->on_us, p->uid_t0, p->auth_t0, p->mode) != PM3_SUCCESS) {
+        at_fill_partial(&out);
+        at_teardown(ledcontrol);
         reply_ng(CMD_LF_AUTEL_WRITE, PM3_SUCCESS, (uint8_t *)&out, sizeof(out));  // found == 0
         return;
     }
@@ -458,7 +716,7 @@ void Autel_Write(const lf_autel_io_t *p, bool ledcontrol) {
     at_store(&out, 0, p->page, rb, agreed);
     out.count = 1;
 
-    hitag_cleanup(ledcontrol);
+    at_teardown(ledcontrol);
     reply_ng(CMD_LF_AUTEL_WRITE, res, (uint8_t *)&out, sizeof(out));
 }
 
@@ -484,8 +742,10 @@ void Autel_Dump(const lf_autel_io_t *p, bool ledcontrol) {
     memset(&out, 0, sizeof(out));
 
     at_setup(&s, ledcontrol);
-    if (at_open_ex(&s, at_key(p->key), (uint32_t)p->off_ms * 1000, p->on_us) != PM3_SUCCESS) {
-        hitag_cleanup(ledcontrol);
+    at_set_tlow(p->tlow);
+    if (at_open_ex(&s, at_key(p->key), (uint32_t)p->off_ms * 1000, p->on_us, p->uid_t0, p->auth_t0, p->mode) != PM3_SUCCESS) {
+        at_fill_partial(&out);
+        at_teardown(ledcontrol);
         reply_ng(CMD_LF_AUTEL_DUMP, PM3_SUCCESS, (uint8_t *)&out, sizeof(out));   // found == 0
         return;
     }
@@ -502,7 +762,7 @@ void Autel_Dump(const lf_autel_io_t *p, bool ledcontrol) {
     }
     out.count = n;
 
-    hitag_cleanup(ledcontrol);
+    at_teardown(ledcontrol);
     reply_ng(CMD_LF_AUTEL_DUMP, PM3_SUCCESS, (uint8_t *)&out, sizeof(out));
 }
 
@@ -524,12 +784,17 @@ void Autel_Configure(const lf_autel_cfg_t *p, uint16_t cmd, bool ledcontrol) {
     }
 
     at_setup(&s, ledcontrol);
+    at_set_tlow(0);
     if (at_open(&s, at_key(p->key)) != PM3_SUCCESS) {
-        hitag_cleanup(ledcontrol);
-        reply_ng(cmd, PM3_SUCCESS, (uint8_t *)&out, sizeof(out));                 // found == 0
+        out.stage = at_best_stage;
+        out.found = (at_best_stage > AUTEL_STAGE_NONE) ? 1 : 0;
+        out.uid = at_best_uid;
+        at_teardown(ledcontrol);
+        reply_ng(cmd, PM3_SUCCESS, (uint8_t *)&out, sizeof(out));
         return;
     }
     out.found = 1;
+    out.stage = AUTEL_STAGE_AUTH;
     out.auth_ok = s.auth_ok ? 1 : 0;
     out.uid = s.uid;
     out.config_before = s.config;
@@ -552,6 +817,6 @@ void Autel_Configure(const lf_autel_cfg_t *p, uint16_t cmd, bool ledcontrol) {
         out.config_after = cfg;
     }
 
-    hitag_cleanup(ledcontrol);
+    at_teardown(ledcontrol);
     reply_ng(cmd, res, (uint8_t *)&out, sizeof(out));
 }

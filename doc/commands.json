@@ -11755,7 +11755,7 @@
         },
         "lf autel configure": {
             "command": "lf autel configure",
-            "description": "Configure which transponder an AT100 emulates. -t is a type name (see `lf autel list`); -u sets the emulated serial and is required for every type that takes one. The whole burst runs in one authenticated session: page 0xFE first (which selects the type), then that type's image pages, exactly as the Autel does. Each page takes about 100 ms to commit, so a large image (ID8A writes 41 pages) takes several seconds. `lf autel reset` restores the factory type.",
+            "description": "Configure which transponder an AT100 emulates. -t is a type name (see `lf autel list`); -u sets the emulated serial and is required for every type that takes one. The whole burst runs in one authenticated session: page 0xFE first (which selects the type), then that type's image pages, exactly as the Autel does. Each page takes about 100 ms to commit, so a large image (ID8A writes 41 pages) takes several seconds. `lf autel reset` restores the factory type. ID11 / ID12 / ID13 leave the chip broadcasting continuously, which used to put it out of reach of this tool. It no longer does: the reader gap was too narrow, and the round trip to EM4102 and back is verified on hardware (docs/at100.md SS13).",
             "notes": [
                 "lf autel configure -t ID46 -u 11223344 -> HITAG2 / MIKRON image",
                 "lf autel configure -t ID13 -u 0456B307C8 -> EM4102, 5-byte ID",
@@ -11802,7 +11802,7 @@
         },
         "lf autel read": {
             "command": "lf autel read",
-            "description": "Read raw pages from an AT100. The page address is 8 bits, so 0x00-0xFF is the whole space. Only the pages `lf autel dump` lists are ever used by the Autel programmer; the rest have never been seen read or written and may not be real storage. Every page is read until two reads agree; one marked ? never did and may be wrong.",
+            "description": "Read raw pages from an AT100. The page address is 8 bits, so 0x00-0xFF is the whole space. Only the pages `lf autel dump` lists are ever used by the Autel programmer; the rest have never been seen read or written and may not be real storage. Every page is read until two reads agree; one marked ? never did and may be wrong. A chip left emulating a talk-first type (EM4102 and friends) load-modulates continuously while it listens, which costs margin on the reader->tag link; the wider default reader gap covers it. --off / --on / --tlow override the built-in schedule with a single timing, for bring-up on a chip it cannot reach.",
             "notes": [
                 "lf autel read -p 0xFE -> the emulated-type register",
                 "lf autel read -p 0xFC -> the device-key page",
@@ -11814,9 +11814,16 @@
                 "-h, --help This help",
                 "-p, --page <dec> first page, 0..255",
                 "-n, --count <dec> pages to read, 1..64 (def 1)",
-                "-k, --key <hex> 48-bit device key (def 9F63A5E8B14B)"
+                "-k, --key <hex> 48-bit device key (def 9F63A5E8B14B)",
+                "--off <ms> override the field-off time before the wake (bring-up)",
+                "--on <us> override the field-on settle before the wake (bring-up)",
+                "--gap <T0> override the wake-reply -> get-UID gap (bring-up)",
+                "--agap <T0> override the UID-reply -> auth gap (bring-up)",
+                "--mode <dec> session-open variant, bring-up only (0 = default)",
+                "--tlow <T0> reader field-off pulse width, 4..16 T0 (def 12, bring-up)",
+                "--uid <hex> 4 byte UID to authenticate with, for --mode 8 (bring-up)"
             ],
-            "usage": "lf autel read [-h] -p <dec> [-n <dec>] [-k <hex>]"
+            "usage": "lf autel read [-h] -p <dec> [-n <dec>] [-k <hex>] [--off <ms>] [--on <us>] [--gap <T0>] [--agap <T0>] [--mode <dec>] [--tlow <T0>] [--uid <hex>]"
         },
         "lf autel reset": {
             "command": "lf autel reset",
@@ -11836,7 +11843,7 @@
         },
         "lf autel write": {
             "command": "lf autel write",
-            "description": "Write one raw page of an AT100 and read it back. This writes whatever you give it with no regard for what the page means, so it can leave the chip emulating nothing useful. `lf autel configure` writes whole coherent images and `lf autel reset` restores the factory type. The chip cannot be locked out this way: its UID, its device key and pages 0xFC / 0xFE live outside the emulated image, and every capture shows the management interface answering whatever the chip is emulating. Page 0xFE is still the type register - write a code no emulation engine knows and the chip may emulate nothing until you set a valid one again (`lf autel list`).",
+            "description": "Write one raw page of an AT100 and read it back. This writes whatever you give it with no regard for what the page means, so it can leave the chip emulating nothing useful. `lf autel configure` writes whole coherent images and `lf autel reset` restores the factory type. Setting page 0xFE to a talk-first type (ID11/ID12/ID13) leaves the chip broadcasting continuously. That is recoverable - `lf autel configure` reaches a broadcasting chip and the round trip is verified on hardware - but an incoherent image written a page at a time may emulate nothing useful until you finish it.",
             "notes": [
                 "lf autel write -p 0 -d 11223344 -> emulated image page 0x00",
                 "lf autel write -p 0xFE -d 8F08029B -> set the emulated type to ID46",
@@ -17366,6 +17373,6 @@
     "metadata": {
         "commands_extracted": 958,
         "extracted_by": "PM3Help2JSON v1.00",
-        "extracted_on": "2026-11-10T18:43:30+00:00"
+        "extracted_on": "2026-11-11T10:32:58+00:00"
     }
 }

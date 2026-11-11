@@ -435,6 +435,30 @@ static void at_print_not_found(void) {
     PrintAndLogEx(HINT, "Check placement on the antenna and try again.");
 }
 
+// The tag answered, but the session never opened.  Each stage has a different
+// cause and a different thing to try, so say which one it was.
+static void at_print_partial(uint8_t stage, uint32_t uid) {
+    PrintAndLogEx(FAILED, "An AT100 answered, but the session could not be opened");
+    switch (stage) {
+        case AUTEL_STAGE_NOISE:
+            PrintAndLogEx(INFO, "Something replied to the " _YELLOW_("1010") " wake, but not with the tag's echo.");
+            PrintAndLogEx(HINT, "Most likely noise on a weak coupling - reseat the tag and retry.");
+            break;
+        case AUTEL_STAGE_ECHO:
+            PrintAndLogEx(INFO, "The tag echoed the " _YELLOW_("1010") " wake, then ignored the get-UID.");
+            PrintAndLogEx(HINT, "Usually weak coupling - reseat the tag on the antenna and retry.");
+            break;
+        case AUTEL_STAGE_UID:
+            PrintAndLogEx(INFO, "UID....... " _GREEN_("%08X"), uid);
+            PrintAndLogEx(INFO, "The tag returned its UID, then ignored " _YELLOW_("{nR}{aR}") ".");
+            PrintAndLogEx(HINT, "A tag emulating a talk-first type (ID11/ID12/ID13) behaves this way;");
+            PrintAndLogEx(HINT, "see the open problem in docs/at100.md section 13.");
+            break;
+        default:
+            break;
+    }
+}
+
 static void at_print_auth_warning(const lf_autel_io_reply_t *r) {
     if (r->auth_ok) {
         return;
@@ -464,6 +488,10 @@ static int at_io_send(uint16_t cmd, const lf_autel_io_t *p, lf_autel_io_reply_t 
     }
     if (out->found == 0) {
         at_print_not_found();
+        return PM3_ESOFT;
+    }
+    if (out->stage < AUTEL_STAGE_AUTH) {
+        at_print_partial(out->stage, out->uid);
         return PM3_ESOFT;
     }
     return PM3_SUCCESS;
@@ -646,8 +674,8 @@ static int CmdLFAutelRead(const char *Cmd) {
                   "Every page is read until two reads agree; one marked " _RED_("?") " never did and may be wrong.\n"
                   "\n"
                   "A chip left emulating a talk-first type (EM4102 and friends) load-modulates\n"
-                  "continuously and only listens for the wake after a genuine cold power-down, so\n"
-                  "the built-in schedule works up to a 3 s field-off.  " _YELLOW_("--off") " / " _YELLOW_("--on") " override that\n"
+                  "continuously while it listens, which costs margin on the reader->tag link; the\n"
+                  "wider default reader gap covers it.  " _YELLOW_("--off") " / " _YELLOW_("--on") " / " _YELLOW_("--tlow") " override the built-in\n"
                   "schedule with a single timing, for bring-up on a chip it cannot reach.",
                   "lf autel read -p 0xFE              -> the emulated-type register\n"
                   "lf autel read -p 0xFC              -> the device-key page\n"
@@ -660,6 +688,11 @@ static int CmdLFAutelRead(const char *Cmd) {
         arg_str0("k", "key",   "<hex>", "48-bit device key (def 9F63A5E8B14B)"),
         arg_int0(NULL, "off",  "<ms>",  "override the field-off time before the wake (bring-up)"),
         arg_int0(NULL, "on",   "<us>",  "override the field-on settle before the wake (bring-up)"),
+        arg_int0(NULL, "gap",  "<T0>",  "override the wake-reply -> get-UID gap (bring-up)"),
+        arg_int0(NULL, "agap", "<T0>",  "override the UID-reply -> auth gap (bring-up)"),
+        arg_int0(NULL, "mode", "<dec>", "session-open variant, bring-up only (0 = default)"),
+        arg_int0(NULL, "tlow", "<T0>",  "reader field-off pulse width, 4..16 T0 (def 12, bring-up)"),
+        arg_str0(NULL, "uid",  "<hex>", "4 byte UID to authenticate with, for --mode 8 (bring-up)"),
         arg_param_end
     };
     // false: a bare `lf autel read` prints the help rather than quietly reading page 0.
@@ -673,10 +706,30 @@ static int CmdLFAutelRead(const char *Cmd) {
     }
     int off_ms = arg_get_int_def(ctx, 4, 0);
     int on_us  = arg_get_int_def(ctx, 5, 0);
+    int uid_t0 = arg_get_int_def(ctx, 6, 0);
+    int auth_t0 = arg_get_int_def(ctx, 7, 0);
+    int mode = arg_get_int_def(ctx, 8, 0);
+    int tlow = arg_get_int_def(ctx, 9, 0);
+    uint8_t fuid[4] = {0};
+    int fuidlen = 0;
+    CLIGetHexWithReturn(ctx, 10, fuid, &fuidlen);
     CLIParserFree(ctx);
+
+    if (uid_t0 < 0 || uid_t0 > 5000 || auth_t0 < 0 || auth_t0 > 5000) {
+        PrintAndLogEx(FAILED, "--gap and --agap must be 0..5000 T0 (the counter is 16 bit)");
+        return PM3_EINVARG;
+    }
 
     if (off_ms < 0 || off_ms > 60000 || on_us < 0 || on_us > 65535) {
         PrintAndLogEx(FAILED, "--off must be 0..60000 ms and --on 0..65535 us");
+        return PM3_EINVARG;
+    }
+
+    // Below 4 the gap stops looking like a gap.  Above 16 it eats the bit period - a BPLM
+    // '0' is 20 T0 end to end - and the frame stops being decodable: measured on a chip
+    // emulating ID4C, 5/5 authentications at 12, 14 and 16, then 0/10 at both 18 and 20.
+    if (tlow < 0 || tlow > 16 || (tlow > 0 && tlow < 4)) {
+        PrintAndLogEx(FAILED, "--tlow must be 4..16 T0 (0 = the default, %d)", 12);
         return PM3_EINVARG;
     }
 
@@ -700,6 +753,13 @@ static int CmdLFAutelRead(const char *Cmd) {
     p.key = key;
     p.off_ms = (uint16_t)off_ms;
     p.on_us = (uint16_t)on_us;
+    p.uid_t0 = (uint16_t)uid_t0;
+    p.auth_t0 = (uint16_t)auth_t0;
+    p.mode = (uint8_t)(mode & 31);
+    p.tlow = (uint8_t)tlow;
+    if (fuidlen == 4) {
+        p.value = be32(fuid);
+    }
 
     lf_autel_io_reply_t r;
     int res = at_io_send(CMD_LF_AUTEL_READ, &p, &r, NULL);
@@ -733,11 +793,10 @@ static int CmdLFAutelWrite(const char *Cmd) {
                   "can leave the chip emulating nothing useful.  `lf autel configure` writes whole\n"
                   "coherent images and `lf autel reset` restores the factory type.\n"
                   "\n"
-                  "The chip cannot be locked out this way: its UID, its device key and pages 0xFC /\n"
-                  "0xFE live outside the emulated image, and every capture shows the management\n"
-                  "interface answering whatever the chip is emulating.  " _YELLOW_("Page 0xFE is still the\n"
-                  "type register") " - write a code no emulation engine knows and the chip may emulate\n"
-                  "nothing until you set a valid one again (`lf autel list`).",
+                  "Setting page 0xFE to a talk-first type (ID11/ID12/ID13) leaves the chip\n"
+                  "broadcasting continuously.  That is recoverable - `lf autel configure` reaches a\n"
+                  "broadcasting chip and the round trip is verified on hardware - but an incoherent\n"
+                  "image written a page at a time may emulate nothing useful until you finish it.",
                   "lf autel write -p 0 -d 11223344         -> emulated image page 0x00\n"
                   "lf autel write -p 0xFE -d 8F08029B      -> set the emulated type to ID46\n"
                   "lf autel write -p 0x06 -d 033A09B0 --nv -> write without the read-back verify");
@@ -828,6 +887,10 @@ static int at_cfg_send(uint16_t cmd, const lf_autel_cfg_t *p, const at_type_t *t
         at_print_not_found();
         return PM3_ESOFT;
     }
+    if (r.stage < AUTEL_STAGE_AUTH) {
+        at_print_partial(r.stage, r.uid);
+        return PM3_ESOFT;
+    }
 
     PrintAndLogEx(NORMAL, "");
     PrintAndLogEx(INFO, "UID....... " _GREEN_("%08X"), r.uid);
@@ -873,7 +936,11 @@ static int CmdLFAutelConfigure(const char *Cmd) {
                   "Each page takes about 100 ms to commit, so a large image (ID8A writes 41 pages)\n"
                   "takes several seconds.\n"
                   "\n"
-                  "`lf autel reset` restores the factory type.",
+                  "`lf autel reset` restores the factory type.\n"
+                  "\n"
+                  "ID11 / ID12 / ID13 leave the chip broadcasting continuously, which used to put\n"
+                  "it out of reach of this tool.  It no longer does: the reader gap was too narrow,\n"
+                  "and the round trip to EM4102 and back is verified on hardware (docs/at100.md SS13).",
                   "lf autel configure -t ID46 -u 11223344        -> HITAG2 / MIKRON image\n"
                   "lf autel configure -t ID13 -u 0456B307C8      -> EM4102, 5-byte ID\n"
                   "lf autel configure -t ID48 -u 785626A1        -> Megamos ID48\n"
@@ -947,6 +1014,14 @@ static int CmdLFAutelConfigure(const char *Cmd) {
     }
     if (t->note) {
         PrintAndLogEx(INFO, _YELLOW_("note") ": %s", t->note);
+    }
+    // ID11/ID12/ID13 leave the chip load-modulating continuously while it listens,
+    // which costs margin on the reader->tag link.  That used to make them a one-way
+    // trip; a reader gap of AT_T_LOW rather than the stock HITAG_T_LOW fixed it and
+    // the round trip is now verified on hardware (docs/at100.md SS13).
+    if (t->place == AT_PLACE_RAW64 || t->place == AT_PLACE_EM4102) {
+        PrintAndLogEx(INFO, _YELLOW_("note") ": %s is a talk-first type - the chip will broadcast continuously.", t->canon);
+        PrintAndLogEx(INFO, "      `lf autel` can still reach it; reconfigure it whenever you like.");
     }
 
     PrintAndLogEx(INFO, "configuring " _GREEN_("%s") " (page 0xFE = %08X), %u page writes%s",

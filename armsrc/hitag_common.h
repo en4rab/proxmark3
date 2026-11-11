@@ -16,6 +16,12 @@
 // Ensure not to set these timings above 5461 (~43ms) when comparing without considering overflow, as they will never reach that value.
 
 #define HITAG_T_LOW 8    /* T_LOW should be 4..10 */
+
+// Width of the reader's field-off pulse, in carrier periods, as actually used by
+// hitag_reader_send_bit().  Defaults to HITAG_T_LOW; exposed so a caller can widen
+// it for a tag whose demodulator needs a deeper gap than the default.  Anything
+// that changes it must put it back, or every later hitag command inherits it.
+extern uint8_t g_hitag_t_low;
 #define HITAG_T_0 20     /* T[0] should be 18..22 */
 #define HITAG_T_1 28     /* T[1] should be 26..32 */
 #define HITAG_T_0_MIN 15 /* T[0] should be 18..22 */

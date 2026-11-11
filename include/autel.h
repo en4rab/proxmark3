@@ -48,6 +48,15 @@
 // It is also exactly what the Autel's own "ID4D" menu entry writes.
 #define AUTEL_CFG_FACTORY   0x9B290A9BUL
 
+// How far a session open got.  A chip that echoes the wake and returns its UID but
+// then ignores {nR}{aR} is a completely different situation from an empty antenna,
+// and reporting both as "nothing on the coil" hides it.
+#define AUTEL_STAGE_NONE    0   // nothing answered the wake
+#define AUTEL_STAGE_NOISE   1   // something answered, but not with the 1010 echo
+#define AUTEL_STAGE_ECHO    2   // wake echoed; the get-UID went unanswered
+#define AUTEL_STAGE_UID     3   // UID read; {nR}{aR} went unanswered
+#define AUTEL_STAGE_AUTH    4   // the tag answered the auth: the session is open
+
 // Pages per reply.  Also the cap on `lf autel read -n` and on the dump page list.
 #define AUTEL_MAX_PAGES     64
 
@@ -68,7 +77,11 @@ typedef struct {
     // cannot reach.  Both 0 => use the built-in schedule.
     uint16_t off_ms;      // field-off time before the wake
     uint16_t on_us;       // field-on settle before the wake
-    uint8_t  rfu2[4];
+    uint16_t uid_t0;      // wake reply -> get-UID gap, T0 (0 => default)
+    uint16_t auth_t0;     // UID reply -> {nR}{aR} gap, T0 (0 => default)
+    uint8_t  mode;        // session-open variant, bring-up only (0 = default)
+    uint8_t  tlow;        // reader field-off pulse width, T0 (0 => the hitag default)
+    uint8_t  rfu3[6];
 } PACKED lf_autel_io_t;
 
 // Firmware -> client for read / write / dump.  `page[]` is carried per entry
@@ -83,6 +96,7 @@ typedef struct {
     uint8_t  page[AUTEL_MAX_PAGES];
     uint8_t  ok[AUTEL_MAX_PAGES / 8];   // bit (i%8) of byte i/8 => data[i] had two agreeing reads
     uint8_t  data[AUTEL_MAX_PAGES * 4];
+    uint8_t  stage;       // furthest AUTEL_STAGE_* reached over all open attempts
 } PACKED lf_autel_io_reply_t;
 
 // One page write of a configure burst.
@@ -115,6 +129,7 @@ typedef struct {
     uint32_t uid;
     uint32_t config_before; // page 0xFE as read at the start of the session
     uint32_t config_after;  // page 0xFE re-read at the end, or 0 if it was not read
+    uint8_t  stage;         // furthest AUTEL_STAGE_* reached over all open attempts
 } PACKED lf_autel_cfg_reply_t;
 
 #endif // AUTEL_H__

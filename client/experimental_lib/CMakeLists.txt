@@ -379,6 +379,7 @@ set (TARGET_SOURCES
         ${PM3_ROOT}/client/src/cmdhw.c
         ${PM3_ROOT}/client/src/cmdlf.c
         ${PM3_ROOT}/client/src/cmdlfawid.c
+        ${PM3_ROOT}/client/src/cmdlfautel.c
         ${PM3_ROOT}/client/src/cmdlfcotag.c
         ${PM3_ROOT}/client/src/cmdlfdestron.c
         ${PM3_ROOT}/client/src/cmdlfem.c
