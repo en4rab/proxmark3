@@ -170,7 +170,6 @@ static const char xh_id8a_probe[] =
 // page: bank-1 0x3D+n on an XT27A, 0x0D+n in the XT136's flat space (docs/xt136.md SS5).
 #define XH136_PG_CFG0        0x0D
 #define XH136_TRIES          3        // per timing (VVDI's, then the XT27A's short one)
-#define XH136_PAGES          16       // pages 0x00..0x0F seen; the VVDI never touches higher ones
 
 //-----------------------------------------------------------------------------
 // Keystream engine (incremental; frames are always 16/32 bits so pos stays a
@@ -1216,7 +1215,7 @@ void Xhorse_Info(bool ledcontrol) {
             out.found = 1;
             out.family = XHORSE_FAM_XT136;
             out.seed_reply = s.seed_reply;
-            xh_read_image(&s, &out, XH136_PAGES);     // flat page space, no sel
+            xh_read_image(&s, &out, XHORSE_XT136_PAGES);     // flat page space, no sel
             xh_ctl(&s, XH_PG_PAD);
         }
         hitag_cleanup(ledcontrol);
@@ -1248,8 +1247,8 @@ void Xhorse_Info(bool ledcontrol) {
 }
 
 // Dumps one bank (0 = emulated image, 1 = config/identity) per call: both would not fit in one reply.
-// An XT136 has no banks: bank 0 returns pages 0x00..0x3F (only 0x00..0x0F are known to exist), and a
-// bank-1 request only reports the family.
+// An XT136 has no banks: bank 0 returns its pages 0x00..0x0F, and a bank-1 request only reports the
+// family.
 void Xhorse_Dump(uint8_t bank, bool ledcontrol) {
     xh_sess_t s;
     lf_xhorse_info_t out;
@@ -1261,7 +1260,7 @@ void Xhorse_Dump(uint8_t bank, bool ledcontrol) {
             out.found = 1;
             out.family = XHORSE_FAM_XT136;
             if (bank == 0) {
-                xh_read_image(&s, &out, 64);
+                xh_read_image(&s, &out, XHORSE_XT136_PAGES);
             }
             xh_ctl(&s, XH_PG_PAD);
         }

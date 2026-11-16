@@ -48,7 +48,7 @@ unsupported.
 | Command | Purpose |
 |---|---|
 | `lf xhorse info` | Identify the chip: channel-B family, or XT27A chip ID, emulated type byte and the first 8 emulated pages, or XT136 pages `0x00`-`0x0F` |
-| `lf xhorse dump` | Read the XT27A chip ID, type byte and all 64 pages of bank 0 and of bank 1, one session per bank; on an XT136, pages `0x00`-`0x3F` in one session |
+| `lf xhorse dump` | Read the XT27A chip ID, type byte and all 64 pages of bank 0 and of bank 1, one session per bank; on an XT136, its pages `0x00`-`0x0F` in one session |
 | `lf xhorse configure -t <type> [-u <uid>]` | Set the emulated transponder type, and its UID: `-u` is required for every type that takes one |
 | `lf xhorse reset` | Restore the factory-default ID46/HITAG2 personality; also recovers a chip stuck in an EM emulation |
 | `lf xhorse read -p <page> [-b <bank>] [-n <count>]` | Read raw channel-A pages: `-b` picks the bank on an XT27A and is ignored on an XT136 |

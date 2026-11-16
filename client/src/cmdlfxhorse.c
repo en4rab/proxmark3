@@ -245,9 +245,10 @@ static const char *xh_page_mark(const lf_xhorse_info_t *nfo, uint8_t pg) {
     return xh_page_ok(nfo, pg) ? "  " : " " _RED_("?");
 }
 
-static void xh_print_unconfirmed(const lf_xhorse_info_t *nfo) {
+// `pages` is how many of image_pages were shown, so the count matches what was printed.
+static void xh_print_unconfirmed(const lf_xhorse_info_t *nfo, uint8_t pages) {
     int bad = 0;
-    for (uint8_t pg = 0; pg < nfo->image_pages; pg++) {
+    for (uint8_t pg = 0; pg < pages; pg++) {
         bad += xh_page_ok(nfo, pg) ? 0 : 1;
     }
     if (bad) {
@@ -294,15 +295,14 @@ static void xh136_print(const lf_xhorse_info_t *nfo, const char *title) {
     PrintAndLogEx(INFO, "Seed...... E430 reply 0x%04X", nfo->seed_reply);
     PrintAndLogEx(INFO, "  page | data");
     PrintAndLogEx(INFO, "-------+-----------");
-    for (uint8_t pg = 0; pg < nfo->image_pages; pg++) {
+    // Firmware may still return pages above 0x0F; they only alias 0x00..0x0F, so never show them.
+    uint8_t pages = (nfo->image_pages < XHORSE_XT136_PAGES) ? nfo->image_pages : XHORSE_XT136_PAGES;
+    for (uint8_t pg = 0; pg < pages; pg++) {
         PrintAndLogEx(INFO, "  0x%02X | %s%s %s", pg, sprint_hex_inrow(&nfo->image[pg * 4], 4), xh_page_mark(nfo, pg), xh136_page_label(pg));
     }
-    xh_print_unconfirmed(nfo);
-    if (nfo->image_pages > 0x0F) {
+    xh_print_unconfirmed(nfo, pages);
+    if (pages >= 0x0F) {
         PrintAndLogEx(INFO, "Config word 1 high byte " _YELLOW_("0x%02X") " (%s, if it is the type byte)", nfo->image[0x0E * 4], typebyte_name(nfo->image[0x0E * 4]));
-    }
-    if (nfo->image_pages > 0x10) {
-        PrintAndLogEx(HINT, "Pages above 0x0F have never been seen used; their values may be aliases or noise.");
     }
     PrintAndLogEx(NORMAL, "");
 }
@@ -375,7 +375,7 @@ static int CmdLFXhorseInfo(const char *Cmd) {
     for (uint8_t pg = 0; pg < nfo.image_pages; pg++) {
         PrintAndLogEx(INFO, "  bank0 0x%02X: %s%s", pg, sprint_hex_inrow(&nfo.image[pg * 4], 4), xh_page_mark(&nfo, pg));
     }
-    xh_print_unconfirmed(&nfo);
+    xh_print_unconfirmed(&nfo, nfo.image_pages);
     PrintAndLogEx(NORMAL, "");
     return PM3_SUCCESS;
 }
@@ -389,8 +389,7 @@ static int CmdLFXhorseDump(const char *Cmd) {
                   "Read all reachable channel-A storage of an Xhorse XT27A: the 16-byte chip ID,\n"
                   "the type byte, and pages 0x00..0x3F of both banks: bank 0 (the emulated-tag\n"
                   "image) and bank 1 (configuration and identity).  Each bank is read in its own session.\n"
-                  "An XT136 has no banks: its pages 0x00..0x3F are read in one session (only\n"
-                  "0x00..0x0F are known to exist).",
+                  "An XT136 has no banks and only pages 0x00..0x0F: they are read in one session.",
                   "lf xhorse dump");
     void *argtable[] = { arg_param_begin, arg_param_end };
     CLIExecWithReturn(ctx, Cmd, argtable, true);
@@ -449,7 +448,7 @@ static int CmdLFXhorseDump(const char *Cmd) {
         }
     }
     for (uint8_t bank = 0; bank < got; bank++) {
-        xh_print_unconfirmed(&nfo[bank]);
+        xh_print_unconfirmed(&nfo[bank], nfo[bank].image_pages);
     }
     PrintAndLogEx(NORMAL, "");
     return PM3_SUCCESS;

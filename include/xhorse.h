@@ -29,6 +29,9 @@
 
 #define XHORSE_UID_MAXLEN   8
 
+// An XT136 has pages 0x00..0x0F; a read of a higher address aliases back into them.
+#define XHORSE_XT136_PAGES  16
+
 // Channel-A family that answered (lf_xhorse_info_t.family).  XT136: doc/xhorse_notes.md.
 typedef enum {
     XHORSE_FAM_NONE = 0,
@@ -76,7 +79,7 @@ typedef struct {
     uint8_t  bank;            // bank image[] was read from (dump: 0 or 1, as requested; info: 0)
     uint8_t  chipid[16];      // 16-byte unique chip ID (bank-1 0x33..0x36; XT27A only)
     uint8_t  image[64 * 4];   // XT27A: pages 0x00..0x3F of `bank` (dump), bank-0 0x00..0x07 (info);
-                              // XT136: pages 0x00..0x3F (dump), 0x00..0x0F (info), no banks
+                              // XT136: pages 0x00..0x0F, no banks
     uint8_t  image_pages;     // how many pages of `bank` are in image[]
     // XMICRO / "channel B" probe (XT57 / XT37-class chips).  An XT27A set to some types (7938)
     // answers XMICRO too, but only a newer, not-yet-supported family names itself ("XT37",
