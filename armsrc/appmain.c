@@ -2102,6 +2102,17 @@ static void PacketReceived(PacketCommandNG *packet) {
             Xhorse_Reset(true);
             break;
         }
+        case CMD_LF_XHORSE_XT57_RESET: {
+            lf_xhorse_xt57_reset_t q;
+            memset(&q, 0, sizeof(q));
+            if (packet->length >= sizeof(q)) {
+                memcpy(&q, packet->data.asBytes, sizeof(q));
+            } else if (packet->length >= 1) {
+                q.force = packet->data.asBytes[0];
+            }
+            Xhorse_Xt57Reset(&q, true);
+            break;
+        }
         case CMD_LF_XHORSE_READ: {
             if (packet->length < sizeof(lf_xhorse_io_t)) {
                 reply_ng(CMD_LF_XHORSE_READ, PM3_EINVARG, NULL, 0);

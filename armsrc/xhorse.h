@@ -28,7 +28,13 @@ void Xhorse_Dump(uint8_t bank, bool ledcontrol);
 void Xhorse_Configure(const lf_xhorse_data_t *packet, bool ledcontrol);
 void Xhorse_Reset(bool ledcontrol);
 void Xhorse_Xt57Nonce(const lf_xhorse_xt57_t *packet, bool ledcontrol);
+void Xhorse_Xt57Reset(const lf_xhorse_xt57_reset_t *q, bool ledcontrol);
 void Xhorse_Read(const lf_xhorse_io_t *packet, bool ledcontrol);
 void Xhorse_Write(const lf_xhorse_io_t *packet, bool ledcontrol);
+
+// The emulation-exit downlink burst - the ASCII word "erase" on a plain LF downlink.
+// Shared with armsrc/autel.c; see armsrc/xhorse.c and docs/xt57b-fullread.md SS12.2.
+void Xhorse_EmBurst(void);
+uint32_t Xhorse_EmBurstLenUs(void);
 
 #endif // XHORSE_FW_H

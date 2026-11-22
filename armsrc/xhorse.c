@@ -89,6 +89,22 @@
 // (S) or 67 T0 (L) as in xh_id8a_probe (identical in both captures).  Replaying it is what lets
 // us reach an ID8A chip, but it also reverts the chip's type byte to 0x36 (info read 0x36 after it
 // while bank 0 still held the ID8A image), so only reset/configure send it (xh_sess_t.allow_probe).
+//
+// The VVDI sends THREE words in this code, and this is the last of them (docs/xt57b-fullread.md
+// SS12.4).  Before it: an 18-symbol word "SLSSSSLLLLSSSSSSSS" at ~0.19 s, which is not ID8A-
+// specific - it is the whole of the XT136 reset preamble (docs/xt136.md SS4.2) - and then a
+// second 98-symbol word, twice, each followed by an XMICRO that gets no answer:
+//     "SLLSSSLLSLLLSSLLLSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSLLSLLSSSLLSSSSLLSSSSLSS"
+// Only after this word, sent six times, does XHORSE reach the chip - the same first-word /
+// last-word shape as the Megamos family.  Whether that other word is a non-destructive read is
+// still open (implementation-plan.md Update 29).
+//
+// The gap width carries nothing (unimodal at 23 T0, same before an S as before an L), so the
+// word is 98 bits.  Those bits do not decode: no ASCII under any expansion, no CRC-16 over
+// 27,888 framings, and not TI's write encoding (that is a 2 ms bit cell with a varying off time,
+// 112 bits; this is 416/536 us with a constant one).  It is a fixed constant - identical across
+// eight bursts in two captures - so it is not a DST challenge, which is why replay works.
+// tools/analysis/probe8a.py re-derives all three from a trace.
 #define XH_T_ID8A_CHARGE_T0  6255
 #define XH_T_ID8A_GAP_T0     22       // nominal; our gaps sniff ~1 T0 wider than set
 #define XH_T_ID8A_FIRST_T0   81
@@ -113,8 +129,8 @@ static const char xh_id8a_probe[] =
 // Recovery for a chip stuck emulating a non-HITAG2 type (e.g. ID11 = EM4100, ID48 = Megamos).  Such a chip
 // continuously broadcasts its fixed code and ignores the XHORSE config channel.
 //
-// What frees it is one reader burst sent a set time after power-up (xh_em_burst:
-// 43 field-off pulses spaced 1 or 2 bit-times of the ID11 chip's RF/32 broadcast).  In a sniff of a successful reset the chip broadcasts
+// What frees it is one reader burst sent a set time after power-up (xh_em_burst): a short LF
+// downlink frame carrying the ASCII word "erase", generated below.  In a sniff of a successful reset the chip broadcasts
 // EM right up to the first burst and is silent from power-up in every window after it, across
 // field-offs of 70 ms, 570 ms and 1.57 s, i.e. the burst turns the emulation off and it stays off
 // across power cycles.  The VVDI wraps the burst in a ~10 s sequence (listen window, XMICRO probes,
@@ -130,12 +146,21 @@ static const char xh_id8a_probe[] =
 // timings aim at the window's centre, commanding 3.5 T0 early because our burst reaches the air that
 // much after the commanded time.  ID13 (RF/64) is freed in its first frame after power-up (VVDI at
 // 1398 T0, ours at ~1752) but not by the same position in a later frame.  ID48 (Megamos) needs a
-// different burst (xh_burst_id48) at 1622 T0.  We don't know the emulated type, so the entries are
+// different word (xh_burst_id48) at 1622 T0.  We don't know the emulated type, so the entries are
 // tried in turn.
 #define XH_T_EM_OFF_US            70050    // field off before and after the burst window (VVDI)
 #define XH_T_EM_SETTLE_US         30180    // field on this long before XHORSE (VVDI, after the chip is freed)
 #define XH_T_EM_COLDBOOT_US     1570940    // VVDI's power-down between the bursts and its handshake (ID13 needs it)
 #define XH_EM_TRIES                   3    // attempts: one burst per xh_em_timings[] entry, cold-boot, handshake
+
+// Phase sweep.  A burst only frees the chip if it lands at the right point in the chip's
+// broadcast frame, and the frame period differs per type (ID11 RF/32, ID12 RF/40, ID13 RF/64),
+// so one fixed offset that suits one chip can miss on another - an ID12 chip that neither the
+// VVDI's own offset nor ours would free is what put this here.  After a first pass at the
+// nominal offsets (the fast path, and what used to be the only path), later attempts slip the
+// burst in 5 T0 steps across a whole 40 T0 ID12 frame.
+#define XH_EM_SWEEP_N                 8    // offsets tried on the attempts after the first
+#define XH_EM_SWEEP_STEP_US          40    // 5 T0 per step; 8 steps = 320 us = one ID12 frame
 
 // func field (top 2 bits of the op byte)
 #define XH_FUNC_CTL   0
@@ -657,61 +682,150 @@ static int xh_open_session_xt136(xh_sess_t *s) {
     return PM3_EFAILED;
 }
 
-// The VVDI's EM unlock burst, sent at a set time after power-up (xh_em_timings).  43 field-off pulses; start
-// offsets are T0 from the start of the first pulse, averaged over 22 occurrences in two VVDI
-// reset captures (they agree to within 0.75 T0); widths are how long the field is held off, i.e.
-// the measured width minus the 2 T0 the sniffer adds (our 8 T0 BPLM gap measures 10, as does the
-// VVDI's).  What it encodes is unknown, so it is replayed verbatim.  The VVDI sends the same burst
-// to an ID12 chip (RF/40 broadcast) and it frees that too.  See doc/xhorse_notes.md.
-static const uint16_t xh_emb_start[43] = {
-    0, 36, 68, 129, 163, 224, 258, 290, 351, 415, 449, 511, 576, 610, 641, 702, 767, 832, 865, 927,
-    961, 992, 1024, 1054, 1115, 1180, 1214, 1245, 1306, 1340, 1372, 1433, 1497, 1562, 1596, 1658,
-    1692, 1753, 1787, 1818, 1880, 1944, 1978
-};
-static const uint8_t xh_emb_width[43] = {
-    20, 16, 15, 19, 16, 19, 15, 15, 19, 19, 15, 19, 19, 16, 15, 19, 19, 19, 16, 19, 16, 15, 15, 15,
-    19, 19, 16, 15, 19, 16, 15, 19, 19, 19, 16, 19, 16, 19, 16, 15, 19, 19, 16
-};
+// The emulation-exit burst.
+//
+// It is not an XHORSE command and not a recorded waveform: it is a plain 125 kHz reader-to-tag
+// downlink, the kind the T5577/EM4x05 families use.  Each symbol is a field-ON time that carries
+// the symbol's value followed by a field gap that closes the cell, and a start gap opens the
+// frame.  Timings below are T0, measured over 120 bursts in 11 VVDI captures of both chips
+// (docs/xt57b-fullread.md SS12.2):
+//
+//   EM word - frees ID11, ID12, ID13          start gap 20
+//        bit 0     ON 15 + gap 16   ->  31 T0 cell      (22 of them)
+//        bit 1     ON 46 + gap 19   ->  65 T0 cell      (20 of them)
+//
+// Its 42 bits are a 2-bit preamble 00 followed by a 40-bit value sent least-significant-bit
+// first: 0x6572617365, the ASCII word "erase".  That is the whole back door - no key, no session,
+// no nonce, and the chip's emulation core listens for it whatever mode it is in.  So the burst is
+// generated from the word, not stored as 43 measured edge positions.
+//
+//   Megamos word - frees ID48, ID8E           start gap 20
+//        symbol 0  ON 16 + gap 17   ->  33 T0 cell
+//        symbol 1  ON 45 + gap 20   ->  65 T0 cell
+//        symbol 2  ON 80 + gap 20   -> 100 T0 cell
+//
+// That word has three symbol lengths, does not decode to ASCII, and is still unexplained, so its
+// 46 symbols are kept verbatim - but as symbols, not as 94 measured edge positions.
+#define XH_EM_ERASE       0x6572617365ULL    // ASCII "erase", sent LSB first
+#define XH_EM_ERASE_BITS  40
+#define XH_EM_WORD_SYMS   (2 + XH_EM_ERASE_BITS)
 
-// The VVDI's ID48 (Megamos) unlock burst: a different 47-pulse sequence on the same ~32 T0 grid,
-// sent 1622 T0 after power-up.  Measured the same way as the EM burst, averaged over the three
-// occurrences in one VVDI capture (they agree to within 2 T0).  The VVDI first sends twice a 48-pulse
-// variant with an extra pulse at +69 T0, each followed by XMICRO probes (channel B), which did not
-// free an XT27A; this 47-pulse one, followed by XHORSE, did.  See doc/xhorse_notes.md.
-static const uint16_t xh_id48b_start[47] = {
-    0, 35, 131, 167, 200, 262, 298, 332, 394, 459, 525, 590, 626, 689, 725, 787, 823, 857, 890, 923,
-    985, 1050, 1116, 1152, 1247, 1313, 1348, 1382, 1444, 1510, 1575, 1673, 1709, 1742, 1776, 1838,
-    1903, 1969, 2004, 2038, 2071, 2165, 2202, 2264, 2300, 2333, 2428
-};
-static const uint8_t xh_id48b_width[47] = {
-    19, 17, 19, 16, 16, 20, 17, 16, 19, 19, 20, 20, 17, 20, 16, 20, 17, 16, 16, 16, 19, 20, 19, 16,
-    19, 19, 16, 16, 19, 20, 19, 19, 16, 16, 15, 20, 19, 20, 17, 16, 16, 20, 16, 19, 16, 16, 19
-};
+// The Megamos word, in symbols.  The VVDI sends two different words in a reset round, and only
+// the second one frees an XT27A - tested here, on an XT27A put into ID48: the other leaves the
+// chip stuck.  The two differ by one gap: this word's 100 T0 cell (symbol '2' at index 1) is sent
+// as a 33 and a 65 in the other, i.e. with an extra gap at +68 T0.  In both
+// vvdi-id48-reset-success.pm3 and vvdi-id8E-reset-success.pm3 the burst that does not work goes
+// out twice first (at 0.33 s and 1.81 s), each followed by XMICRO probes on channel B, and this
+// one goes out last (3.30 s), followed by XHORSE.
+//
+// This one does NOT decode, unlike the 7935 word below (docs/xt57b-fullread.md SS12.4).  Its
+// carrier is the EM4x70 reader link - constant gap, cells of one to three ~32 T0 periods - but
+// expanded on that rule the 46 symbols give 74 bits, whose command nibble is 1100, none of the
+// six EM4x70 commands, and 74 matches no EM4x70 frame length.  Kept verbatim.
+static const char xh_id48_word[] = "0200100111101010000111021001112000111000201002";
+
+// Symbol timings, T0: the field-ON time, then the gap that closes the cell.
+typedef struct {
+    uint8_t start_gap;
+    uint8_t on[3];
+    uint8_t gap[3];
+} xh_dl_t;
+
+static const xh_dl_t xh_dl_em   = { 20, { 15, 46,  0 }, { 16, 19,  0 } };
+static const xh_dl_t xh_dl_id48 = { 20, { 16, 45, 80 }, { 17, 20, 20 } };
+// The word that frees a chip blanked to 7935, from the VVDI's own reset of one
+// (data/traces/xt57b/xhorse-XT57b-reset-from-7935.pm3; docs/xt57b-fullread.md SS12.11).  Three
+// symbols again, but on a far slower grid than the other two: cells of 65, 129 and 193 T0, i.e.
+// one, two or three units of 512 us, with a ~100 us gap closing each.  58 gaps, 58.3 ms end to
+// end - nearly four times the "erase" burst.
+//
+// Unlike the other two words this one decodes, and as the emulated part's own protocol.  It is a
+// PCF7931 reader downlink (armsrc/pcf7931.c AddBitPCF7931): 128 T0 bit cells carrying one gap
+// each, at 34 T0 for a '1' and 98 T0 for a '0', so gap to gap gives 64, 128 or 192 - our 65, 129,
+// 193.  The 57 symbols are 57 transitions across 58 bits, which is exactly PCF7931's
+// "1 password-indication bit + 56-bit password + 1 programming-mode bit" and then nothing: the
+// address, data and parity of a write frame are absent and the field simply stays up.  Reading
+// the password LSB-first per byte as AddBytePCF7931 sends it gives 10 01 22 44 66 88 AA.  So the
+// VVDI is not writing - it presents a magic password to a PCF7935, the part being emulated.
+// Polarity and byte framing carry a caveat each; see SS12.11.  The firmware replays the measured
+// symbols, so none of that changes what goes on air.
+static const xh_dl_t xh_dl_7935 = { 13, { 53, 117, 181 }, { 12, 12, 12 } };
+static const char xh_7935_word[] = "011120112011111112011201112011201210121011120112020202020";
 
 typedef struct {
-    const uint16_t *start;      // T0 from the start of the first pulse
-    const uint8_t  *width;      // T0 the field is held off
-    size_t          n;
+    const char    *name;
+    const xh_dl_t *dl;
+    const char    *word;    // NULL -> the "erase" word, generated below
+    size_t         n;       // symbols
 } xh_burst_t;
 
-static const xh_burst_t xh_burst_em   = { xh_emb_start,   xh_emb_width,   sizeof(xh_emb_start) / sizeof(xh_emb_start[0]) };
-static const xh_burst_t xh_burst_id48 = { xh_id48b_start, xh_id48b_width, sizeof(xh_id48b_start) / sizeof(xh_id48b_start[0]) };
+static const xh_burst_t xh_burst_em   = { "erase",   &xh_dl_em,   NULL,          XH_EM_WORD_SYMS };
+static const xh_burst_t xh_burst_id48 = { "megamos", &xh_dl_id48, xh_id48_word,  sizeof(xh_id48_word) - 1 };
+static const xh_burst_t xh_burst_7935 = { "7935",    &xh_dl_7935, xh_7935_word,  sizeof(xh_7935_word) - 1 };
 
-// burst length in us: start of the last pulse + its width (EM 1994 T0 = 15.95 ms, ID48 2447 T0 = 19.6 ms)
-static uint32_t xh_burst_len_us(const xh_burst_t *b) {
-    return ((uint32_t)b->start[b->n - 1] + b->width[b->n - 1]) * 8;
+// Symbol i of a burst, in the order it goes on air.
+static inline uint8_t xh_burst_sym(const xh_burst_t *b, size_t i) {
+    if (b->word != NULL) {
+        return (uint8_t)(b->word[i] - '0');
+    }
+    return (i < 2) ? 0 : (uint8_t)((XH_EM_ERASE >> (i - 2)) & 1);   // preamble 00, then LSB first
 }
 
-// Emit a burst with the field on.  One precision-counter reference covers it (2447 T0 = 29364
-// ticks < 65536), so pulse positions don't accumulate per-pulse error.
-static void xh_em_burst(const xh_burst_t *b) {
-    const uint16_t ref = GetPrecisionCounterRaw();
+// Burst length in T0: the start gap plus every cell.
+static uint32_t xh_burst_len_t0(const xh_burst_t *b) {
+    uint32_t t = b->dl->start_gap;
     for (size_t i = 0; i < b->n; i++) {
-        while (GetPrecisionCounterDelta(ref) < (uint16_t)(T0 * b->start[i])) {};
-        Gpio_SSC_DOUT_High();                                        // field off
-        while (GetPrecisionCounterDelta(ref) < (uint16_t)(T0 * (b->start[i] + b->width[i]))) {};
-        Gpio_SSC_DOUT_Low();                                         // field on
+        const uint8_t s = xh_burst_sym(b, i);
+        t += (uint32_t)b->dl->on[s] + b->dl->gap[s];
     }
+    return t;
+}
+
+// burst length in us (EM 2002 T0 = 16.0 ms, Megamos 2449 T0 = 19.6 ms)
+static uint32_t xh_burst_len_us(const xh_burst_t *b) {
+    return xh_burst_len_t0(b) * 8;
+}
+
+// Emit a burst.  The field is on when this is called and on when it returns.  Edge positions are
+// accumulated against one precision-counter reference, so they do not drift pulse to pulse.
+// Rebase the reference once the accumulated target passes XH_BURST_REBASE T0, so a burst longer
+// than the 16-bit counter's 5461 T0 still has every edge placed against one running clock.  The
+// 7935 word is 7290 T0; the other two fit without this ever firing.
+#define XH_BURST_REBASE  4000
+static inline void xh_burst_wait(uint16_t *ref, uint32_t *t) {
+    while (GetPrecisionCounterDelta(*ref) < (uint16_t)(T0 * (*t))) {};
+    if (*t > XH_BURST_REBASE) {
+        *ref = (uint16_t)(*ref + (uint16_t)(T0 * XH_BURST_REBASE));
+        *t -= XH_BURST_REBASE;
+    }
+}
+
+static void xh_em_burst(const xh_burst_t *b) {
+    const xh_dl_t *dl = b->dl;
+    uint16_t ref = GetPrecisionCounterRaw();
+    uint32_t t = dl->start_gap;
+
+    Gpio_SSC_DOUT_High();                                            // field off: the start gap
+    for (size_t i = 0; i < b->n; i++) {
+        const uint8_t s = xh_burst_sym(b, i);
+        xh_burst_wait(&ref, &t);
+        Gpio_SSC_DOUT_Low();                                         // field on: carries the symbol
+        t += dl->on[s];
+        xh_burst_wait(&ref, &t);
+        Gpio_SSC_DOUT_High();                                        // field off: closes the cell
+        t += dl->gap[s];
+    }
+    while (GetPrecisionCounterDelta(ref) < (uint16_t)(T0 * t)) {};
+    Gpio_SSC_DOUT_Low();                                             // field back on
+}
+
+// The EM burst on its own, for autel.c (armsrc/xhorse.h).
+void Xhorse_EmBurst(void) {
+    xh_em_burst(&xh_burst_em);
+}
+
+uint32_t Xhorse_EmBurstLenUs(void) {
+    return xh_burst_len_us(&xh_burst_em);
 }
 
 // Burst windows (see XH_T_EM_OFF_US): which burst, in a field-on window of on_us, commanded
@@ -754,15 +868,25 @@ static const xh_em_timing_t xh_em_timings[] = {
 // either way.  ~2.3 s per attempt.
 static int xh_open_session_em(xh_sess_t *s) {
     for (int attempt = 0; attempt < XH_EM_TRIES; attempt++) {
-        for (size_t t = 0; t < sizeof(xh_em_timings) / sizeof(xh_em_timings[0]); t++) {
-            const xh_em_timing_t *tm = &xh_em_timings[t];
+        // first attempt: the nominal offsets only, which is the common case and keeps it quick.
+        // after that, slip the burst through a whole frame.  Once the chip is free the extra
+        // bursts are harmless - the VVDI keeps bursting after the chip goes silent too.
+        const size_t nsweep = (attempt == 0) ? 1 : XH_EM_SWEEP_N;
 
-            Gpio_SSC_DOUT_High();                                    // off: the burst is timed from a fresh power-up
-            xh_delay_us(XH_T_EM_OFF_US);
-            Gpio_SSC_DOUT_Low();                                     // field on: chip boots, broadcasts EM
-            xh_delay_us(tm->burst_at_us);
-            xh_em_burst(tm->burst);
-            xh_delay_us(tm->on_us - tm->burst_at_us - xh_burst_len_us(tm->burst));
+        for (size_t k = 0; k < nsweep; k++) {
+            const uint32_t slip = (uint32_t)k * XH_EM_SWEEP_STEP_US;
+
+            for (size_t t = 0; t < sizeof(xh_em_timings) / sizeof(xh_em_timings[0]); t++) {
+                const xh_em_timing_t *tm = &xh_em_timings[t];
+                const uint32_t at = tm->burst_at_us + slip;
+
+                Gpio_SSC_DOUT_High();                                // off: the burst is timed from a fresh power-up
+                xh_delay_us(XH_T_EM_OFF_US);
+                Gpio_SSC_DOUT_Low();                                 // field on: chip boots, broadcasts EM
+                xh_delay_us(at);
+                xh_em_burst(tm->burst);
+                xh_delay_us(tm->on_us - at - xh_burst_len_us(tm->burst));
+            }
         }
 
         Gpio_SSC_DOUT_High();                                        // cold-boot
@@ -827,12 +951,8 @@ static void xh_read_chipid(xh_sess_t *s, uint8_t id16[16]) {
 //-----------------------------------------------------------------------------
 // Encoders for the per-type page images
 //-----------------------------------------------------------------------------
-static uint8_t xh_bitrev8(uint8_t b) {
-    b = (uint8_t)(((b & 0xF0) >> 4) | ((b & 0x0F) << 4));
-    b = (uint8_t)(((b & 0xCC) >> 2) | ((b & 0x33) << 2));
-    b = (uint8_t)(((b & 0xAA) >> 1) | ((b & 0x55) << 1));
-    return b;
-}
+// xh_bitrev8(), xh_pack_em8() and xh_id13_stream() are shared with the client (include/xhorse.h):
+// the XT57B set command builds the same images for its XMICRO sessions.
 
 // CRC-16/KERMIT over data[] (poly 0x1021, init 0, refin/refout, xorout 0).
 static uint16_t xh_crc16_kermit(const uint8_t *data, size_t len) {
@@ -853,61 +973,6 @@ static uint16_t xh_crc16_kermit(const uint8_t *data, size_t len) {
 
 static uint32_t xh_be32(const uint8_t *b) {
     return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | b[3];
-}
-
-// ID11/ID12 bitrev packing -> bank-0 pages 0x00..0x04 (header passed in).
-static void xh_pack_em8(const uint8_t *uid, uint16_t header, uint16_t pages[5]) {
-    uint8_t r[8];
-    for (int i = 0; i < 8; i++) {
-        r[i] = xh_bitrev8(uid[i]);
-    }
-    pages[0x00] = header;
-    pages[0x02] = (uint16_t)((r[0] << 8) | r[1]);
-    pages[0x01] = (uint16_t)((r[2] << 8) | r[3]);
-    pages[0x04] = (uint16_t)((r[4] << 8) | r[5]);
-    pages[0x03] = (uint16_t)((r[6] << 8) | r[7]);
-}
-
-// EM4102-encode 5 (already bit-reversed) bytes into a 64-bit stream, then
-// bit-reverse each output byte -> 8 bytes, matching ID13.
-static void xh_id13_stream(const uint8_t *uid5, uint8_t out8[8]) {
-    uint8_t rb[5];
-    for (int i = 0; i < 5; i++) {
-        rb[i] = xh_bitrev8(uid5[i]);
-    }
-    uint8_t bits[64];
-    int n = 0;
-    for (int i = 0; i < 9; i++) {
-        bits[n++] = 1;             // 9 header ones
-    }
-    uint8_t col[4] = {0, 0, 0, 0};
-    for (int by = 0; by < 5; by++) {
-        for (int half = 0; half < 2; half++) {
-            uint8_t nib = half ? (rb[by] & 0x0F) : (rb[by] >> 4);
-            uint8_t row[4] = { (uint8_t)((nib >> 3) & 1), (uint8_t)((nib >> 2) & 1),
-                               (uint8_t)((nib >> 1) & 1), (uint8_t)(nib & 1)
-                             };
-            uint8_t rp = 0;
-            for (int k = 0; k < 4; k++) {
-                bits[n++] = row[k];
-                rp ^= row[k];
-                col[k] ^= row[k];
-            }
-            bits[n++] = rp;        // even row parity
-        }
-    }
-    for (int k = 0; k < 4; k++) {
-        bits[n++] = col[k];        // even column parity
-    }
-    bits[n++] = 0;                 // stop bit  -> 64 bits total
-
-    for (int i = 0; i < 8; i++) {
-        uint8_t v = 0;
-        for (int b = 0; b < 8; b++) {
-            v = (uint8_t)((v << 1) | bits[i * 8 + b]);
-        }
-        out8[i] = xh_bitrev8(v);   // bit-reverse each byte
-    }
 }
 
 //-----------------------------------------------------------------------------
@@ -1189,6 +1254,199 @@ static void xh_read_image(xh_sess_t *s, lf_xhorse_info_t *out, uint8_t pages) {
         out->image[pg * 4 + 2] = (uint8_t)(w >> 8);
         out->image[pg * 4 + 3] = (uint8_t)(w);
     }
+}
+
+// Free an XT57B stuck in a broadcast emulation mode.
+//
+// Configured as one of the talk-first types the XT57B broadcasts continuously and stops answering
+// XMICRO, so none of the channel-B commands reach it.  The same "erase" downlink word that frees
+// an XT27A frees it - the emulation core listens for it whatever family the chip is - but the
+// XT57B captures wrap it in a different choreography.  Measured from
+// xhorse-XT57b-reset-from-id11.pm3, -id12 and -id13, identical in all three to the millisecond
+// (docs/xt57b-fullread.md SS12.1):
+//
+//   2 rounds of:
+//        4 x [ field off 70 ms, on, burst at +109.7 ms, window ends at +156 ms ]
+//        field off 568 ms
+//        field on, XMICRO probe             <- answers once the chip is free
+//        field off 228 ms
+//
+// NOTE: this frees the chip, it does not rewrite its configuration.  The VVDI follows the burst
+// with 11 encrypted page writes (session nonce 6DCD7463, keystream not recovered - SS12.5) which
+// are what make its reset permanent.  Until those are decrypted this restores the channel, not
+// the factory personality.
+#define XT57_EM_OFF_US         70050    // field off between bursts inside a round
+#define XT57_EM_AT_US         109700    // burst position in the window, from the field-on edge
+#define XT57_EM_WINDOW_US     156000    // field-on window holding one burst
+#define XT57_EM_ROUND_OFF_US  568300    // drop at the end of a round, before the probe
+#define XT57_EM_PROBE_OFF_US  228100    // drop after a failed probe, before the next round
+#define XT57_EM_BURSTS             4    // bursts per round
+#define XT57_EM_ROUNDS             2
+
+// Phase sweep, for when the VVDI's own offset does not free this particular chip - which is the
+// common case here, not the rare one: an XT57B set to ID11 is not freed by XT57_EM_AT_US at all,
+// on any retry.  The burst has to land at the right point in the chip's broadcast frame (ID11 is
+// RF/32, so one frame is 32 T0 = 256 us), and the VVDI's fixed offset was measured against the
+// chip it was used on, through its antenna.  So after the VVDI's sequence has been tried, walk
+// the burst outwards from that offset in 5 T0 steps and probe every few positions.
+#define XT57_EM_SWEEP_N           32    // positions, centred on XT57_EM_AT_US: +-16 steps
+#define XT57_EM_SWEEP_STEP_US     40    // 5 T0 per step; +-640 us covers five ID11 frames
+#define XT57_EM_PROBE_EVERY        8    // probe XMICRO after this many swept bursts
+
+// The 7935 word's own geometry, read off the VVDI's reset of a blanked chip: field off 120.06 ms,
+// on, burst at 18.76 ms, field held on to 107.82 ms.  The chip broadcasts from about 26 to 78 ms
+// after power-up, so the burst goes out over the broadcast, not before or after it.  One burst at
+// the VVDI's offset frees the chip, and it stays free across later power cycles.  Its frame is
+// 4096 us, so the sweep steps 128 us: 32 positions walk one whole frame.
+#define XT57_7935_OFF_US      120060
+#define XT57_7935_AT_US        18760
+#define XT57_7935_WINDOW_US   107820
+#define XT57_7935_STEP_US        128
+
+// One burst in its own power cycle, so it is timed from a fresh power-up, inside the VVDI's
+// 156 ms field-on window (107.8 ms for the 7935 word).
+static void xt57_em_burst_at(uint32_t at_us, const xh_burst_t *b, uint32_t on_us, uint32_t off_us) {
+    const uint32_t blen = xh_burst_len_us(b);
+    Gpio_SSC_DOUT_High();                                        // off: the burst is timed from power-up
+    xh_delay_us(off_us);
+    Gpio_SSC_DOUT_Low();                                         // on: chip boots, broadcasts
+    xh_delay_us(at_us);
+    xh_em_burst(b);
+    // the tail of the window, if the burst has not already run past its end
+    if (on_us > at_us + blen) {
+        xh_delay_us(on_us - at_us - blen);
+    }
+}
+
+// One round: XT57_EM_BURSTS bursts at the same offset, then the long drop that ends the round.
+static void xt57_em_round(uint32_t at_us, const xh_burst_t *b, uint32_t on_us, uint32_t off_us) {
+    for (int i = 0; i < XT57_EM_BURSTS; i++) {
+        xt57_em_burst_at(at_us, b, on_us, off_us);
+    }
+    Gpio_SSC_DOUT_High();
+    xh_delay_us(XT57_EM_ROUND_OFF_US);
+    Gpio_SSC_DOUT_Low();
+}
+
+// Which words to send, and the geometry each one wants.  XT57_WORD_AUTO tries the EM word and
+// then the 7935 word, because the chip cannot be asked what it is emulating while it is stuck.
+typedef struct {
+    const xh_burst_t *burst;
+    uint32_t at_us;
+    uint32_t on_us;
+    uint32_t off_us;
+    int32_t  step_us;
+} xt57_word_t;
+
+static const xt57_word_t xt57_words[] = {
+    { &xh_burst_em,   XT57_EM_AT_US,   XT57_EM_WINDOW_US,   XT57_EM_OFF_US,   XT57_EM_SWEEP_STEP_US },
+    { &xh_burst_id48, XT57_EM_AT_US,   XT57_EM_WINDOW_US,   XT57_EM_OFF_US,   XT57_EM_SWEEP_STEP_US },
+    { &xh_burst_7935, XT57_7935_AT_US, XT57_7935_WINDOW_US, XT57_7935_OFF_US, XT57_7935_STEP_US },
+};
+
+void Xhorse_Xt57Reset(const lf_xhorse_xt57_reset_t *q, bool ledcontrol) {
+    const bool force = (q->force != 0);
+    const int nsweep = q->nsweep ? q->nsweep : XT57_EM_SWEEP_N;
+    const int probe_every = q->probe_every ? q->probe_every : XT57_EM_PROBE_EVERY;
+    // word: 0 = auto (erase, then 7935), 1 = erase, 2 = megamos, 3 = 7935
+    const int wfirst = (q->word == 0) ? 0 : (int)q->word - 1;
+    const int wlast  = (q->word == 0) ? 2 : (int)q->word - 1;
+    xh_sess_t s;
+    lf_xhorse_info_t out;
+    memset(&out, 0, sizeof(out));
+
+    xh_setup(&s, ledcontrol);
+
+    // If it already answers XMICRO it is not stuck, and there is nothing for the burst to do.
+    // `force` sends the bursts anyway, which is how the sequence gets exercised on a healthy chip.
+    size_t tlen = 0;
+    if ((force == false) && xh_xmicro_identify(&s, out.bchip_type, sizeof(out.bchip_type), &tlen) == PM3_SUCCESS) {
+        out.bchip = 1;
+        out.bchip_type_len = (uint8_t)tlen;
+        out.found = 1;                                           // already reachable
+        hitag_cleanup(ledcontrol);
+        reply_ng(CMD_LF_XHORSE_XT57_RESET, PM3_SUCCESS, (uint8_t *)&out, sizeof(out));
+        return;
+    }
+
+    for (int wi = wfirst; wi <= wlast; wi++) {
+        if ((q->word == 0) && (wi == 1)) {
+            continue;                                            // auto: the EM word, then 7935
+        }
+        const xt57_word_t *w = &xt57_words[wi];
+        const xh_burst_t *word = w->burst;
+        const uint32_t at_us = q->at_us ? (uint32_t)q->at_us : w->at_us;
+        const uint32_t on_us = q->on_us ? (uint32_t)q->on_us : w->on_us;
+        const uint32_t off_us = w->off_us;
+        const int32_t step_us = q->step_us ? q->step_us : w->step_us;
+
+        // Pass 1: the VVDI's own sequence, unchanged.
+        for (int round = 0; round < XT57_EM_ROUNDS; round++) {
+            xt57_em_round(at_us, word, on_us, off_us);
+
+            // xh_xmicro_identify power-cycles and waits XH_T_XMICRO_POWERUP_US itself
+            if (xh_xmicro_identify(&s, out.bchip_type, sizeof(out.bchip_type), &tlen) == PM3_SUCCESS) {
+                out.bchip = 1;
+                out.bchip_type_len = (uint8_t)tlen;
+                hitag_cleanup(ledcontrol);
+                reply_ng(CMD_LF_XHORSE_XT57_RESET, PM3_SUCCESS, (uint8_t *)&out, sizeof(out));
+                return;
+            }
+            if (g_dbglevel >= DBG_DEBUG) {
+                Dbprintf("xhorse: XT57B round %d: no XMICRO answer after the bursts", round);
+            }
+
+            Gpio_SSC_DOUT_High();
+            xh_delay_us(XT57_EM_PROBE_OFF_US);
+            Gpio_SSC_DOUT_Low();
+        }
+
+        // Pass 2: walk the burst outwards from the VVDI's offset - 0, -1, +1, -2, +2, ... - and probe
+        // every XT57_EM_PROBE_EVERY positions.  A burst at the wrong position is harmless once the
+        // chip is free, so the probe does not have to follow every one.
+        int32_t last_slip = 0;
+        for (int k = 0; k < nsweep; k++) {
+            const int step = (k & 1) ? -((k + 1) / 2) : (k / 2);
+            last_slip = step * step_us;
+            {
+                const int32_t a = (int32_t)at_us + last_slip;
+                xt57_em_burst_at((uint32_t)((a < 0) ? 0 : a), word, on_us, off_us);
+            }
+
+            if (((k + 1) % probe_every) != 0) {
+                continue;
+            }
+            Gpio_SSC_DOUT_High();
+            xh_delay_us(XT57_EM_ROUND_OFF_US);
+            Gpio_SSC_DOUT_Low();
+
+            if (xh_xmicro_identify(&s, out.bchip_type, sizeof(out.bchip_type), &tlen) == PM3_SUCCESS) {
+                out.bchip = 1;
+                out.bchip_type_len = (uint8_t)tlen;
+                // the winning burst is somewhere in the block just sent; report the last of them,
+                // which bounds the offset to within XT57_EM_PROBE_EVERY steps
+                out.em_slip_us = (int16_t)((last_slip > 32767) ? 32767
+                                           : (last_slip < -32768) ? -32768 : last_slip);
+                hitag_cleanup(ledcontrol);
+                reply_ng(CMD_LF_XHORSE_XT57_RESET, PM3_SUCCESS, (uint8_t *)&out, sizeof(out));
+                return;
+            }
+            if (g_dbglevel >= DBG_DEBUG) {
+                Dbprintf("xhorse: XT57B sweep through %d: no XMICRO answer", k);
+            }
+
+            Gpio_SSC_DOUT_High();
+            xh_delay_us(XT57_EM_PROBE_OFF_US);
+            Gpio_SSC_DOUT_Low();
+        }
+
+        if (BUTTON_PRESS() || data_available()) {
+            break;
+        }
+    }   // words, when none was named
+
+    hitag_cleanup(ledcontrol);
+    reply_ng(CMD_LF_XHORSE_XT57_RESET, PM3_EFAILED, (uint8_t *)&out, sizeof(out));
 }
 
 void Xhorse_Info(bool ledcontrol) {
@@ -1636,6 +1894,13 @@ void Xhorse_Write(const lf_xhorse_io_t *p, bool ledcontrol) {
 #define XT57_DEF_ID_SEL_T0    82
 #define XT57_DEF_NONCE_ANS_T0 144
 #define XT57_MAX_T0           5000     // the precision counter is 16 bit: 5461 T0 at most
+// Default gaps for a scripted post-auth frame, from the VVDI's own sessions (doc/xt57-auth.md SS7.3):
+// the first frame comes 1404-1409 T0 after the 64-bit reply, a frame that follows a tag response
+// 178-192 T0 later, and the frame after a write's 8-bit ack about 1390 T0 later.  A script entry
+// may override any of them.
+#define XT57_POST_T0_FIRST    1408
+#define XT57_POST_T0_RESP      190
+#define XT57_POST_T0_ACK      1390
 
 typedef struct {
     uint32_t nonce;
@@ -1657,13 +1922,80 @@ static uint32_t xt57_us(int32_t v) {
     return (v < 0) ? 0 : (uint32_t)v;
 }
 
+// Replay/compose the scripted frames of a post-auth session.  Returns the number of frames sent.
+// A frame at the wrong index is not a valid command and ends the session, so this stops as soon as
+// a frame that expects an answer gets none: everything after it would be meaningless anyway.
+static uint8_t xt57_post_run(xh_sess_t *s, const lf_xhorse_xt57_t *p, xt57_presp_t *out,
+                             uint8_t *nkept) {
+    uint8_t rx[32];
+    uint16_t len = (p->scriptlen > XHORSE_XT57_SCRIPTBYTES) ? XHORSE_XT57_SCRIPTBYTES : p->scriptlen;
+    uint8_t first = p->rfirst ? p->rfirst : 1;
+    uint8_t prev_bits = 0;
+    uint8_t sent = 0;
+    uint8_t kept = 0;
+    uint16_t at = 0;
+
+    while (at < len && sent < p->npost) {
+        uint8_t b = p->script[at++];
+        if (b == 0) {
+            break;
+        }
+        uint16_t gap_t0 = 0;
+        if (b & 0x80) {
+            if (at + 2 > len) {
+                break;
+            }
+            gap_t0 = (uint16_t)(p->script[at] | (p->script[at + 1] << 8));
+            at += 2;
+            b &= 0x7F;
+        }
+        if (b == 0 || b > XHORSE_XT57_POSTBYTES * 8) {
+            break;
+        }
+        uint8_t nb = (uint8_t)((b + 7) / 8);
+        if (at + nb > len) {
+            break;
+        }
+        const uint8_t *data = &p->script[at];
+        at += nb;
+
+        int gap;
+        if (gap_t0) {
+            gap = xt57_t0((int32_t)gap_t0);
+        } else if (sent == 0) {
+            gap = XT57_POST_T0_FIRST;
+        } else {
+            // a write (48 bits) is acked with 8 bits and the next frame follows it slowly
+            gap = (prev_bits == 48) ? XT57_POST_T0_ACK : XT57_POST_T0_RESP;
+        }
+
+        size_t rxlen = xh_xfer_clear(s, data, b, rx, sizeof(rx), gap);
+        sent++;
+        prev_bits = b;
+        if (sent >= first && kept < XHORSE_XT57_MAXPOST) {
+            out[kept].bits = (uint8_t)((rxlen > 255) ? 255 : rxlen);
+            memcpy(out[kept].data, rx, XHORSE_XT57_RESPBYTES);
+            kept++;
+        }
+
+        if (rxlen == 0) {
+            break;
+        }
+        if (BUTTON_PRESS() || data_available()) {
+            break;
+        }
+    }
+    *nkept = kept;
+    return sent;
+}
+
 // One session, up to and including the reply to the answer.  Whatever got that far is in *r.
 static void xt57_session(xh_sess_t *s, const lf_xhorse_xt57_t *p, int32_t val, lf_xhorse_xt57_rec_t *r) {
     static const uint8_t xmicro[6] = { 'X', 'M', 'I', 'C', 'R', 'O' };
     static const uint8_t query[1]  = { 0x30 };   // 4 bits, 0b0011
 
     uint32_t off_us = p->off_us ? p->off_us : XH_T_FIELD_OFF_US;
-    uint32_t pwr_us = XT57_DEF_POWERUP_US;
+    uint32_t pwr_us = p->powerup_us ? p->powerup_us : XT57_DEF_POWERUP_US;
     int t_ack_id = XT57_DEF_ACK_ID_T0;
     int t_id_sel = XT57_DEF_ID_SEL_T0;
     int t_non_ans = XT57_DEF_NONCE_ANS_T0;
@@ -1691,21 +2023,31 @@ static void xt57_session(xh_sess_t *s, const lf_xhorse_xt57_t *p, int32_t val, l
     if (rxlen < 16) {
         return;
     }
-    r->flags |= XT57_F_ACK;
     r->ack[0] = rx[0];
     r->ack[1] = rx[1];
+    // 16 bits is not an ack: a chip emulating a talk-first type modulates the field all the way
+    // through the window, and the demodulator reads its carrier as 5555.  Only 5AA5 is the ack.
+    if ((rx[0] != 0x5A) || (rx[1] != 0xA5)) {
+        if (p->press_on == 0) {
+            return;
+        }
+    } else {
+        r->flags |= XT57_F_ACK;
+    }
 
     rxlen = xh_xfer_clear(s, query, 4, rx, sizeof(rx), t_ack_id);
-    if (rxlen < 16) {
+    if (rxlen >= 16) {
+        memcpy(r->ident, rx, sizeof(r->ident));
+    }
+    if ((rxlen >= 32) && (rx[0] == 'X') && (rx[1] == 'T')) {
+        r->flags |= XT57_F_IDENT;
+    } else if (p->press_on == 0) {
         return;
     }
-    memcpy(r->ident, rx, sizeof(r->ident));
-    if ((rxlen < 32) || (rx[0] != 'X') || (rx[1] != 'T')) {
-        return;
-    }
-    r->flags |= XT57_F_IDENT;
 
-    rxlen = xh_xfer_clear(s, p->select, XHORSE_XT57_SELLEN * 8, rx, sizeof(rx), t_id_sel);
+    uint16_t selbits = p->selbits ? p->selbits : (XHORSE_XT57_SELLEN * 8);
+    if (selbits > XHORSE_XT57_SELLEN * 8) selbits = XHORSE_XT57_SELLEN * 8;
+    rxlen = xh_xfer_clear(s, p->select, selbits, rx, sizeof(rx), t_id_sel);
     r->nonce_bits = (uint8_t)((rxlen > 255) ? 255 : rxlen);
     memcpy(r->nonce, rx, sizeof(r->nonce));
     if (rxlen < 32) {
@@ -1743,6 +2085,50 @@ static void xt57_session(xh_sess_t *s, const lf_xhorse_xt57_t *p, int32_t val, l
 
 void Xhorse_Xt57Nonce(const lf_xhorse_xt57_t *p, bool ledcontrol) {
     xh_sess_t s;
+
+    // Scripted mode: run sessions until the wanted nonce comes up, then send the script in that
+    // session and stop.  The keystream is a function of the nonce, so a script is only meaningful
+    // at the nonce it was built for.
+    if (p->npost > 0) {
+        lf_xhorse_xt57_post_reply_t pout;
+        memset(&pout, 0, sizeof(pout));
+        xh_setup(&s, ledcontrol);
+
+        uint16_t tries = p->count ? p->count : 1;
+        for (uint16_t i = 0; i < tries; i++) {
+            int64_t v = (int64_t)p->base + (int64_t)i * p->step;
+            if (v > INT32_MAX) v = INT32_MAX;
+            if (v < INT32_MIN) v = INT32_MIN;
+
+            lf_xhorse_xt57_rec_t rec;
+            xt57_session(&s, p, (int32_t)v, &rec);
+            pout.sessions = (uint8_t)((i + 1 > 255) ? 255 : i + 1);
+
+            uint32_t nonce = xh_bits_to_u32(rec.nonce, 32);
+            bool want_ok = (p->want == 0) || (nonce == p->want);
+            // only a session that actually authenticated can carry the script
+            // Normally only an authenticated session can carry the script.  With --noanswer
+            // there is no auth at all: run the script straight after the identify, so a
+            // plain-mode command set can be probed (doc/xt57-auth.md SS17.5).
+            bool carry = (rec.reply_bits >= 64) ||
+                         ((p->answer_mode == XT57_ANS_NONE) && (rec.flags & XT57_F_IDENT));
+            if (want_ok && carry) {
+                pout.rec = rec;
+                pout.rfirst = p->rfirst ? p->rfirst : 1;
+                pout.nsent = xt57_post_run(&s, p, pout.presp, &pout.npost);
+                break;
+            }
+            pout.rec = rec;
+            if (BUTTON_PRESS() || data_available()) {
+                break;
+            }
+        }
+
+        hitag_cleanup(ledcontrol);
+        reply_ng(CMD_LF_XHORSE_XT57_NONCE, PM3_SUCCESS, (uint8_t *)&pout, sizeof(pout));
+        return;
+    }
+
     lf_xhorse_xt57_reply_t out;
     memset(&out, 0, sizeof(out));
 

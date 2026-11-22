@@ -1190,6 +1190,7 @@ typedef struct {
 #define CMD_LF_XHORSE_XT57_NONCE 0x036D
 #define CMD_LF_XHORSE_READ 0x036E
 #define CMD_LF_XHORSE_WRITE 0x036F
+#define CMD_LF_XHORSE_XT57_RESET 0x037F
 
 // For Hitag 2 transponders
 #define CMD_LF_HITAG_SNIFF 0x0370

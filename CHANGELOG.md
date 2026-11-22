@@ -3,6 +3,550 @@ All notable changes to this project will be documented in this file.
 This project uses the changelog in accordance with [keepchangelog](http://keepachangelog.com/). Please use this to write notable changes, which is not the same as git commit log...
 
 ## [unreleased][unreleased]
+
+### Added
+ - **A chip blanked to 7935 can be freed again** (docs/xt57b-fullread.md SS12.11). A sniff of the
+   VVDI resetting one (`data/traces/xt57b/xhorse-XT57b-reset-from-7935.pm3`) shows it is the same
+   kind of back door the EM types have, with a **third word**: 58 gaps over 58.3 ms, cells of one,
+   two or three 512 us units (65/129/193 T0), sent 18.76 ms after power-up, over the chip's own
+   broadcast rather than before or after it. The word is
+   `011120112011111112011201112011201210121011120112020202020`. One burst frees the chip and it
+   stays free across later power cycles. `tools/analysis/burst7935.py` re-derives it from the
+   trace and decodes it.
+   `lf xhorse xt57 reset` now sends the "erase" word and then this one when `--word` is not given,
+   because a stuck chip cannot be asked what it is emulating; `--word 7935` sends only this one.
+   Verified end to end twice on an XT57B: wipe, deaf, `reset`, `restore`, `lf hitag info` shows
+   the UID again - 17 s on the default path.
+ - **The ID8A probe analysed: three words in one code, none of which decode**
+   (docs/xt57b-fullread.md SS12.4, `tools/analysis/probe8a.py`). The TI-style command the VVDI
+   must send before it can open a session with a chip set to ID8A is a binary pulse-distance code
+   - constant ~184 us gap, intervals of 416 us (S) or 536 us (L) - and the gap width carries
+   nothing, so `xh_id8a_probe` is 98 bits. Its envelope is TI half-duplex: the 50.04 ms charge is
+   exactly the 50 ms Proxmark's own `WriteTItag` uses, and the long field-off afterwards is when
+   an HDX tag answers. New: the VVDI sends **three** words in this code, not one. An 18-symbol
+   word opens both captures and is also the entire XT136 reset preamble (`xt136.md` SS4.2); then a
+   second 98-symbol word goes out twice, each time followed by an XMICRO that gets no answer; then
+   the stored word six times, after which XHORSE reaches the chip - the same first-word /
+   last-word shape as the Megamos family. The second word is now written down for the first time
+   (Update 29 named it only "probe variant A"). None of the three decodes: no ASCII under any
+   expansion of S/L into 0-3 bits, no CRC-16 across 27,888 framings per word, not TI's write
+   encoding, and no all-zero address field. All are fixed constants, identical across every
+   capture, so they are not DST challenges - which is why replaying them works.
+ - **The 7935 back-door word decoded: it is a PCF7931 password frame** (docs/xt57b-fullread.md
+   SS12.11). Unlike the other two words it is not an opaque constant. The PCF7931 reader downlink
+   is pulse-position - a 128 T0 bit cell with one gap in it, at 34 T0 for a `1` and 98 T0 for a
+   `0` (`armsrc/pcf7931.c`) - so gap to gap gives 64, 128 or 192, which is the measured 65, 129,
+   193. The model predicts that the two transition symbols must strictly alternate, and across 29
+   of them they do, without exception. That makes the 57 symbols 58 bits, which is exactly
+   PCF7931's `1 password-indication bit + 56-bit password + 1 programming-mode bit` - and then the
+   frame stops, with none of the address, data or parity bits a write would carry. So the VVDI is
+   not writing anything; it presents a magic password, `10 01 22 44 66 88 AA` read LSB-first per
+   byte, to a PCF7935 - the part the chip has been told to be. Polarity and byte framing each
+   carry a caveat, documented in SS12.11; the firmware replays the measured symbols, so nothing
+   about what goes on air changes.
+ - **Why the Megamos word does not decode** (docs/xt57b-fullread.md SS12.4), re-measured from the
+   trace rather than from the stored constant. Its gaps are constant and the on-time carries the
+   symbol: cells of 33, 63 and 95 T0, i.e. one to three periods of ~32 T0, which is the EM4x70
+   reader link. Expanded on that rule the 46 symbols give 74 bits, and there it fails - the
+   command nibble reads `1100`, which is none of the six EM4x70 commands, and 74 matches no
+   EM4x70 frame length (6, 36, 70, 97). The pulse-position reading that works for the 7935 word is
+   ruled out outright: 18 repeats among 28 transition symbols. Also noted there: the shorter
+   bursts in the same captures (49 gaps, 8.9 ms) are not a third word but the ASCII probe
+   `XMICRO`, and the 33-gap ones are session frames.
+ - **181 exchanges of XMICRO keystream at nonce `CDB9AE8C`**, up from 23
+   (docs/xt57b-fullread.md SS12.9). The long session in `vvdi-xt157b-set-id33.pm3` turned out to
+   run at `CDB9AE8C` itself, not at the nonce the docs named, and its first 23 exchanges match the
+   table already in hand - so its later indices were reachable by the method that gave the first
+   ones. The recorded wire bytes fix `k0(i) & 0xF8` at every index because the plaintext opcode
+   family follows from the frame length; sending `(k0 & 0xF8) ^ x` is then always a read, and
+   sweeping `x` over 0..7 solves for the low three bits of `k0(i)` and for `K(i)` against the
+   eight known words of the block the session starts in. 181 of 184 indices solved, none
+   ambiguous, all 23 previously known reproduced exactly. Table in
+   `data/traces/xt57b/keystream/cdb9ae8c.txt`.
+ - `lf xhorse xt57 set -t 7935` - the ID33 / ID40..ID44 personality, which decrypting that session
+   shows is **not an image write but a wipe**: `7F` page 4 `<- 00000035`, then all ten addresses of
+   the emulated store filled (`5A5A0000`, `5A5A5A5A`, `00000000`, with `5A5A0707` at one slot).
+   182 exchanges do not fit one call - 560 script bytes and 64 responses per reply - so the
+   builder emits chunk marks and the runner splits the plan into five sessions at the same
+   power-up delay. 84 of 84 writes read back and verified on an XT57B.
+   **It needs `--wipe`**, because it overwrites the factory tables at addresses `00`, `01`, `03`,
+   `04`, `08` and `09` and nothing puts them back - not `lf xhorse xt57 restore`, and not the
+   VVDI's own reset, whose write session is seven configuration writes rather than an image. The
+   chip also goes deaf to XMICRO afterwards, but that part is recoverable (SS12.11); reading the
+   ten addresses first, 90 read-only exchanges in one session, is the only way to keep them.
+ - **The whole emulated store is channel A's two banks.** Addresses `00`-`07` of the XMICRO
+   session are bank 0's pages `0x00`-`0x3F` and `08`-`09` are bank 1's `0x00`-`0x0F`, matching
+   `xh_recipe()`'s `XHORSE_R_7935` case page for page including the odd one at `0x1F`. SS12.8 had
+   shown this for the image block; it holds for the whole store.
+ - `lf xhorse xt57 reset` takes `--at`, `--step`, `-n`, `--probe`, `--on` and `--word`, so the
+   burst can be walked over a frame as long as the emulated type makes it - the default +-640 us
+   suits ID11's 256 us frame, and the 7935 word steps 128 us so 32 positions walk one whole
+   4096 us frame.
+ - `lf xhorse xt57 nonce` takes `--powerup` (set the field-on delay while another gap is swept)
+   and `--presson` (send the select even when the identify went unanswered).
+ - `lf xhorse xt57 set` - **set which transponder an XT57B emulates**, the channel-B counterpart of
+   `lf xhorse configure` (docs/xt57b-fullread.md SS12.8). Takes `-t <type>` and `-u <uid>`, builds
+   the VVDI's own set session from a recovered keystream rather than replaying it, and reads every
+   write back. Types: `ID46`/`7936`/`7937`/`7946` (4-byte UID, 21 exchanges), `ID11`/`ID12`
+   (8-byte, 23) and `ID13` (5-byte, 23). Anything else is refused with its reason - `7935` wipes
+   64 pages, `ID48` needs 16, the Texas family writes bank 1 - none of which fit the 23 exchanges
+   of keystream recovered at the time. (`7935` was added once the keystream reached 181; see the
+   entry above.)
+   The decrypted set captures show the session is **the reset's two halves in the other order**:
+   the eleven-exchange `7F` config block, identical but for the type byte, and the block `00`
+   image, one write and one read-back per page. A broadcast type gets the image first, which is
+   what the VVDI does. The ID11 session never selects a block before its first write, so a session
+   starts on block `00`.
+   **The image block is the channel-A bank 0.** The ID11 half writes pages `2, 1, 4, 3, 0` - the
+   same pages in the same order as `xh_recipe()`'s ID11 case, derived from XT27A captures that
+   know nothing about XMICRO - and the ID46 half is that function's HITAG2 case. So `xh_bitrev8()`,
+   `xh_pack_em8()` and `xh_id13_stream()` move from `armsrc/xhorse.c` to `include/xhorse.h` and
+   both channels build their images with the same code.
+   Measured on an XT57B, every write read back and compared: `-t 7946 -u DE269A2F` 8/8, then
+   `lf search` -> `PCF 7946` / `DE269A2F`; `-t ID13 -u 20471BB01B` 9/9, then `lf em 410x reader`
+   -> `04E2D80DD8`; `-t ID11` and `-t ID12` 9/9 each, both broadcasting stable UID-derived
+   patterns that differ between the types. `lf xhorse xt57 reset` + `restore` recovers from each.
+ - **ID13's `--uid` is not the ID a reader sees.** `-t ID13 -u 20471BB01B` writes the four words
+   `docs/xt27a-datasheet.md` SS11.4 records from the VVDI's own captures for that UID, and on air
+   it reads as EM410x `04E2D80DD8` - the per-byte bit-reverse. Feeding `04E2D80DD8` in gives
+   `20471BB01B` on air. The encoding bit-reverses each byte going in, so the VVDI's user-ID field
+   and the EM410x ID are bit-reverses of each other. Both `set` and `configure` keep the VVDI's
+   convention so they agree; the help text now says so. This is the air side of SS11.4, which had
+   only ever been checked against the on-chip words.
+ - **Retraction: writing a broadcast type byte does not kill the session that writes it.** The
+   previous entry said the chip "stops answering in the middle of the session that wrote it".
+   A built set session reads back all four writes that follow `7F` page 4 `<- 01F0008C`, so the
+   chip answers XMICRO to the end; it is only from the **next power-up** that it talks first and
+   goes quiet. The replay that suggested otherwise was failing for some other reason. What stands
+   unchanged: the type byte is the whole arming mechanism, and the burst rewrites it.
+ - **Nonces are not equally reachable, and `restore` was pinned to a bad one.** The nonce a
+   power-up delay lands on drifts by a bit either way, so some sit on a plateau and some are hit
+   only now and then: stepping 2 us across 119500-119738, `CDB9AE8C` holds for about 10 us while
+   `6DCD7463` is interleaved with both its neighbours and turns up in roughly one sample in forty.
+   A session that misses its nonce silently does nothing, and `restore` - pinned to `6DCD7463`
+   because that is the nonce the VVDI's reset was recorded at - failed one run in three. Since a
+   built session is not tied to the nonce it was recorded at, `set` and `restore` now try each
+   recovered nonce in turn and run at the first one they land on, and both search with a 2 us step
+   instead of 8. `restore` keeps its behaviour otherwise and is now `set -t 7936` internally.
+
+ - **What arms an XT57B emulation is the type byte, and nothing else** (docs/xt57b-fullread.md
+   SS12.7), from decrypting the VVDI's "set transponder" sessions. `vvdi-xt157b-set-id11-*.pm3`
+   runs under nonce `CDB9AE8C`, whose keystream SS4 already gives, so it decrypts directly: it
+   writes the emulated image to block `00` first, then `7F` page 4 `<- 01F0008C`, page 5
+   `<- 00000049`, page 6 `<- 0000C900` then `00000000` - the same `7F` writes the reset makes,
+   differing only in the type byte (`8C` = ID11, `36` = 7936/ID46).
+   Measured by replaying that session onto a chip: writing `7F` page 4 with a broadcast code
+   **arms the emulation** - the VVDI writes the image first and the type word last, and the reset
+   can safely write its non-broadcast `0x36` first. (This entry originally said the chip stops
+   answering in the middle of the session that wrote it; see the retraction above - it answers to
+   the end and goes quiet from the next power-up.) And the `erase` burst **rewrites that
+   byte**: a chip armed with `01F0008C` reads back `01F00046` after `lf xhorse xt57 reset`, with
+   the emulated image untouched. So `erase` clears the type selection, not the memory.
+   **Retracts** the previous entry's conclusion that the enable was not among the pages the reset
+   writes. That test wrote back values read off the chip *after* the burst had neutralised them:
+   `01F00046` is not ID13's configuration, it is what the burst leaves behind - `0x46` is **7946**,
+   which does not talk first, while ID11, ID12 and ID13 all share `0x8C`.
+ - `0x33`, a fifth opcode, and a **negative result** on it. It is the only command that appears in
+   a set-to-ID11 session and not in a set-to-ID46 one (index 23, after the `7F` terminator), which
+   made it the obvious arming candidate; replaying the set session without it arms the chip just
+   the same, so it is not. Found by extending the `CDB9AE8C` keystream past index 20 - 21 `k0 3C`
+   / `K FEB31762`, 22 `82`/`60694C6A`, 23 `2C`/`91130817` - giving plaintexts `06`, `7F`, `33`.
+ - **Full cycle tested end to end**: a chip set to ID11 by replaying the VVDI's set session stops
+   answering XMICRO; `lf xhorse xt57 reset` frees it (via the sweep, -160 us off the VVDI's
+   offset); `lf xhorse xt57 restore` puts back `01F00036` and the factory image; `lf search` then
+   reports `PCF 7936` / `Hitag 2` with the UID written.
+
+ - `lf xhorse xt57 restore` - **rewrite an XT57B's factory ID46 personality**, the half of the
+   VVDI's reset that `lf xhorse xt57 reset` does not do. This is the first command in the project
+   that writes to a chip.
+   The frames are **generated, not replayed**: each is built from its plaintext opcode and value,
+   XORed with the recovered `k0(i)`/`K(i)` for nonce `6DCD7463`, with the CRC-8 taken over the
+   resulting ciphertext (SS5). That is what lets `--uid` choose the emulated UID while every other
+   write keeps the VVDI's value; with no `--uid` one is generated, as the VVDI does.
+   The keystream is nonce-specific, so the session must land on `6DCD7463`, and the power-up delay
+   that produces it differs per chip (119322 us on tag C, 119536-119544 on tag I). The command
+   searches for the nonce first, then runs the script at the delay that found it; `--base` and
+   `--span` narrow the search. Each write carries the VVDI's own read-back, with an explicit
+   2000 T0 gap for the ~16 ms programming time, and the command decrypts and compares it, so it
+   reports what is on the chip rather than what it sent.
+   **Tested end to end** on tag I, configured to ID13 and freed: `7F` page 4 `01F00046` ->
+   `01F00036` (type byte 46 -> 36, ID13 -> ID46), page 5 `0000004B` -> `00000049`, block `00`
+   pages 0-3 -> UID + `MIKRON` + HITAG2 config. All 8 read-backs matched, a second session under a
+   *different* nonce and keystream (`CDB9AE8C`) confirmed the same values independently, and the
+   chip then answered `lf hitag info` as a HITAG2 with the UID written - with a pinned UID
+   (`37786F1F`) and with a generated one (`7CD3F292`).
+   It runs backwards too - see the next entry, which **retracts** an earlier claim here that it
+   did not.
+
+ - **All three sessions of the XT57B reset are decrypted**, in all three traces
+   (docs/xt57b-fullread.md SS12.6). The reset makes three sessions, not one: a one-frame probe, a
+   session that reads the chip's identity, and the session that writes.
+   Session 2 runs under a second nonce, **`36E6BA31`** (answer `C64A3095`, reply
+   `703C397FC27ADBF5`, stream offset 38), whose keystream is recovered for indices 1-20 by the
+   same method. It selects address `7E` and reads pages 4-7, then selects `21` and reads page 7 -
+   i.e. the VVDI reads the three identity words before it writes anything. The select echo bytes
+   decrypt to `7E` and `21`, matching the command bytes, which is an independent check that did
+   not go into the solve.
+   The identity words read there, `59A41534 4146EDE2 99A9011D`, are **tag I's**, so the reset
+   captures are tag I being recovered - the chip SS11 recorded as configured and then reset.
+ - **A fourth opcode, `7F`** (docs/xt57b-fullread.md SS5, SS12.6). It ends every one of the three
+   sessions, under two different nonces and with three different wire bytes (`4C`, `68`, `A0`),
+   takes no operand and is never acknowledged. Finding it needed a different method, since with no
+   reply and no opcode family the trace pins nothing: fill the earlier indices with real reads and
+   try all 32 values of `k0(i) & 0xF8` at the index in question - exactly one makes it a valid
+   read and draws a reply.
+ - **The emulated UID is generated fresh for each reset.** The three traces write `37786F1F`,
+   `A5F9191A` and `FAF72412` to block `00` page 0 while everything else they write is identical,
+   so it is neither a fixed factory default nor the chip's own identity (tag I's dump has
+   `A50B2310` there). Noted in SS12.5, which previously implied a fixed default.
+   The id12 trace puts the two nonces on the opposite sessions from id11 and id13, so its writes
+   decrypt under the *other* keystream to the same plaintext - the strongest available check that
+   the recovery is right.
+
+ - **The XT57B reset's writes are decrypted** (docs/xt57b-fullread.md SS12.5), closing the last
+   open item on the reset. There are **8** of them, not the 11 an earlier draft counted, under
+   session nonce `6DCD7463`.
+   The keystream fell out without any guessing: the trace itself pins `k0(i) & 0xF8` at every
+   index, because a read's plaintext opcode is `00000AAA`, a write's `10000AAA` and a select's
+   `11011SSS`. A byte carrying those five bits therefore decrypts to *some* valid page read at
+   that index whatever its low three bits are, so sweeping the low three bits across eight
+   sessions gives eight replies per index; matching them against pages 0-7 read under `CDB9AE8C`
+   (the known keystream) solves the low three bits of `k0(i)` and all 32 bits of `K(i)`. All 20
+   indices resolved uniquely. Read-only throughout - every frame sent was an 8-bit read.
+   Checks: all 20 frames decrypt to correctly formed opcodes of their own family, and all 8
+   write/read-back pairs name the same page.
+   What the reset writes: `7F` page 4 <- `01F00036` (low byte `36` = the ID46/7936 type byte),
+   `7F` page 5 <- `00000049` (the constant SS11.3 found in every used chip and could not explain -
+   so it is written by the reset, not a serial), `7F` page 6 <- `0000C900` then `00000000`, and
+   block `00` pages 0-3 <- `37786F1F 4D494B52 00004F4E 06AA4854`. The last three are ASCII
+   `MIKRON` plus the HITAG2 config word and are byte-identical to what an XT27A carries after
+   `lf xhorse reset`, so the factory ID46 image is shared across the two families.
+   This turns SS11's before/after inference into measurement.
+   Tools: `data/traces/xt57b/nonce-captures/ks6dcd7463-{step1,step2,solve,decrypt}.py`.
+ - `lf xhorse xt57 nonce` - nonce `6DCD7463` added to the known table (answer `519F0319`, reply
+   `6B6E92C691C91277`) and `xt57_stream` extended by 3 bits to 71. It is the reset session's
+   nonce and sits at stream offset 39, immediately after `CDB9AE8C`; the client now reports
+   "reply matches" for it. Reachable on the bench at powerup 119544 us with `--off 45000`.
+
+### Fixed
+ - The back-door burst emitter accumulated every edge against one 16-bit precision-counter
+   reference, which is fine for the 16 ms "erase" word and the 19.6 ms Megamos one but overflows
+   on the 58.3 ms 7935 word (7290 T0 = 87,480 ticks). It now rebases the reference every 4000 T0,
+   which is exact modular arithmetic and leaves the two short words' timing unchanged.
+ - `docs/xt57b-fullread.md` SS12.10 concluded that a chip blanked to 7935 could not be brought
+   back, and that the burst's phase was not what was missing. The second half was right and the
+   first was wrong for the same reason: the word was. SS12.11 has the trace and the recovery, and
+   SS12.10 is kept as the record of what a wrong word costs.
+ - `lf xhorse xt57 nonce` reported an XMICRO ack for **any** 16 demodulated bits. A chip emulating
+   a talk-first type modulates all the way through the window and reads back as `5555`, which
+   looked like a healthy handshake at delays where nothing was listening. The flag now means the
+   `5AA5` ack and the table prints what came back instead.
+ - `docs/xt57b-fullread.md` SS12.8 said the long `set-id33` session was "183 exchanges under nonce
+   `1FF1A845`, for which nothing is recovered". `1FF1A845` is an answer, not a nonce; the session
+   is 184 reader frames at `CDB9AE8C`; and 23 exchanges of its keystream were already in hand.
+ - `docs/xt57b-fullread.md` SS5 - **the write frame's CRC-8 is over the ciphertext, not the
+   plaintext**. Poly `0x07`, init 0, computed over the five encrypted bytes, so it verifies on the
+   wire without the key: all eight writes in SS12.5 check that way and none checks the other way.
+   SS5 had described it as a CRC over the plaintext, which was inference from a frame this project
+   had never sent. Also noted there: the 40-bit keystream block covers the opcode and four data
+   bytes exactly, with the CRC outside it, so a write is the one command that uses the whole block.
+ - `docs/xt57b-fullread.md` SS4 - **retracted: there is no 20-exchange limit.** An earlier entry
+   here claimed the session supplies exactly 20 keystream blocks, because the trace's 21st frame
+   drew no reply and a 21-frame probe stopped at 20. Both observations have a different cause:
+   frame 21 is the `7F` command (SS12.6), which never draws a reply, so the probe byte built for
+   it was not a read either. The right byte gets an answer at index 21 at once, and index 21's
+   keystream is now in SS12.5's table. SS4's table stopping at 20 is how far it was measured, not
+   a limit of the chip.
+ - `lf xhorse xt57 reset` - **free an XT57B stuck emulating a broadcast transponder type**. Such a
+   chip transmits continuously and answers nothing on XMICRO, so none of the other xt57 commands
+   reach it; there was no recovery for it at all before. Sends the VVDI's exit-emulation
+   choreography, measured from `xhorse-XT57b-reset-from-id11/-id12/-id13.pm3` and identical in all
+   three (docs/xt57b-fullread.md SS12.1): two rounds of four downlink bursts, each in its own
+   power cycle (field off 70 ms, on, burst at +109.7 ms, window ends at +156 ms), a 568 ms drop
+   and an XMICRO probe after each round, 228 ms between rounds. The burst is the same generated
+   `"erase"` word the XT27A recovery sends - one emitter, shared - because the emulation core
+   listens for it whatever family the chip is.
+   The VVDI's own offset is tried first; if that fails the burst is walked outwards from it in
+   5 T0 steps (+-640 us, five ID11 frames), probing every 8 positions. **That is the normal path,
+   not the fallback**: an XT57B set to ID11 is not freed by the VVDI's offset at all, on any
+   retry - the same phase problem the XT27A's ID12 showed. The reply carries how far off the
+   nominal offset the freeing burst was, so the constant can be retuned.
+   `--force` sends the bursts even when the chip already answers, which is how the sequence is
+   exercised on a healthy chip.
+   **Scope**: this restores the channel, not the factory personality. The VVDI follows the burst
+   with 11 encrypted page writes under session nonce `6DCD7463`, whose keystream is not recovered
+   (SS12.5), and those are what make its reset permanent.
+   **Tested end to end** on one XT57B put into each of ID11, ID12 and ID13 with a VVDI. Each time:
+   confirmed stuck (no XMICRO), freed, answering as `XT57X` and reachable by `lf xhorse info`
+   afterwards, and idempotent on a re-run ("not stuck").
+
+   | from | freed in | by |
+   |------|----------|----|
+   | ID11 | 8.4 s | the sweep - the VVDI's offset failed 3/3 |
+   | ID12 | 4.3 s | the VVDI's offset, second round |
+   | ID13 | 2.4 s | the VVDI's offset, first round |
+
+   Note this is the **opposite** of the XT27A, where ID11 works on the nominal offset and ID12
+   needs the sweep. So the offset is not a property of the emulated type: the same type lands on
+   one chip and misses on another. It depends on the individual chip and the reader, which is why
+   both commands sweep rather than carrying a per-type constant.
+
+ - `lf xhorse xt57 nonce --post/--want` - send scripted reader frames after an authenticated XT57B
+   session and report each response with its CRC-8, so a recorded session can be replayed or rebuilt
+   frame by frame (@claude)
+ - `lf xhorse xt57 nonce --post` now carries a packed script instead of a 24 frame array, so a whole
+   VVDI session (183 frames) fits in one command; `--rfirst <n>` picks which 64 responses are
+   reported, and a long session is read out in a few passes (@claude)
+ - `lf xhorse xt57 nonce --selbits <n>` - send a select frame shorter than 13 bytes, so the
+   authenticate position can be probed with another command set's frames; a `--noanswer`
+   session may now also carry a `--post` script, for probing a mode that has no auth (@claude)
+ - `lf xhorse info` - prints the raw channel-B identify reply, not just the four ASCII family bytes;
+   a chip whose model word has been altered shows it in the fifth byte (@claude)
+
+### Fixed
+ - `lf xhorse reset` / `lf autel` - **the emulation-exit burst is now generated, not replayed**.
+   It was two tables of 43 and 47 measured pulse edges per chip family, copied into both
+   `armsrc/xhorse.c` and `armsrc/autel.c`, with a comment saying what it encoded was unknown.
+   It is a plain 125 kHz reader-to-tag downlink (docs/xt57b-fullread.md SS12.2): a start gap,
+   then one cell per symbol, each a field-ON time carrying the symbol followed by a gap. The EM
+   word that frees ID11/ID12/ID13 is 42 bits - a 2-bit preamble and a 40-bit value sent
+   least-significant-bit first, `0x6572617365`, the ASCII word **"erase"** - so it is now emitted
+   from that constant rather than from 86 numbers. The Megamos word (ID48/ID8E) is still
+   unexplained, so it is kept verbatim, but as 46 symbols instead of 94 edge positions. autel.c's
+   duplicate copy is gone; it calls `Xhorse_EmBurst()` (new, `armsrc/xhorse.h`).
+   Tested on an XT27A: configure to ID11, ID12, ID13, ID48 and ID8E in turn and recover each one.
+   All five round-trip.
+ - `lf xhorse reset` - **phase sweep when the first pass fails**. The burst only frees the chip
+   if it lands at the right point in the chip's broadcast frame, and the frame period differs per
+   type (ID11 RF/32, ID12 RF/40, ID13 RF/64), so one fixed offset can simply miss: an XT27A put
+   into ID12 here was not recovered by the nominal offsets - not by the new code and **not by the
+   old table-based code either**, so this is a pre-existing gap, not a regression. The first
+   attempt still uses the nominal offsets only, so the common case is as quick as before; later
+   attempts slip the burst in 5 T0 steps across a whole 40 T0 frame. That recovers the ID12 chip,
+   and ID11/ID12/ID13/ID48/ID8E now all round-trip repeatably.
+ - `docs/xt57b-fullread.md` SS12 - **how the VVDI frees an XT57B stuck in a broadcast emulation
+   mode**, from `xhorse-XT57b-reset-from-id11/-id12/-id13.pm3`. It is not a command on `XMICRO`
+   and needs no key, session or nonce: it is a fixed burst of 43 field dips, sent at +109.7 ms
+   into a 156 ms field-on window, 8 times in two rounds of four (226 ms apart inside a round,
+   1187 ms between rounds) with 70 ms power-cycles between (the fourth drop of a round 570 ms),
+   after which `XMICRO` is answered normally. **The burst decodes.** Split into gaps and field-on
+   times rather than measured edge to edge, it is an ordinary 125 kHz reader-to-tag downlink on
+   the T5577/ATA5577 physical layer - 43 gaps of 16-22 T0 and 42 on-times of either 14-17 or
+   43-46 T0, which are Proxmark's own `T55xx_Timing` defaults (write gap 17, bit 0 = 15,
+   bit 1 = 47). That makes it 42 bits: a 2-bit preamble `00` and a 40-bit payload sent
+   least-significant-bit first, `0x6572617365` - the ASCII word **`erase`**. The competing
+   EM4x05 forward-link reading (a `1` is *no* gap) is ruled out: it would make the burst 63 bits
+   with no two adjacent `1`s. Identical in **120 bursts over 11 traces**, the three XT57B
+   captures and eight year-older XT27A ones, settling an open question from
+   `implementation-plan.md` Update 14 (ID13 shares the ID11/ID12 burst). Activity drops 43 -> 4
+   across the first burst on ID11 and 40 -> 5 on ID13; ID12 is not silenced by the first burst,
+   the known phase sensitivity. With no tag on the pad no downlink burst is sent at all. New
+   tool: `tools/analysis/burstdecode.py`; also `tools/analysis/emburst.py`,
+   `tools/analysis/emsilence.py`.
+   Corrects two things in the first draft of SS12: the burst is sent **eight** times, not four,
+   and the ID48/ID8E word is **not** 47 binary intervals - its on-times take three values (~16,
+   ~45, ~80 T0, cells of 33/65/100), so it is not a two-symbol frame. A reset round sends two
+   such words, differing by one gap, and only the second frees the chip:
+   `00100100111101010000111021001112000111000201002` goes out twice and does not,
+   `0200100111101010000111021001112000111000201002` goes out last and does - confirmed on an
+   XT27A. Neither decodes to ASCII under any expansion of the three symbols into bit strings of
+   length 0-3, either polarity, either bit order, any preamble up to 12 - still open.
+   Also still open: the 11 writes that make the reset permanent are under session nonce
+   `6DCD7463` and undecrypted, but the trace carries the VVDI's answer `519F0319` for it, so they
+   are recoverable.
+ - `docs/xt57b-fullread.md` SS11 - **a ninth chip (I), and a correction**. Tag I first read as an
+   **EM4x70** with `lf hitag info` silent and every XMICRO session returning *no ack*: it had been
+   configured to emulate another transponder family, and answered normally after a reset. So the
+   XT57B's car-facing personality spans families, not just HITAG2/ID46, and the tool-facing
+   channel is unreachable while it is set up as one of the others - a chip that does not answer
+   `XMICRO` has not necessarily failed. Its identity words survived the round trip intact.
+   **Correction:** SS11.3 called `49` at `7F` page 5 a collision between A and E and concluded the
+   field could not be a serial. That compared a used chip's overwritten word with a fresh chip's.
+   Both used chips (A and I) read exactly `00000049`, so that is a constant written by
+   configuration; across the seven chips still holding the factory value, all seven bytes are
+   **distinct**. The field is now undetermined - consistent with a per-chip value and with a batch
+   code - rather than ruled out. The conclusion on the ten identity bytes is unchanged: distinct on
+   all nine, no structure, not a readable serial.
+ - `docs/xt57b-fullread.md` - **page existence is now proven, not assumed: 280 of 288 exist**.
+   The forward/backward pass cannot decide the interior of an all-zero block, where a latched zero
+   and a stored zero are the same byte; the earlier note's "on the other 34 blocks every page is
+   real" overstated what it had measured. 203 pages were settled by the two passes across eight
+   chips, leaving 77. Those were settled by priming the latch - read a known non-zero page, select
+   the block, read the page under test first: the primer coming back means the page does not
+   exist. All 77 are real, with four controls (two known-real, two known-absent) correct in the
+   same run. The absent set is exactly `7E` pages 0-3 and `7F` pages 0-3, so the chip holds 1120
+   bytes of real storage in 1152 bytes of address space. New: `exists.py`, `pageprobe.py`,
+   `pageprobe-C.json`.
+ - `docs/xt57b-fullread.md` SS11 - **eight chips read and compared; there is no readable serial
+   number**. Seven factory-fresh XT57Bs plus the one programmed chip, each read forwards and
+   backwards. Among the seven fresh chips **9 of 280 existing pages differ**: the emulated HITAG2
+   UID at `00` page 0, three identity words at `7E` pages 4-6, and one byte at `7F` page 5 (the
+   last four mirrored at `21` pages 2-4 and `20` page 1). Everything else - every factory table,
+   the `2600CC57...` block at `04`, the fixed table at `20` - is byte-identical. The ten identity
+   bytes are distinct on all eight and show no structure: no shared prefix, no ordering, no
+   low-entropy field, bit balance where eight random samples would sit. `7E` page 6 ends `011D` on
+   all eight, so it is 10 bytes plus a type field. The `7F` byte **collides** (A and E both `49`),
+   so it is not a serial either, and it is not a checksum over the identity or the UID under sum,
+   XOR or CRC-8 in either byte order. Per-chip reach parameters recorded too: the power-up base
+   for nonce `CDB9AE8C`, and that tag H needs a 100 ms field-off where 45 ms suffices for the rest.
+   Tag C was re-read directly rather than converted from its pre-SS18.10 dump; the two agree on
+   all 288 pages, an independent check on SS18.10's `page = slot ^ 4`. Artefacts:
+   `full<A-H>.json`, `full<A-H>-rev.json`, `cmp.py`, `corpus.txt`.
+ - `data/traces/xt57b/store-dump/fullread.py` - **a page that does not exist returns the previous
+   read's value**, not zero; a select does not clear the latch. Only blocks `7E` and `7F` have
+   absent pages (0-3), so the common area is two half blocks of 16 bytes. Found when tag B showed
+   its UID four times where tag C had shown zeros - both artefacts of the preceding read. The
+   script now takes `--rev` (read pages 7-0; a page disagreeing with the forward pass does not
+   exist), `--find` (sweep the power-up delay for the wanted nonce), `--base`, `--off` and `--uid`.
+   `docs/xt57b-fullread.md` and SS18.9 corrected.
+ - `docs/xt57b-fullread.md` (new) - **a complete, standalone read-out of the chip**: the session
+   shape and handshake, the per-exchange 40-bit keystream and how it covers each frame type, the
+   three Hitag Pro commands with their plaintext encodings, the 8-bit `segment:block` address space
+   with its ignored alias bit, the full 36-block dump with all eight pages of each, an annotated
+   20-exchange transcript decrypted frame by frame, and what is still unknown. Written for a reader
+   with no prior knowledge of the XT57B. Read-only: 8-bit page reads and 16-bit selects only.
+ - `docs/xt57-auth.md` SS18.10 - **`OPC = 0x04`, not `0x00`**. SS13.3 and SS17.4 left the low three
+   bits of the command-keystream byte an explicit free choice and took `0`; the full read measures
+   them three independent ways - the decrypted echo is the address exactly, the factory counter
+   tables ascend in page order, and the VVDI's HITAG2 image lands at page *n* for HITAG2 page *n*.
+   Two of the three measure the bits through the read's page field and one through the select's
+   segment field, and they agree. Every `k0` is XOR 4 (`k0(12) = 7F`, `k0(2) = A4`), the index-12
+   select mask is `7F1E`, and `byte0 & 7` is now the segment number directly. The common area of
+   SS18.9 relabels to segment 3, addresses `7E`/`7F`, which is the form the VVDI sends; its select
+   of the main store decrypts to `D800`, the block the transponder image is written to and the
+   power-on default. No measured value moves - `K`, the data and the address map are unaffected.
+ - `docs/xt57-auth.md` SS18.9 - **the common area at `FE` and `FF` dumped**. Segment 7 blocks
+   `1E`/`1F`, canonical selects `A400`/`A401`, read live on tag C: three used words each and five
+   zero, eight slots being the whole block since the read opcode `00000AAA` has a three-bit page
+   field. It is SS16.4's identity group - what SS15.3's labelling called `0:00` and `0:01` - so the
+   ten per-chip bytes with the constant `011D` tail live in the common area, not in a segment. That
+   also explains SS16.4's aliases: old `2:1E`/`2:1F` are the two blocks of segment 1, and a read
+   there runs past them into the common area, wrapping the page field. Weak support for SS18.7's
+   common-area reading, not proof: selecting `FE` or `FF` returns four pages and then nothing,
+   where an ordinary block's read runs on, so the pair is at the end of the address space - but it
+   still answers to segment bits 3/7, not the `0` that `D8FF` encodes. Artefacts:
+   `data/traces/xt57b/store-dump/common.py` and `common.txt`.
+ - `docs/xt57-auth.md` SS18 - **the select keystream byte 1 is measured, so the select decrypts**.
+   The 40-bit block of SS7.2 is one contiguous stream, so a 16-bit select takes `k0` over byte 0,
+   `K >> 24` over byte 1 and `(K >> 16) & FF` over the tag's echo. `K` was unknown at the two
+   select positions, so both were read instead - index 1 accepts a read (SS9.1's failed attempt
+   there sent index 2's opcode), and index 12's eight read bytes must lie in `78`-`7F` - each
+   anchored on the eight words of the no-select default group, seven 32-bit checks apiece:
+   `K(1) = B0CD03E4`, `K(12) = 1E2BB45E`, the latter matching a VVDI capture in SS7.2. Confirmed by
+   sending one plaintext select (`DD01`) at indices 2, 3, 6, 7 and 12: five different ciphertexts,
+   all opening the same address, all five echoes decrypting to the same byte. Canonical select
+   plaintext = on-air `^ 7B1E`; segment = `(byte0 & 3) ^ 3`, block = `byte1 ^ 1E`. The VVDI's three
+   selects are segment 7 block 1E, segment 5 block 01, segment 4 block 00. Also: the tag's echo is
+   `[g(segment)][block & F]` in plaintext; `k0(12)` is `7B` and `k0(1)` `7A`, correcting SS17.4's
+   `78`/`79`, which had chosen the low three bits rather than measured them; a select is accepted
+   at a read index, so SS17.8's "one upper-five-bit pattern per index" is the wrong reading of
+   SS9.1 step 3. It does **not** settle SS17.11: the awkward group is the two blocks at the top of
+   the block space (`FE FF`), which look like Hitag Pro's common area but answer under the wrong
+   segment bits (`selks.py`, `selks.txt`, read-only) (@claude)
+ - `docs/xt57-auth.md` SS17.10/SS17.11 - **the XT57B decodes 36 of its 128 addresses, not 128**.
+   All 256 selects opened at index 1 and read at indices 2-5 (`shallow.py`, `tagC-shallow.json`,
+   read-only): an address returning the live page 0 at all four is not decoded. 92 of 128 are
+   not there at all, so SS15.4's "103 all-zero" was 92 undecoded plus 11 decoded-but-empty.
+   Measured on tag C alone, the map predicts the other two chips exactly - every address holding
+   data on any of the three falls inside it, 25/25 on tag A and 10/10 on B and C. Real storage is
+   1152 bytes; 4096 is the address space. The map (one group of 32 blocks, two of 2 in different
+   bit-4 halves, one empty) is expressible in Hitag Pro's segment configuration only as 8
+   segments of 16 blocks, since `blockCount` is a nibble - so SS17.3's 4x32 reading is the less
+   likely one (@claude)
+ - `docs/xt57-auth.md` SS17.8/SS17.9 - Hitag Pro's 24-bit `WriteByte` (`0xA0 | page | bytenum<<3`)
+   probed on tag C, `bytenum` 0-3 at exchange indices 2 and 3: every frame drew no response and
+   ended the session, which is only SS9.1's validity rule refusing a non-read opcode at a read
+   index. A real test needs a write index, and it cannot be made a no-op - the write opcode
+   addresses a different space whose current contents cannot be read first (SS15.5) - so it needs
+   a tag chosen to be spent. Correction: the probe address was picked as all-zero from the dump
+   but is a shallow-index **fallback** - selected at index 1 it returns the live page 0 at indices
+   2, 3, 4 and 5 - so the intended no-op guarantee did not hold; nothing was written only because
+   every frame was refused - confirmed by a full re-dump of all 128 addresses afterwards, byte-
+   identical to the original at 256/256 selects
+   (`data/traces/xt57b/store-dump/tagC-after-writebyte-probe.json`). This also gives a test that separates an
+   unimplemented address from an empty one, so SS15.4's "103 all-zero" is an upper bound on empty
+   storage, not a count of it (@claude)
+ - `docs/xt57-auth.md` SS17.6/SS17.7 - the Hitag Pro **plain-mode authenticate is refused** by the
+   XT57B, so the segment configuration cannot be read from the reader side. Probed read-only on
+   tag C: all 256 first-byte values at 104 bits (only `C0`-`C7` answer), every frame length from
+   8 to 104 bits with `FF` + IDE (nothing at any length), and the known-good `C0` frame at every
+   length (103 bits refused, 104 accepted - the chip counts bits). `C0`-`C7` are not modes: all
+   eight authenticate on the same recorded answer, the post-auth keystream is byte-identical
+   under all eight, and the only difference is `reply(Cx) = reply(C0) XOR (x in all 8 bytes)` -
+   three bits that pass through the authentication function linearly. Steering a tag back onto a
+   known nonce needs `--off 45000`; at the default 20000 us the orbit holds no known nonce
+   (@claude)
+ - `docs/xt57-auth.md` SS17 - **the XT57B's memory format is Hitag Pro**, and with it the last
+   unknown constant of the command keystream. Matched against the four Hitag XMA variants
+   implemented by the Hitager project (`reference/hitager/`): `Hitag2 + EE`, `Hitag2 Extended` and
+   `Hitag AES` are excluded (5-bit command plus inverse, at most 2048 bytes). `HitagPro.cs` matches
+   every frame the XT57B sends - the 4-bit `0011` IDE read with its 32-bit truncation, the 16-bit
+   `0xD800 | segment << 8 | block` select, the 8-bit `0x00 | page` read, the 48-bit
+   `0x80 | page` + 32-bit data + CRC-8 (poly 0x07) write, the 32-bit page, and 8 segments x 16
+   blocks x 8 pages x 32 bits = 4096 bytes, exactly the measured store size. `SuperChip.cs` (VVDI
+   Super Chip / XT27A) is the same code, so Xhorse already ships Hitag Pro. Index 6 is the one
+   index driven both as a select and as a read, and the keystream there is command-independent, so
+   the measured `C8`-`CF` select window decrypts to Hitag Pro's `1101 1AAA` only if the top five
+   bits of `OPC` are zero: **`OPC = 0x00`, `k0(2) = A0`**, and SS13.3's `d(i)` table becomes the
+   absolute command keystream rather than a relative one (@claude)
+ - `docs/xt57-auth.md` SS16.4 - a third XT57B dumped. Its UID was read first and used as a
+   prediction: address `3:1E` slot 4 decrypts to `95298F14`, matching `lf hitag info` exactly, on a
+   second chip nothing was fitted to. Tags B and C are byte-identical at 123 of 128 addresses, so
+   the entire per-chip content of a fresh XT57B is five words: three identity words at `0:00`
+   (aliased at `2:1F`), one 16-bit field at `0:01` (aliased at `2:1E`), and the ID46 page 0. The
+   identity words carry a constant `011D` tail and are independent of the emulated UID (@claude)
+ - `docs/xt57-auth.md` SS16 - a second XT57B dumped and diffed against the first. The decryption is
+   verified on a chip it was not derived from: address `3:1E` slot 4 decrypts to `11D89614` and
+   `lf hitag info` on that tag reports exactly that UID, while `"MIKR"`/`"..ON"`/config stay
+   byte-identical across both tags. 102 of 128 addresses identical (all zero), 26 differing; tag A
+   is programmed (VW part number, `CAFECAFE`, record templates), tag B near-blank but carrying
+   ascending index tables. The key is global - same 64-bit reply from both tags - but the nonce
+   timing is per-tag (base 119296 vs 119568), so SS13's recipe needs re-steering per chip (@claude)
+ - `docs/xt57-auth.md` SS15 - **the XT57B store is read out in full**: 128 addresses, 1024 words,
+   4096 bytes, at nonce `CDB9AE8C`, read-only (16-bit selects and 8-bit reads, nothing written).
+   The unknown opcode byte cancels out of the addressing (`on-air byte = A0 ^ d(i) ^ s`), so the
+   five unmeasurable bits of SS13.3 are not needed. The last unknown keystream constant is measured,
+   `D = 4D494B1B`, confirmed by a known word read at a deep index and by address `3:1E` decrypting
+   to the stored ID46 image - page 0, `"MIKR"`, `"..ON"`, config - in ASCII. The whole session
+   keystream is now absolute. Dump and scripts in `data/traces/xt57b/store-dump/` (@claude)
+ - `docs/xt57-auth.md` SS12.3 - the select decode was wrong. Byte 1 bits 3 and 4 are address bits,
+   not ignored bits, so the store is 128 addresses and not the 8-per-position that was swept; and
+   the three select positions address one space through an XOR offset on the select value, not the
+   disjoint sets SS13.5 claimed. Verified by predicting index-1 selects for groups found at index 12
+   (@claude)
+ - `docs/xt57-auth.md` SS14 - the generator hunt, redone against the corrected keystream: not a linear
+   recurrence in any of six bit orderings, not states of the public nonce register, not an affine
+   filter of it at any offset to 20,000 clocks, not a quadratic one, and `k0` is not a byte of the
+   data keystream. The exhaustive HITAG2 filter-generator state recovery over the anchored 160 bits
+   has **completed with a null in both bit orders**: of all 2^48 states, none produces that
+   keystream MSB-first or LSB-first, so the channel is not HITAG2's cipher clocked as a contiguous
+   40-bits-per-exchange stream however the bits are ordered. 2 h 45 min and 2 h 43 min on 32
+   threads, guided DFS, ~2^43 node visits each, validated against a planted state. What survives:
+   a per-exchange block function of (key, nonce, index), now the leading hypothesis, and a
+   HITAG2-like core with Xhorse's own taps or filter constants (@claude)
+ - `docs/xt57-auth.md` SS13 - the XT57B **command** keystream is recovered for a whole session, up to
+   one unknown byte: the write opcode is the read opcode XOR `0x80` in plaintext (seven independent
+   confirmations), the plaintext command byte does not depend on the exchange index, and two measured
+   cross-window links join every index into one chain. The five remaining bits are the plaintext read
+   opcode, which the protocol never transmits in clear (@claude)
+ - `docs/xt57-auth.md` SS13.4 - 13 of the 17 data-keystream values were wrong, inherited from the
+   "HITAG2 pages 0-7 in order" assumption SS9.1 step 6 refuted. The `A5AE`/`A5AF` window is corrected
+   absolutely (anchored on the live emulated page 0); the other two windows are corrected relative to
+   each other and left with one unknown 32-bit constant, since the VVDI traces show the word index 7
+   reads is the same on two different tags and so cannot be the live page 0. Replays were unaffected
+   (a write and its read-back share the error) (@claude)
+ - `docs/xt57-auth.md` SS12 - the memory map was about three times too large: every exchange between
+   two selects returns the *same* eight words, so an ID46 session reaches 24 words (96 bytes), not 72
+   addresses. `T1`/`T2`/`T3` of SS7.6 are one set of words, not three (@claude)
+ - `docs/xt57-auth.md` - the post-auth keystream at exchange indices 13-20 was off by a constant
+   `0x000C0000`; corrected, and the missing index-5 word (`6CC0FE4B`) recovered (@claude)
+ - `docs/xt57-auth.md` SS9.1 - the XT57B *command* keystream depends on the 104-bit select payload,
+   not on the nonce alone: a chip whose family string has changed answers none of the recorded
+   command bytes. The data keystream is unaffected and stays a function of (nonce, index) (@claude)
+ - `docs/xt57-auth.md` SS9.1 step 9 - the family/model identifier is not address `13` of the `A5AF`
+   window. It is the write-mode window's index-2 location, which reads `00000000` on an undamaged
+   chip; a non-zero value there is what makes an XT57B report `XT5F`. Writing zero back restores
+   `"XT57X"` (@claude)
 - Added `lf autel` - Autel AT100 programmable transponder support: `list`, `dump`, `read`, `write`, `configure`, `reset`. 18 emulated types, each image replayed byte-for-byte from a decrypted Autel capture. Reads and reconfigures a chip in any emulated type, including the talk-first EM4102 types (ID11/ID12/ID13), which need a wider reader gap than the Hitag default. See `docs/at100.md` (@en4rab)
 - Changed `lf autel` session open - a real power-down is tried first instead of the DOUT-only field gap, which a continuously-transmitting chip does not reboot from; a chip emulating ID4C now reads 8/8 where it managed 4/33 (@en4rab)
 - Added `g_hitag_t_low` - the reader's field-off pulse width is now settable at runtime instead of fixed at `HITAG_T_LOW`; `lf autel` uses 12 T0, matching the Autel programmer's own gaps, and restores the default on teardown (@en4rab)

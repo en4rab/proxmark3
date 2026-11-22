@@ -557,6 +557,38 @@ XT27B reports itself as `XT37`. The byte after the family name varies; it may be
 channel-B encryption, as the `7372` reply is for channel A. The channel-B management protocol that
 follows is not decoded.
 
+# XT57B: scripted post-auth frames (`--post`)
+^[Top](#top)
+
+`lf xhorse xt57 nonce` can send a list of reader frames after an authenticated session and report
+each response with its CRC-8:
+
+```
+lf xhorse xt57 nonce --off 45000 --sweep powerup --base <us> --step 0 -n 20 \
+    --answer <32-bit> --want <nonce> --post "bits:hex[:gap],bits:hex[:gap],..."
+```
+
+`--want` makes the firmware retry sessions until that nonce comes up, because the keystream is a
+function of the nonce and a script is only meaningful at the nonce it was built for. Gaps are in T0
+since the last tag edge and default to the VVDI's (1408 for the first frame, 190 after a response,
+1390 after a write's ack).
+
+A whole session reads with no write in it: at an index where the VVDI sends a 48-bit write, send an
+8-bit trigger whose byte is the write opcode **XOR 0x80**, and flip the low bit of each 16-bit
+window select. The trigger's low three bits pick one of eight addresses in the window, so sweeping
+them dumps the window. See `docs/xt57-auth.md` SS10 in the project folder for the chain, the
+keystream table and a dump.
+
+The script is sent as a packed byte stream (`[bits][data..]`, or `[0x80|bits][gap_lo][gap_hi][data..]`
+for an explicit gap), so a whole VVDI session - 183 frames - fits in one 624 byte command. Only 64
+responses come back per call; `--rfirst <n>` says which frame the first of them belongs to, so a long
+session is read out in a few passes.
+
+`--select <13 bytes>` matters on a chip whose family string is not `XT57`: the keystream depends on
+the select payload, so a chip identifying itself as, say, `XT5F` answers none of the command bytes
+recorded from an `XT57` session. Build the select from the identify reply, which `lf xhorse info`
+now prints in full.
+
 # Open questions
 ^[Top](#top)
 

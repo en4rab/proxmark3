@@ -32,6 +32,75 @@
 // An XT136 has pages 0x00..0x0F; a read of a higher address aliases back into them.
 #define XHORSE_XT136_PAGES  16
 
+//-----------------------------------------------------------------------------
+// Emulated-image encoders
+//-----------------------------------------------------------------------------
+// The emulated image is the same on both channels: an XT27A's channel-A bank 0 and an XT57B's
+// XMICRO block 0x00 hold the same words in the same pages (docs/xt57b-fullread.md SS12.8).  So
+// these live here rather than in armsrc/xhorse.c: the firmware builds channel-A images with
+// them, the client builds XMICRO session scripts with them.
+static inline uint8_t xh_bitrev8(uint8_t b) {
+    b = (uint8_t)(((b & 0xF0) >> 4) | ((b & 0x0F) << 4));
+    b = (uint8_t)(((b & 0xCC) >> 2) | ((b & 0x33) << 2));
+    b = (uint8_t)(((b & 0xAA) >> 1) | ((b & 0x55) << 1));
+    return b;
+}
+
+// ID11/ID12 bitrev packing -> image pages 0x00..0x04 (header passed in).
+static inline void xh_pack_em8(const uint8_t *uid, uint16_t header, uint16_t pages[5]) {
+    uint8_t r[8];
+    for (int i = 0; i < 8; i++) {
+        r[i] = xh_bitrev8(uid[i]);
+    }
+    pages[0x00] = header;
+    pages[0x02] = (uint16_t)((r[0] << 8) | r[1]);
+    pages[0x01] = (uint16_t)((r[2] << 8) | r[3]);
+    pages[0x04] = (uint16_t)((r[4] << 8) | r[5]);
+    pages[0x03] = (uint16_t)((r[6] << 8) | r[7]);
+}
+
+// EM4102-encode 5 (already bit-reversed) bytes into a 64-bit stream, then
+// bit-reverse each output byte -> 8 bytes, matching ID13.
+static inline void xh_id13_stream(const uint8_t *uid5, uint8_t out8[8]) {
+    uint8_t rb[5];
+    for (int i = 0; i < 5; i++) {
+        rb[i] = xh_bitrev8(uid5[i]);
+    }
+    uint8_t bits[64];
+    int n = 0;
+    for (int i = 0; i < 9; i++) {
+        bits[n++] = 1;             // 9 header ones
+    }
+    uint8_t col[4] = {0, 0, 0, 0};
+    for (int by = 0; by < 5; by++) {
+        for (int half = 0; half < 2; half++) {
+            uint8_t nib = half ? (rb[by] & 0x0F) : (rb[by] >> 4);
+            uint8_t row[4] = { (uint8_t)((nib >> 3) & 1), (uint8_t)((nib >> 2) & 1),
+                               (uint8_t)((nib >> 1) & 1), (uint8_t)(nib & 1)
+                             };
+            uint8_t rp = 0;
+            for (int k = 0; k < 4; k++) {
+                bits[n++] = row[k];
+                rp ^= row[k];
+                col[k] ^= row[k];
+            }
+            bits[n++] = rp;        // even row parity
+        }
+    }
+    for (int k = 0; k < 4; k++) {
+        bits[n++] = col[k];        // even column parity
+    }
+    bits[n++] = 0;                 // stop bit  -> 64 bits total
+
+    for (int i = 0; i < 8; i++) {
+        uint8_t v = 0;
+        for (int b = 0; b < 8; b++) {
+            v = (uint8_t)((v << 1) | bits[i * 8 + b]);
+        }
+        out8[i] = xh_bitrev8(v);   // bit-reverse each byte
+    }
+}
+
 // Channel-A family that answered (lf_xhorse_info_t.family).  XT136: doc/xhorse_notes.md.
 typedef enum {
     XHORSE_FAM_NONE = 0,
@@ -90,6 +159,8 @@ typedef struct {
     uint8_t  page_ok[8];      // bit (n % 8) of byte n / 8 set => two consecutive reads of page n agreed
     uint8_t  family;          // xhorse_family_t
     uint16_t seed_reply;      // the tag's reply to 7372 (XT27A) / E430 (XT136) that seeds the cipher
+    int16_t  em_slip_us;      // `xt57 reset`: how far off the VVDI's nominal burst offset the
+                              // burst that actually freed the chip was, in us (0 = the nominal one)
 } PACKED lf_xhorse_info_t;
 
 // Client -> firmware payload for `lf xhorse read` / `lf xhorse write`: the raw channel-A page
@@ -123,10 +194,35 @@ typedef struct {
 // Session: field on, XMICRO -> 0x5AA5, 0011 -> "XT57X", 104-bit select -> 32-bit nonce, 32-bit answer -> 64-bit reply.
 // The answer and reply depend only on the nonce; XHORSE_XT57_KNOWN lists the (nonce, answer, reply) triples seen
 // from a VVDI mini, X(nonce, answer, reply_hi, reply_lo).
-#define XHORSE_XT57_KNOWN     X(0x2CFE132E, 0xFB33A1F1, 0xE58572D5, 0xE585F912)     X(0x59FC265C, 0x4FBDCA62, 0xB1F0879E, 0x404AFF59)     X(0xB3F84CB9, 0x2E21740A, 0xCC4B51BC, 0x6A69F0B3)     X(0x67F09973, 0x99AAEF6B, 0x55B462CA, 0x132478D0)     X(0xCFE132E7, 0xA9CBEA5B, 0xB72636B1, 0x155D7F00)     X(0x9FC265CF, 0xC9ABF021, 0x983E9981, 0x0367AD7A)     X(0x7F09973E, 0xA0D63F3E, 0x93D4AEEB, 0x592AE381)     X(0xFE132E7C, 0x7CCA106D, 0x6BECC747, 0x19267F38)     X(0xFC265CF9, 0xF24F7DBA, 0x919B81F2, 0x37FC0428)     X(0xF9B735D1, 0x914F41D0, 0xE4F40216, 0xE2070455)     X(0xCDB9AE8C, 0x1BA796D1, 0x79B67285, 0x0078F49D)
+#define XHORSE_XT57_KNOWN     X(0x2CFE132E, 0xFB33A1F1, 0xE58572D5, 0xE585F912)     X(0x59FC265C, 0x4FBDCA62, 0xB1F0879E, 0x404AFF59)     X(0xB3F84CB9, 0x2E21740A, 0xCC4B51BC, 0x6A69F0B3)     X(0x67F09973, 0x99AAEF6B, 0x55B462CA, 0x132478D0)     X(0xCFE132E7, 0xA9CBEA5B, 0xB72636B1, 0x155D7F00)     X(0x9FC265CF, 0xC9ABF021, 0x983E9981, 0x0367AD7A)     X(0x7F09973E, 0xA0D63F3E, 0x93D4AEEB, 0x592AE381)     X(0xFE132E7C, 0x7CCA106D, 0x6BECC747, 0x19267F38)     X(0xFC265CF9, 0xF24F7DBA, 0x919B81F2, 0x37FC0428)     X(0xF9B735D1, 0x914F41D0, 0xE4F40216, 0xE2070455)     X(0xCDB9AE8C, 0x1BA796D1, 0x79B67285, 0x0078F49D)     X(0x36E6BA31, 0xC64A3095, 0x703C397F, 0xC27ADBF5)     X(0x6DCD7463, 0x519F0319, 0x6B6E92C6, 0x91C91277)
 
 #define XHORSE_XT57_SELLEN   13      // select frame: 0xC0 "XT57" + 8 payload bytes (104 bits)
+
 #define XHORSE_XT57_MAXSESS  16      // sessions per firmware call (the reply must fit one packet)
+
+// Post-authentication frame script.  The traffic after the 64-bit reply is XORed with a keystream
+// fixed by (nonce, exchange index) alone - not by time and not by the command byte (doc/xt57-auth.md
+// SS7.2, SS9.1).  So a session recorded at a nonce we can steer to can be replayed frame by frame,
+// and any frame whose index keystream is known can be rebuilt to carry a chosen plaintext.  A frame
+// at the wrong index is not a valid command and kills the session, so the script must keep the
+// recorded length and index of every exchange it does not mean to change.
+#define XHORSE_XT57_MAXPOST   64     // responses returned per call
+#define XHORSE_XT57_POSTBYTES  6     // longest reader frame: a 48-bit write
+#define XHORSE_XT57_RESPBYTES  8     // longest tag response kept
+#define XHORSE_XT57_SCRIPTBYTES 560  // packed script: a whole VVDI session fits
+
+// The script is a packed byte stream, one record per frame, so that a 180-frame session fits in a
+// single 624 byte command:
+//
+//   [bits]            1..48, MSB-aligned data follows in ceil(bits/8) bytes
+//   [0x80 | bits]     the same, but a 16 bit little-endian gap_t0 comes first (0 => default)
+//
+// A bits byte of 0 ends the script.
+
+typedef struct {
+    uint8_t  bits;                          // bits demodulated (0 => the tag said nothing)
+    uint8_t  data[XHORSE_XT57_RESPBYTES];
+} PACKED xt57_presp_t;
 
 // Which gap `base + i * step` is applied to.
 typedef enum {
@@ -148,13 +244,39 @@ typedef struct {
     uint8_t  sweep;           // xt57_sweep_t
     uint8_t  answer_mode;     // xt57_answer_t
     uint8_t  count;           // sessions this call, 1..XHORSE_XT57_MAXSESS
-    uint8_t  rfu;
+    uint8_t  selbits;         // bits of select[] to send, 0 => XHORSE_XT57_SELLEN * 8 (104)
     int32_t  base;            // swept value of session 0
     int32_t  step;            // added per session
     uint32_t answer;          // for XT57_ANS_FIXED
     uint32_t off_us;          // field-off time before every session, us (0 = 20000)
+    uint32_t powerup_us;      // field-on -> XMICRO, us (0 = the VVDI's 120140).  Overridden by
+    //                           the sweep when that is XT57_SWEEP_POWERUP.
+    uint8_t  press_on;        // send the select even when the 0011 identify went unanswered -
+    //                           a diagnostic for a chip that acks XMICRO and nothing else.
     uint8_t  select[XHORSE_XT57_SELLEN];
+    // Post-auth script.  Only run when the session's nonce equals `want` (or want == 0), because a
+    // swept delay lands on the wanted nonce only now and then and the keystream is nonce-specific.
+    uint8_t  npost;           // frames in script[], 0 => no script (plain nonce logging)
+    uint8_t  rfirst;          // 1-based index of the first frame whose response is returned (0 = 1)
+    uint16_t scriptlen;       // bytes used in script[]
+    uint32_t want;            // required nonce, 0 => any
+    uint8_t  script[XHORSE_XT57_SCRIPTBYTES];
 } PACKED lf_xhorse_xt57_t;
+
+// `lf xhorse xt57 reset` parameters.  The burst has to land at a particular phase of the chip's
+// broadcast frame, and the frame length is a property of the emulated type: 256 us for ID11 at
+// RF/32, but 4096 us for a blanked PCF7935 (docs/xt57b-fullread.md SS12.11).  So how far the
+// sweep walks has to be settable, or a type with a long frame is never freed.
+typedef struct {
+    uint8_t  force;           // send the bursts even if the chip already answers XMICRO
+    uint8_t  probe_every;     // probe XMICRO every N swept bursts (0 = 8)
+    int16_t  nsweep;          // swept positions (0 = 32), centred on `at_us`
+    int32_t  at_us;           // centre of the sweep, us from power-up (0 = the VVDI's 109700)
+    int32_t  step_us;         // sweep step (0 = 40)
+    int32_t  on_us;           // field-on window holding one burst (0 = 156000)
+    uint8_t  word;            // 0 = auto: "erase", then the 7935 word.  1 = "erase",
+                              // 2 = the Megamos word (ID48/ID8E), 3 = the 7935 word
+} PACKED lf_xhorse_xt57_reset_t;
 
 #define XT57_F_ACK     0x01   // 0x5AA5 seen
 #define XT57_F_IDENT   0x02   // reply to 0011 started "XT"
@@ -176,5 +298,16 @@ typedef struct {
     uint8_t  count;
     lf_xhorse_xt57_rec_t rec[XHORSE_XT57_MAXSESS];
 } PACKED lf_xhorse_xt57_reply_t;
+
+// Firmware -> client when a post script ran.  Sent under the same command id; the client tells the
+// two apart by the reply length, since a scripted call always runs exactly one session.
+typedef struct {
+    lf_xhorse_xt57_rec_t rec;               // the session the script ran in
+    uint8_t  sessions;                      // sessions tried before the wanted nonce came up
+    uint8_t  npost;                         // responses in presp[]
+    uint8_t  rfirst;                        // 1-based index presp[0] belongs to
+    uint8_t  nsent;                         // frames actually sent
+    xt57_presp_t presp[XHORSE_XT57_MAXPOST];
+} PACKED lf_xhorse_xt57_post_reply_t;
 
 #endif // XHORSE_H__

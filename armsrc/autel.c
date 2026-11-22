@@ -47,6 +47,7 @@
 #include "commonutil.h"
 #include "hitag_common.h"    // hitag_mod_t, T0, HITAG_T_*
 #include "hitag2_crypto.h"   // ht2_hitag2_init / ht2_hitag2_word
+#include "xhorse.h"        // Xhorse_EmBurst - the shared "erase" downlink burst
 
 //-----------------------------------------------------------------------------
 // Physical layer.  Identical to the XT27A's (armsrc/xhorse.c) because both are a
@@ -432,27 +433,8 @@ static int at_wake_uid(at_sess_t *s, uint32_t *uid, int uid_t0) {
 #define AT_T_EM_COLDBOOT_US 1570940     // power-down between the bursts and the handshake
 #define AT_T_EM_SETTLE_US     30180     // field on this long before the wake
 
-static const uint16_t at_emb_start[43] = {
-    0, 36, 68, 129, 163, 224, 258, 290, 351, 415, 449, 511, 576, 610, 641, 702, 767, 832, 865, 927,
-    961, 992, 1024, 1054, 1115, 1180, 1214, 1245, 1306, 1340, 1372, 1433, 1497, 1562, 1596, 1658,
-    1692, 1753, 1787, 1818, 1880, 1944, 1978
-};
-static const uint8_t at_emb_width[43] = {
-    20, 16, 15, 19, 16, 19, 15, 15, 19, 19, 15, 19, 19, 16, 15, 19, 19, 19, 16, 19, 16, 15, 15, 15,
-    19, 19, 16, 15, 19, 16, 15, 19, 19, 19, 16, 19, 16, 19, 16, 15, 19, 19, 16
-};
-
-// Emit the burst with the field on.  One counter reference covers it (1994 T0 = 23928
-// ticks < 65536), so pulse positions do not accumulate per-pulse error.
-static void at_em_burst(void) {
-    const uint16_t ref = GetPrecisionCounterRaw();
-    for (size_t i = 0; i < ARRAYLEN(at_emb_start); i++) {
-        while (GetPrecisionCounterDelta(ref) < (uint16_t)(T0 * at_emb_start[i])) {};
-        Gpio_SSC_DOUT_High();
-        while (GetPrecisionCounterDelta(ref) < (uint16_t)(T0 * (at_emb_start[i] + at_emb_width[i]))) {};
-        Gpio_SSC_DOUT_Low();
-    }
-}
+// The burst itself is generated in armsrc/xhorse.c (Xhorse_EmBurst): a plain LF downlink
+// frame carrying the ASCII word "erase".  See docs/xt57b-fullread.md SS12.2.
 
 // Burst windows: field-on window length, and when in it the burst is commanded.
 static const uint32_t at_em_on_us[2]    = { 155940, 60300 };
@@ -461,14 +443,13 @@ static const uint32_t at_em_at_us[2]    = { 109540, 13990 };   // ID11 frame 6; 
 // One round of the VVDI's shape: a burst per timing, each in its own power cycle, then
 // a single long cold boot.  Leaves the field on, settled, ready for the wake.
 static void at_em_free(void) {
-    const uint32_t burst_len_us = ((uint32_t)at_emb_start[ARRAYLEN(at_emb_start) - 1]
-                                   + at_emb_width[ARRAYLEN(at_emb_width) - 1]) * 8;
+    const uint32_t burst_len_us = Xhorse_EmBurstLenUs();
     for (size_t t = 0; t < ARRAYLEN(at_em_on_us); t++) {
         Gpio_SSC_DOUT_High();
         at_delay_us(AT_T_EM_OFF_US);
         Gpio_SSC_DOUT_Low();
         at_delay_us(at_em_at_us[t]);
-        at_em_burst();
+        Xhorse_EmBurst();
         at_delay_us(at_em_on_us[t] - at_em_at_us[t] - burst_len_us);
     }
     Gpio_SSC_DOUT_High();
