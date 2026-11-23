@@ -701,8 +701,14 @@ void Autel_Write(const lf_autel_io_t *p, bool ledcontrol) {
     reply_ng(CMD_LF_AUTEL_WRITE, res, (uint8_t *)&out, sizeof(out));
 }
 
-// Pages the Autel is ever seen to use (docs/at100.md SS8).  Everything else in the
-// 256-page space is untouched in every capture; `lf autel read` reaches those.
+// The page list behind `lf autel dump --used`: everything the Autel is ever seen to
+// use (docs/at100.md SS8), plus the two factory pages 0xFB and 0xFD that it never
+// touches but that hold real data - the UID and the device key's high half (SS8a).
+//
+// This is the short view, not the whole chip.  A plain `lf autel dump` reads all 255
+// readable pages as four READ chunks, because one reply carries only AUTEL_MAX_PAGES.
+// Every address 0x00..0xFE answers; the 196 left out here read FFFFFFFF but are real
+// read/write EEPROM (all 196 write-tested, no aliasing), and 0xFF alone is silent.
 static const uint8_t at_dump_pages[] = {
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
     0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
@@ -714,7 +720,7 @@ static const uint8_t at_dump_pages[] = {
     0x78, 0x79, 0x7A, 0x7B,
     0xC8,
     0xF0, 0xF1, 0xF2, 0xF3, 0xF4,
-    0xFC, 0xFE,
+    0xFB, 0xFC, 0xFD, 0xFE,
 };
 
 void Autel_Dump(const lf_autel_io_t *p, bool ledcontrol) {

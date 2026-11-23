@@ -2086,12 +2086,18 @@ static void PacketReceived(PacketCommandNG *packet) {
             break;
         }
 
-        case CMD_LF_XHORSE_INFO: {
-            Xhorse_Info(true);
-            break;
-        }
+        case CMD_LF_XHORSE_INFO:
         case CMD_LF_XHORSE_DUMP: {
-            Xhorse_Dump((packet->length > 0) ? (packet->data.asBytes[0] & 1) : 0, true);
+            // lf_xhorse_rdopt_t, short or absent from an older client: default to bank 0, no probe.
+            lf_xhorse_rdopt_t opt;
+            memset(&opt, 0, sizeof(opt));
+            size_t n = (packet->length < sizeof(opt)) ? packet->length : sizeof(opt);
+            memcpy(&opt, packet->data.asBytes, n);
+            if (packet->cmd == CMD_LF_XHORSE_INFO) {
+                Xhorse_Info(&opt, true);
+            } else {
+                Xhorse_Dump(opt.bank & 1, &opt, true);
+            }
             break;
         }
         case CMD_LF_XHORSE_CONFIGURE: {

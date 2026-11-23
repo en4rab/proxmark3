@@ -44,6 +44,14 @@
 #define AUTEL_PG_KEYSIG     0xFC
 #define AUTEL_KEYSIG        0xA5E8B14BUL
 
+// Pages 0xFB and 0xFD: factory pages the Autel programmer never reads, found by
+// sweeping the whole address space (docs/at100.md SS8a).  0xFB mirrors the UID the
+// chip returns in the wake handshake; 0xFD holds the device key's high 16 bits,
+// zero-extended, so 0xFD:0xFC together are the whole 48-bit key in plain sight.
+#define AUTEL_PG_UID        0xFB
+#define AUTEL_PG_KEYHI      0xFD
+#define AUTEL_KEYHI         0x00009F63UL
+
 // Factory-default contents of page 0xFE: every unprogrammed blank read so far.
 // It is also exactly what the Autel's own "ID4D" menu entry writes.
 #define AUTEL_CFG_FACTORY   0x9B290A9BUL

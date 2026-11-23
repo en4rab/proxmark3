@@ -451,7 +451,8 @@ static void at_print_partial(uint8_t stage, uint32_t uid) {
         case AUTEL_STAGE_UID:
             PrintAndLogEx(INFO, "UID....... " _GREEN_("%08X"), uid);
             PrintAndLogEx(INFO, "The tag returned its UID, then ignored " _YELLOW_("{nR}{aR}") ".");
-            PrintAndLogEx(HINT, "A tag emulating a talk-first type (ID11/ID12/ID13) behaves this way;");
+            PrintAndLogEx(HINT, "Either the device key is wrong - pass the right one with " _YELLOW_("-k") " - or this is");
+            PrintAndLogEx(HINT, "a tag emulating a talk-first type (ID11/ID12/ID13), which also stops here;");
             PrintAndLogEx(HINT, "see the open problem in docs/at100.md section 13.");
             break;
         default:
@@ -500,6 +501,30 @@ static int at_io_send(uint16_t cmd, const lf_autel_io_t *p, lf_autel_io_reply_t 
 // Always two visible characters, so a following column stays aligned.
 static const char *at_mark(const lf_autel_io_reply_t *r, uint8_t i) {
     return ((r->ok[i / 8] >> (i % 8)) & 1) ? "  " : " " _RED_("?");
+}
+
+static const char *at_mark_of(bool agreed) {
+    return agreed ? "  " : " " _RED_("?");
+}
+
+// What is worth saying about one page.  The only annotated pages are 0xFB-0xFE, all
+// of them in the right-hand column of a two-column dump; this is the one place to
+// change if that ever stops being true.
+static const char *at_note(uint8_t pg, uint32_t v, uint32_t uid) {
+    switch (pg) {
+        case AUTEL_PG_KEYSIG:
+            return (v == AUTEL_KEYSIG) ? "device key, low 32 bits"
+                   : _RED_("device key page, unexpected value");
+        case AUTEL_PG_KEYHI:
+            return (v == AUTEL_KEYHI) ? "device key, high 16 bits"
+                   : _RED_("device key page, unexpected value");
+        case AUTEL_PG_UID:
+            return (v == uid) ? "UID" : _RED_("UID page, does not match the session UID");
+        case AUTEL_PG_CONFIG:
+            return "emulated-type register";
+        default:
+            return "";
+    }
 }
 
 static void at_print_header(const lf_autel_io_reply_t *r) {
@@ -599,22 +624,92 @@ static int CmdLFAutelList(const char *Cmd) {
 //-----------------------------------------------------------------------------
 // dump
 //-----------------------------------------------------------------------------
+// The whole readable space is 0x00-0xFE (docs/at100.md SS8a).  That is 255 pages and
+// one reply carries at most AUTEL_MAX_PAGES, so a full dump is four READ chunks -
+// four sessions - merged here.  0xFF is left out on purpose: it answers no read, and
+// the word a read returns for it is cipher keystream rather than memory.
+#define AT_DUMP_FIRST   0x00
+#define AT_DUMP_LAST    0xFE
+#define AT_DUMP_PAGES   (AT_DUMP_LAST - AT_DUMP_FIRST + 1)   // 255
+#define AT_DUMP_ROWS    128                                  // left col 0x00-0x7F
+
+typedef struct {
+    uint32_t val[AT_DUMP_PAGES];
+    bool     got[AT_DUMP_PAGES];   // the device returned this page at all
+    bool     ok[AT_DUMP_PAGES];    // two reads of it agreed
+} at_pagemap_t;
+
+// Read 0x00-0xFE into `m`.  `first` keeps the first successful reply so the header
+// (UID, type, auth warning) comes from a real session.  A chunk that fails is
+// reported and its pages are left ungot rather than silently printed as zero.
+static int at_read_all(uint64_t key, at_pagemap_t *m, lf_autel_io_reply_t *first) {
+    static const struct { uint8_t page; uint8_t count; } chunks[] = {
+        { 0x00, 64 }, { 0x40, 64 }, { 0x80, 64 }, { 0xC0, 63 },
+    };
+    memset(m, 0, sizeof(*m));
+    bool have_first = false;
+
+    for (size_t c = 0; c < ARRAYLEN(chunks); c++) {
+        lf_autel_io_t p;
+        memset(&p, 0, sizeof(p));
+        p.key   = key;
+        p.page  = chunks[c].page;
+        p.count = chunks[c].count;
+
+        lf_autel_io_reply_t r;
+        if (at_io_send(CMD_LF_AUTEL_READ, &p, &r, NULL) != PM3_SUCCESS) {
+            PrintAndLogEx(WARNING, "pages 0x%02X-0x%02X could not be read",
+                          chunks[c].page, (uint8_t)(chunks[c].page + chunks[c].count - 1));
+            if (have_first == false) {
+                return PM3_ESOFT;     // nothing to print a header from
+            }
+            continue;
+        }
+        if (have_first == false) {
+            memcpy(first, &r, sizeof(*first));
+            have_first = true;
+        }
+        for (uint8_t i = 0; i < r.count; i++) {
+            uint8_t pg = r.page[i];
+            if (pg > AT_DUMP_LAST) {
+                continue;
+            }
+            m->val[pg] = be32(&r.data[i * 4]);
+            m->got[pg] = true;
+            m->ok[pg]  = ((r.ok[i / 8] >> (i % 8)) & 1) != 0;
+        }
+    }
+    return have_first ? PM3_SUCCESS : PM3_ESOFT;
+}
+
+// One cell of the table: "0xNN | VVVVVVVV" plus the two-character agreement mark.
+static void at_cell(char *buf, size_t sz, const at_pagemap_t *m, uint8_t pg) {
+    if (m->got[pg]) {
+        snprintf(buf, sz, "0x%02X | %08X%s", pg, m->val[pg], at_mark_of(m->ok[pg]));
+    } else {
+        snprintf(buf, sz, "0x%02X | %-8s  ", pg, "--");
+    }
+}
+
 static int CmdLFAutelDump(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "lf autel dump",
-                  "Read every page of an AT100 that the Autel programmer is ever seen to use:\n"
-                  "the emulated image at 0x00-0x27, the ID4D/ID4E registers at 0x3A-0x3D, 0x50,\n"
-                  "0x78-0x7B, 0xC8, 0xF0-0xF4, the device-key page 0xFC and the type register 0xFE.\n"
+                  "Read and print every readable page of an AT100: 0x00-0xFE, in two columns.\n"
                   "\n"
-                  "The rest of the 256-page space is untouched in every capture; reach it with\n"
-                  "`lf autel read` if you want to probe it.\n"
+                  "Page 0xFF is not shown - it is the one address the chip never answers, and a\n"
+                  "read of it returns cipher keystream rather than memory (docs/at100.md SS8a).\n"
+                  "Pages reading " _YELLOW_("FFFFFFFF") " are blank: real, writable EEPROM that the Autel\n"
+                  "programmer never uses.  " _YELLOW_("--used") " prints just the pages it does use, which is the\n"
+                  "shorter view and takes one session instead of four.\n"
                   "\n"
                   "Every page is read until two reads agree; one marked " _RED_("?") " never did and may be wrong.",
                   "lf autel dump\n"
+                  "lf autel dump --used\n"
                   "lf autel dump -k 9F63A5E8B14B");
     void *argtable[] = {
         arg_param_begin,
         arg_str0("k", "key", "<hex>", "48-bit device key (def 9F63A5E8B14B)"),
+        arg_lit0(NULL, "used", "only the pages the Autel programmer uses (one session)"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, true);
@@ -623,38 +718,88 @@ static int CmdLFAutelDump(const char *Cmd) {
         CLIParserFree(ctx);
         return PM3_EINVARG;
     }
+    bool used_only = arg_get_lit(ctx, 2);
     CLIParserFree(ctx);
 
-    lf_autel_io_t p;
-    memset(&p, 0, sizeof(p));
-    p.key = key;
+    // --used: the firmware's own curated page list, read in a single session.
+    if (used_only) {
+        lf_autel_io_t p;
+        memset(&p, 0, sizeof(p));
+        p.key = key;
 
-    lf_autel_io_reply_t r;
-    int res = at_io_send(CMD_LF_AUTEL_DUMP, &p, &r, NULL);
+        lf_autel_io_reply_t r;
+        int res = at_io_send(CMD_LF_AUTEL_DUMP, &p, &r, NULL);
+        if (res != PM3_SUCCESS) {
+            return res;
+        }
+
+        PrintAndLogEx(NORMAL, "");
+        PrintAndLogEx(INFO, "--- " _CYAN_("Autel AT100 dump") " (pages the Autel uses) ------");
+        at_print_header(&r);
+        at_print_auth_warning(&r);
+        PrintAndLogEx(INFO, "");
+        PrintAndLogEx(INFO, "  page | data       | note");
+        PrintAndLogEx(INFO, "-------+------------+-----------------------------");
+        for (uint8_t i = 0; i < r.count; i++) {
+            uint32_t v = be32(&r.data[i * 4]);
+            PrintAndLogEx(INFO, "  0x%02X | %08X%s | %s", r.page[i], v, at_mark(&r, i),
+                          at_note(r.page[i], v, r.uid));
+        }
+        at_warn_unconfirmed(&r);
+        PrintAndLogEx(NORMAL, "");
+        return PM3_SUCCESS;
+    }
+
+    at_pagemap_t m;
+    lf_autel_io_reply_t first;
+    memset(&first, 0, sizeof(first));
+    int res = at_read_all(key, &m, &first);
     if (res != PM3_SUCCESS) {
         return res;
     }
 
     PrintAndLogEx(NORMAL, "");
     PrintAndLogEx(INFO, "--- " _CYAN_("Autel AT100 dump") " -----------------------");
-    at_print_header(&r);
-    at_print_auth_warning(&r);
+    at_print_header(&first);
+    at_print_auth_warning(&first);
     PrintAndLogEx(INFO, "");
-    PrintAndLogEx(INFO, "  page | data       | note");
-    PrintAndLogEx(INFO, "-------+------------+-----------------------------");
+    PrintAndLogEx(INFO, "  page | data       | page | data       | note");
+    PrintAndLogEx(INFO, "-------+------------+------+------------+---------------------------");
 
-    for (uint8_t i = 0; i < r.count; i++) {
-        uint8_t pg = r.page[i];
-        uint32_t v = be32(&r.data[i * 4]);
-        const char *note = "";
-        if (pg == AUTEL_PG_KEYSIG) {
-            note = (v == AUTEL_KEYSIG) ? "device key, low 32 bits" : _RED_("device key page, unexpected value");
-        } else if (pg == AUTEL_PG_CONFIG) {
-            note = "emulated-type register";
+    for (uint8_t row = 0; row < AT_DUMP_ROWS; row++) {
+        uint8_t lp = row;                       // 0x00..0x7F
+        uint8_t rp = (uint8_t)(row + AT_DUMP_ROWS);   // 0x80..0xFF
+        char left[64];
+        at_cell(left, sizeof(left), &m, lp);
+
+        if (rp > AT_DUMP_LAST) {                // 0x7F has no partner: 0xFF is not read
+            PrintAndLogEx(INFO, "  %s |", left);
+            continue;
         }
-        PrintAndLogEx(INFO, "  0x%02X | %s%s | %s", pg, sprint_hex_inrow(&r.data[i * 4], 4), at_mark(&r, i), note);
+        char right[64];
+        at_cell(right, sizeof(right), &m, rp);
+        PrintAndLogEx(INFO, "  %s | %s | %s", left, right, at_note(rp, m.val[rp], first.uid));
     }
-    at_warn_unconfirmed(&r);
+
+    int bad = 0, missing = 0, blank = 0;
+    for (int pg = 0; pg < AT_DUMP_PAGES; pg++) {
+        if (m.got[pg] == false) {
+            missing++;
+        } else if (m.ok[pg] == false) {
+            bad++;
+        } else if (m.val[pg] == 0xFFFFFFFF) {
+            blank++;
+        }
+    }
+    PrintAndLogEx(INFO, "");
+    PrintAndLogEx(INFO, "%d pages 0x00-0xFE, %d blank (" _YELLOW_("FFFFFFFF") "), %d with data",
+                  AT_DUMP_PAGES - missing, blank, AT_DUMP_PAGES - missing - blank);
+    if (bad) {
+        PrintAndLogEx(WARNING, "%d page(s) marked " _RED_("?") " unconfirmed: no two reads agreed, so they may be wrong; try again", bad);
+    }
+    if (missing) {
+        PrintAndLogEx(WARNING, "%d page(s) shown as " _YELLOW_("--") " were not read back at all", missing);
+    }
     PrintAndLogEx(NORMAL, "");
     return PM3_SUCCESS;
 }
@@ -667,9 +812,10 @@ static int CmdLFAutelRead(const char *Cmd) {
     CLIParserInit(&ctx, "lf autel read",
                   "Read raw pages from an AT100.\n"
                   "\n"
-                  "The page address is 8 bits, so 0x00-0xFF is the whole space.  Only the pages\n"
-                  "`lf autel dump` lists are ever used by the Autel programmer; the rest have never\n"
-                  "been seen read or written and may not be real storage.\n"
+                  "The page address is 8 bits, so 0x00-0xFF is the whole space.  All 255 addresses\n"
+                  "0x00-0xFE answer a read; the ones `lf autel dump` leaves out hold FFFFFFFF.  Page\n"
+                  "0xFF is the single address the chip never answers, and the word printed for it is\n"
+                  "cipher keystream, not data - it is flagged " _RED_("?") " for that reason.\n"
                   "\n"
                   "Every page is read until two reads agree; one marked " _RED_("?") " never did and may be wrong.\n"
                   "\n"
@@ -784,6 +930,30 @@ static int CmdLFAutelRead(const char *Cmd) {
 //-----------------------------------------------------------------------------
 // write
 //-----------------------------------------------------------------------------
+// 0xFB-0xFD are live, not an identity stamp: the chip loads its UID and its auth key
+// from them at power-up (docs/at100.md SS8b).  Writing one is legitimate - it is how a
+// chip gets re-keyed - but a key written and then forgotten locks the chip for good,
+// because every command on an AT100 authenticates first.  Say so before doing it.
+static void at_warn_factory_page(uint8_t page, uint32_t value) {
+    switch (page) {
+        case AUTEL_PG_UID:
+            PrintAndLogEx(WARNING, "page 0x%02X is the chip's " _YELLOW_("UID") ", not a copy of it.", page);
+            PrintAndLogEx(INFO, "      From the next power-up the chip answers as " _YELLOW_("%08X") ".", value);
+            PrintAndLogEx(INFO, "      The client reads the UID from the handshake, so it follows automatically.");
+            break;
+        case AUTEL_PG_KEYSIG:
+        case AUTEL_PG_KEYHI:
+            PrintAndLogEx(WARNING, "page 0x%02X is the live " _RED_("device key") " (%s 0x%08X), not a signature.",
+                          page, (page == AUTEL_PG_KEYSIG) ? "low 32 bits ->" : "high 16 bits ->", value);
+            PrintAndLogEx(WARNING, "      From the next session every command needs " _YELLOW_("-k") " with the new key.");
+            PrintAndLogEx(WARNING, "      " _RED_("Record it.") "  Every AT100 command authenticates first, so a key you");
+            PrintAndLogEx(WARNING, "      cannot reproduce locks the chip permanently - there is no reset that skips auth.");
+            break;
+        default:
+            break;
+    }
+}
+
 static int CmdLFAutelWrite(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "lf autel write",
@@ -792,6 +962,11 @@ static int CmdLFAutelWrite(const char *Cmd) {
                   "This writes whatever you give it with no regard for what the page means, so it\n"
                   "can leave the chip emulating nothing useful.  `lf autel configure` writes whole\n"
                   "coherent images and `lf autel reset` restores the factory type.\n"
+                  "\n"
+                  "Pages " _YELLOW_("0xFB") "-" _YELLOW_("0xFD") " are live, not an identity stamp: 0xFB is the UID and\n"
+                  "0xFD:0xFC is the 48-bit device key, and the chip loads both at power-up.  Writing a\n"
+                  "key half re-keys the chip, and since every command authenticates first, a key you\n"
+                  "cannot reproduce locks it " _RED_("permanently") " - there is no reset that skips auth.\n"
                   "\n"
                   "Setting page 0xFE to a talk-first type (ID11/ID12/ID13) leaves the chip\n"
                   "broadcasting continuously.  That is recoverable - `lf autel configure` reaches a\n"
@@ -836,6 +1011,8 @@ static int CmdLFAutelWrite(const char *Cmd) {
     p.value = be32(data);
     p.verify = nv ? 0 : 1;
     p.key = key;
+
+    at_warn_factory_page((uint8_t)page, p.value);
 
     lf_autel_io_reply_t r;
     int status = PM3_SUCCESS;

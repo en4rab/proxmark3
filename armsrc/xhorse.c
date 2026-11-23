@@ -88,29 +88,76 @@
 // 31.74 ms (3968 T0) after the last gap.  Gap starts are 81 T0 apart for the first two, then 52 T0
 // (S) or 67 T0 (L) as in xh_id8a_probe (identical in both captures).  Replaying it is what lets
 // us reach an ID8A chip, but it also reverts the chip's type byte to 0x36 (info read 0x36 after it
-// while bank 0 still held the ID8A image), so only reset/configure send it (xh_sess_t.allow_probe).
+// while bank 0 still held the ID8A image), so reset/configure send it and a read only does on
+// request (xh_sess_t.probe, `--probe`).
 //
 // The VVDI sends THREE words in this code, and this is the last of them (docs/xt57b-fullread.md
 // SS12.4).  Before it: an 18-symbol word "SLSSSSLLLLSSSSSSSS" at ~0.19 s, which is not ID8A-
 // specific - it is the whole of the XT136 reset preamble (docs/xt136.md SS4.2) - and then a
-// second 98-symbol word, twice, each followed by an XMICRO that gets no answer:
-//     "SLLSSSLLSLLLSSLLLSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSLLSLLSSSLLSSSSLLSSSSLSS"
-// Only after this word, sent six times, does XHORSE reach the chip - the same first-word /
-// last-word shape as the Megamos family.  Whether that other word is a non-destructive read is
-// still open (implementation-plan.md Update 29).
+// second 98-symbol word (xh_id8a_probe_a below), twice, each followed by an XMICRO that gets no
+// answer.  Only after this word, sent six times, does XHORSE reach the chip - the same first-word /
+// last-word shape as the Megamos family.
+//
+// Nothing answers either word: the envelope after the last gap is flat through the 31.74 ms of
+// field-on and the 177.1 ms of field-off, in both captures.  And the VVDI never sends XHORSE
+// after word A - decoding every 48-bit frame in vvdi-id8A-reset-success.pm3 gives XMICRO six
+// times and XHORSE once, at 3.68 s, after the sixth word B.  So whether word A is a harmless
+// read was never tested.  `lf xhorse info --probe a` asked, on an XT27A set to ID8A: word A does
+// open a session (timing 3, 4R ok), but bank-1 0x3C then reads 0x00 where word B leaves 0x36 -
+// three runs, against a configure that had just verified 0x8A.  So A is not a harmless read, and
+// the two words do different things to the chip (Update 32).
 //
 // The gap width carries nothing (unimodal at 23 T0, same before an S as before an L), so the
 // word is 98 bits.  Those bits do not decode: no ASCII under any expansion, no CRC-16 over
 // 27,888 framings, and not TI's write encoding (that is a 2 ms bit cell with a varying off time,
 // 112 bits; this is 416/536 us with a constant one).  It is a fixed constant - identical across
-// eight bursts in two captures - so it is not a DST challenge, which is why replay works.
-// tools/analysis/probe8a.py re-derives all three from a trace.
+// eight bursts in two captures - so it is not a DST challenge, which is why replay works.  They
+// are not interchangeable wake patterns either: A and B leave the type byte at different values,
+// so the 98 bits are a payload the chip reads, not a pattern it merely matches.
+//
+// Mutating the word (--probe-word, Updates 33-35) shows what guards it.  All 98 single-symbol
+// flips of word B were swept against hardware (tools/analysis/probe8a_sweep.py,
+// data/probe8a-sweep.jsonl): 97 are refused outright, including every flip inside the long run of
+// S, so none of it is padding and nothing is parsed into fields.  The one exception is symbol 5,
+// which is accepted and changes the outcome to 0x00.  The check is on the symbol values, not on
+// timing: A and B differ in total duration and both work.  And 0x00 is simply "passed the check
+// but is not word B" - word A and B-with-symbol-5-flipped both land there - while 0x36 is what
+// word B actually writes.
+//
+// It is not a checksum.  Multi-symbol flips (--flips, data/probe8a-pairs.jsonl, -pos5, -cut and
+// -header) refuse six different double flips away from symbol 5, which any equal-weight checksum
+// would wave through, yet accept 5+40 and 5+60, which parity says must fail.  Mapping symbol 5
+// against every other symbol gives the structure (Update 36):
+//
+//     accept  iff  symbols 0..14 match word B's, ignoring symbols 5 and 9
+//                  and ( symbol 5 == L  or  the whole word is A or B )
+//
+// So the chip reads thirteen of the 98 symbols: a fixed preamble in 0..14 - no single-symbol
+// variant of it is ever accepted - with a one-bit command selector at symbol 5 and symbol 9
+// reserved.  L at symbol 5 is a command with no payload: the header with symbols 15..97 all S, and
+// the same header with them all L, are both accepted.  S at symbol 5 takes the other 83 symbols as
+// a payload and accepts exactly two, word A's tail and word B's tail, with no tolerance anywhere in
+// them - which is why replay is the only way in and why xh_id8a_probe must stay byte-exact.  The
+// rule reproduces all 151 hardware points, 142 distinct words, with no exceptions.  0x36 is what
+// word B's payload writes; 0x00 is what every other accepted word leaves behind.  A rejected word
+// leaves the chip untouched and deaf, and every accepted word leaves bank 0 byte-identical - the
+// type byte is the only casualty.  tools/analysis/probe8a.py re-derives the three words from a
+// trace; probe8a_sweep.py is the mutation harness.
 #define XH_T_ID8A_CHARGE_T0  6255
 #define XH_T_ID8A_GAP_T0     22       // nominal; our gaps sniff ~1 T0 wider than set
 #define XH_T_ID8A_FIRST_T0   81
 #define XH_T_ID8A_TAIL_T0    3968
 static const char xh_id8a_probe[] =
     "SLLSSSLLSLLLSSLSSSSLLSLLSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSLSLSSSLSLSSL";
+// Word A, the one the VVDI sends twice before it.  It opens the chip as B does, but leaves the
+// emulated type byte at 0x00 instead of reverting it to 0x36, so it is no safer and 0x00 is not
+// even a valid type.  Per Update 34 it carries no payload of its own - it is just a word that
+// passes the check without being B.  Sent only when asked for by name (XHORSE_PROBE_A).
+static const char xh_id8a_probe_a[] =
+    "SLLSSSLLSLLLSSLLLSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSLLSLLSSSLLSSSSLLSSSSLSS";
+// A word handed down by the client (XHORSE_PROBE_CUSTOM), for asking the chip what the bits mean.
+static char xh_id8a_probe_custom[XHORSE_ID8A_SYMS + 1];
+
 #define XH_T_XMICRO_ID_US    1000     // gap after the XMICRO ACK before the 4-bit identify query
 // XMICRO must not be sent straight after power-up: the VVDI waits 120.14 ms (15018 T0, identical in
 // its XT27B and XT57B read captures, with nothing else on air in between).  The XT57B happens to
@@ -261,7 +308,7 @@ typedef struct {
     bool    led;
     int8_t  cur_bank;   // last sel'd bank, or -1
     bool    em_mode;    // freed from EM emulation this run: later sessions reopen with the EM off/settle timing
-    bool    allow_probe; // may send the ID8A probe, which reverts the type byte (reset/configure only)
+    uint8_t probe;       // xhorse_probe_t: which ID8A probe word timing 3 may send (0 = none)
     uint8_t family;      // xhorse_family_t of the open session
     uint16_t seed_reply; // the tag's reply to 7372 / E430, which seeds the keystream
 } xh_sess_t;
@@ -573,6 +620,26 @@ static void xh_field_reset(void) {
     xh_delay_us(XH_T_POWERUP_US);
 }
 
+// Send one ID8A probe word: 100 field gaps about 23 T0 wide, the first two 81 T0 apart and the
+// rest 52 T0 (S) or 67 T0 (L), then hold the field on for the 31.74 ms tail.  The caller has
+// already powered the chip up and waited out the 50.04 ms charge.
+static void xh_send_id8a_probe(const char *word, size_t n) {
+    for (size_t i = 0; i < n + 2; i++) {
+        uint32_t next;                               // gap start to next gap start (T0)
+        if (i == 0) {
+            next = XH_T_ID8A_FIRST_T0;
+        } else if (i <= n) {
+            next = (word[i - 1] == 'L') ? 67 : 52;
+        } else {
+            next = XH_T_ID8A_TAIL_T0;                // last gap -> field off
+        }
+        Gpio_SSC_DOUT_High();
+        xh_delay_us(XH_T_ID8A_GAP_T0 * 8);
+        Gpio_SSC_DOUT_Low();
+        xh_delay_us((next - XH_T_ID8A_GAP_T0) * 8);
+    }
+}
+
 // The 4R opener: the first encrypted command of a session is sel bank 1 (0x41BE), and the chip
 // echoes it.  Only a real XT27A with the right keystream returns an echo that decrypts to exactly
 // 0x41BE, so this is the check that a session is genuinely open.  It matters for chips stuck in
@@ -597,7 +664,7 @@ static bool xh_4r(xh_sess_t *s, const char *what, int attempt) {
 // more commands after a `ctl` must open a new session here first, as the VVDI does between
 // its capability read and its writes.
 static int xh_open_session(xh_sess_t *s) {
-    const int timings = s->allow_probe ? 4 : 3;
+    const int timings = (s->probe != XHORSE_PROBE_NONE) ? 4 : 3;
     for (int attempt = 0; attempt < timings * XH_TRIES_PER_TIMING; attempt++) {
         int mode = s->em_mode ? 1 : (attempt % timings);
         if (g_dbglevel >= DBG_EXTENDED) {
@@ -606,23 +673,13 @@ static int xh_open_session(xh_sess_t *s) {
         if (mode == 3) {
             // The VVDI's whole last round before its first XHORSE to a chip set to ID8A: the TI-style
             // probe, then the long off and XHORSE 41.8 ms after power-up (see XH_T_ID8A_CHARGE_T0).
+            const char *word = (s->probe == XHORSE_PROBE_A)      ? xh_id8a_probe_a
+                               : (s->probe == XHORSE_PROBE_CUSTOM) ? xh_id8a_probe_custom
+                               :                                     xh_id8a_probe;
+            const size_t n = XHORSE_ID8A_SYMS;               // 98 S/L intervals -> 100 gaps
             xh_field_reset();
             xh_delay_us(XH_T_ID8A_CHARGE_T0 * 8 - XH_T_POWERUP_US);
-            const size_t n = sizeof(xh_id8a_probe) - 1;     // 98 S/L intervals -> 100 gaps
-            for (size_t i = 0; i < n + 2; i++) {
-                uint32_t next;                               // gap start to next gap start (T0)
-                if (i == 0) {
-                    next = XH_T_ID8A_FIRST_T0;
-                } else if (i <= n) {
-                    next = (xh_id8a_probe[i - 1] == 'L') ? 67 : 52;
-                } else {
-                    next = XH_T_ID8A_TAIL_T0;                // last gap -> field off
-                }
-                Gpio_SSC_DOUT_High();
-                xh_delay_us(XH_T_ID8A_GAP_T0 * 8);
-                Gpio_SSC_DOUT_Low();
-                xh_delay_us((next - XH_T_ID8A_GAP_T0) * 8);
-            }
+            xh_send_id8a_probe(word, n);
             Gpio_SSC_DOUT_High();
             xh_delay_us(XH_T_ID8A_OFF_US);
             Gpio_SSC_DOUT_Low();
@@ -923,15 +980,41 @@ static int xh_open_any(xh_sess_t *s) {
     return xh_open_session_em(s);
 }
 
-static int xh_begin(xh_sess_t *s, bool ledcontrol) {
+// Take the probe choice from a client packet.  A XHORSE_PROBE_CUSTOM word must be exactly 98
+// 'S'/'L' symbols; anything else is refused, because a half-copied word is a different command.
+static uint8_t xh_probe_from(const lf_xhorse_rdopt_t *opt) {
+    if (opt == NULL) {
+        return XHORSE_PROBE_NONE;
+    }
+    if (opt->probe != XHORSE_PROBE_CUSTOM) {
+        return (opt->probe > XHORSE_PROBE_CUSTOM) ? XHORSE_PROBE_NONE : opt->probe;
+    }
+    for (int i = 0; i < XHORSE_ID8A_SYMS; i++) {
+        if (opt->word[i] != 'S' && opt->word[i] != 'L') {
+            Dbprintf("xhorse: bad custom probe word at symbol %d; not sending a probe", i);
+            return XHORSE_PROBE_NONE;
+        }
+        xh_id8a_probe_custom[i] = opt->word[i];
+    }
+    xh_id8a_probe_custom[XHORSE_ID8A_SYMS] = 0;
+    if (g_dbglevel >= DBG_INFO) {
+        Dbprintf("xhorse: custom ID8A probe word: %s", xh_id8a_probe_custom);
+    }
+    return XHORSE_PROBE_CUSTOM;
+}
+
+// probe is a xhorse_probe_t: XHORSE_PROBE_NONE for an ordinary read, or a word to let
+// xh_open_session fall through to its fourth timing for a chip set to ID8A.
+static int xh_begin(xh_sess_t *s, uint8_t probe, bool ledcontrol) {
     xh_setup(s, ledcontrol);
+    s->probe = probe;
     return xh_open_session(s);
 }
 
 // Like xh_begin, but also handles a chip stuck in a non-HITAG2 emulation (reset/configure).
 static int xh_begin_any(xh_sess_t *s, bool ledcontrol) {
     xh_setup(s, ledcontrol);
-    s->allow_probe = true;      // the chip is about to be rewritten anyway
+    s->probe = XHORSE_PROBE_B;  // the chip is about to be rewritten anyway
     return xh_open_any(s);
 }
 
@@ -1449,12 +1532,13 @@ void Xhorse_Xt57Reset(const lf_xhorse_xt57_reset_t *q, bool ledcontrol) {
     reply_ng(CMD_LF_XHORSE_XT57_RESET, PM3_EFAILED, (uint8_t *)&out, sizeof(out));
 }
 
-void Xhorse_Info(bool ledcontrol) {
+void Xhorse_Info(const lf_xhorse_rdopt_t *opt, bool ledcontrol) {
     xh_sess_t s;
     lf_xhorse_info_t out;
     memset(&out, 0, sizeof(out));
 
     xh_setup(&s, ledcontrol);
+    s.probe = xh_probe_from(opt);   // NONE unless the caller asked for an ID8A probe word
 
     // Try the XMICRO / channel-B identify first.  A family name means a newer super-chip family
     // (XT57 / XT37-class) that this command does not yet support - report it and stop.
@@ -1507,13 +1591,13 @@ void Xhorse_Info(bool ledcontrol) {
 // Dumps one bank (0 = emulated image, 1 = config/identity) per call: both would not fit in one reply.
 // An XT136 has no banks: bank 0 returns its pages 0x00..0x0F, and a bank-1 request only reports the
 // family.
-void Xhorse_Dump(uint8_t bank, bool ledcontrol) {
+void Xhorse_Dump(uint8_t bank, const lf_xhorse_rdopt_t *opt, bool ledcontrol) {
     xh_sess_t s;
     lf_xhorse_info_t out;
     memset(&out, 0, sizeof(out));
     out.bank = bank;
 
-    if (xh_begin(&s, ledcontrol) != PM3_SUCCESS) {
+    if (xh_begin(&s, xh_probe_from(opt), ledcontrol) != PM3_SUCCESS) {
         if (xh_open_session_xt136(&s) == PM3_SUCCESS) {
             out.found = 1;
             out.family = XHORSE_FAM_XT136;

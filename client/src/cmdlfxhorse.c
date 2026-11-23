@@ -233,6 +233,87 @@ static void xh_print_not_found(void) {
     PrintAndLogEx(FAILED, "No XT27A or XT136 answered the " _YELLOW_("XHORSE") " handshake");
     PrintAndLogEx(HINT, "An XT27A emulating an EM type (ID11/12/13), ID48, ID8E or ID8A never answers it;");
     PrintAndLogEx(HINT, "`" _YELLOW_("lf xhorse reset") "` or `" _YELLOW_("lf xhorse configure") "` can recover it.");
+    PrintAndLogEx(HINT, "For an ID8A chip, `" _YELLOW_("--probe b") "` reads it without a rewrite, at the cost of its type byte.");
+}
+
+// --probe for info/dump.  A chip set to ID8A answers no handshake at any power-up delay; the only
+// thing that reaches it is the VVDI's TI-style probe, and the word that is known to work (B)
+// reverts the chip's emulated type byte to 0x36, which is why a read never sends one by itself.
+// Word A, the one the VVDI sends first, opens the chip too, but zeroes the type byte instead of
+// reverting it - so it is no safer, and 0x00 is not even a valid type (section 12.4).
+// --probe-word takes a whole 98-symbol word, and --probe-type patches just the candidate type-byte
+// field of word B (bits 17..24, MSB first, S = 0): both are research controls for working out what
+// the 98 bits say, and the chip acts on whatever is sent.
+static const char xh_cli_probe_b[] =
+    "SLLSSSLLSLLLSSLSSSSLLSLLSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSLSLSSSLSLSSL";
+#define XH_PROBE_TYPE_OFF  17     // first symbol of the candidate field
+
+// Returns PM3_SUCCESS and fills opt->probe (and opt->word), or prints why and fails.
+static int xh_parse_probe(struct arg_str *a, struct arg_str *wordarg, struct arg_str *typearg,
+                          lf_xhorse_rdopt_t *opt) {
+    opt->probe = XHORSE_PROBE_NONE;
+    if (a->count && (wordarg->count || typearg->count)) {
+        PrintAndLogEx(ERR, "--probe, --probe-word and --probe-type are alternatives; pick one");
+        return PM3_EINVARG;
+    }
+    if (wordarg->count && typearg->count) {
+        PrintAndLogEx(ERR, "--probe-word and --probe-type are alternatives; pick one");
+        return PM3_EINVARG;
+    }
+    if (wordarg->count) {
+        const char *w = wordarg->sval[0];
+        if (strlen(w) != XHORSE_ID8A_SYMS) {
+            PrintAndLogEx(ERR, "--probe-word needs exactly %d symbols, got %zu", XHORSE_ID8A_SYMS, strlen(w));
+            return PM3_EINVARG;
+        }
+        for (int i = 0; i < XHORSE_ID8A_SYMS; i++) {
+            char c = (char)toupper((unsigned char)w[i]);
+            if (c != 'S' && c != 'L') {
+                PrintAndLogEx(ERR, "--probe-word symbol %d is `%c`; only S and L are symbols", i, w[i]);
+                return PM3_EINVARG;
+            }
+            opt->word[i] = c;
+        }
+        opt->probe = XHORSE_PROBE_CUSTOM;
+        PrintAndLogEx(WARNING, "sending a " _YELLOW_("custom") " ID8A probe word - what it does to the chip is unknown");
+        PrintAndLogEx(INFO, "word... %.*s", XHORSE_ID8A_SYMS, opt->word);
+        return PM3_SUCCESS;
+    }
+    if (typearg->count) {
+        uint32_t v = 0;
+        if (sscanf(typearg->sval[0], "%x", &v) != 1 || v > 0xFF) {
+            PrintAndLogEx(ERR, "--probe-type takes one hex byte, e.g. 8A");
+            return PM3_EINVARG;
+        }
+        memcpy(opt->word, xh_cli_probe_b, XHORSE_ID8A_SYMS);
+        for (int i = 0; i < 8; i++) {
+            opt->word[XH_PROBE_TYPE_OFF + i] = ((v >> (7 - i)) & 1) ? 'L' : 'S';
+        }
+        opt->probe = XHORSE_PROBE_CUSTOM;
+        PrintAndLogEx(WARNING, "sending word B with its candidate type field set to " _YELLOW_("0x%02X") " - untested ground", v);
+        PrintAndLogEx(INFO, "word... %.*s", XHORSE_ID8A_SYMS, opt->word);
+        return PM3_SUCCESS;
+    }
+    if (a->count == 0) {
+        return PM3_SUCCESS;
+    }
+    uint8_t *probe = &opt->probe;
+    const char *v = a->sval[0];
+    if (v == NULL || strlen(v) != 1) {
+        PrintAndLogEx(ERR, "--probe takes `a` or `b`");
+        return PM3_EINVARG;
+    }
+    if (*v == 'a' || *v == 'A') {
+        *probe = XHORSE_PROBE_A;
+        PrintAndLogEx(WARNING, "ID8A probe " _YELLOW_("word A") " enabled - it zeroes the chip's type byte");
+    } else if (*v == 'b' || *v == 'B') {
+        *probe = XHORSE_PROBE_B;
+        PrintAndLogEx(WARNING, "ID8A probe " _YELLOW_("word B") " enabled - it reverts the chip's type byte to 0x36");
+    } else {
+        PrintAndLogEx(ERR, "--probe takes `a` or `b`");
+        return PM3_EINVARG;
+    }
+    return PM3_SUCCESS;
 }
 
 // Bank-0 pages whose reads never agreed are printed with a red '?' (see page_ok).
@@ -326,14 +407,31 @@ static int CmdLFXhorseInfo(const char *Cmd) {
                   "newer families (XT57 / XT37-class) answer it and are reported as unsupported.\n"
                   "Otherwise reads the XT27A over channel A: unique chip ID, emulated type byte,\n"
                   "and the first 8 emulated-image pages.  If no XT27A answers, tries the XT136\n"
-                  "handshake and reads its pages 0x00..0x0F.",
-                  "lf xhorse info");
-    void *argtable[] = { arg_param_begin, arg_param_end };
+                  "handshake and reads its pages 0x00..0x0F.\n"
+                  "A chip set to ID8A answers nothing until the VVDI's ID8A probe is replayed:\n"
+                  "--probe sends it, at the cost of the chip's emulated type byte (word b).",
+                  "lf xhorse info\n"
+                  "lf xhorse info --probe b    -> read an ID8A chip; reverts its type byte to 0x36\n"
+                  "lf xhorse info --probe a    -> the VVDI's other word; zeroes the type byte instead");
+    void *argtable[] = {
+        arg_param_begin,
+        arg_str0(NULL, "probe", "<a|b>", "also try the ID8A probe to reach an ID8A chip; both words cost its type byte (b -> 0x36, a -> 0x00)"),
+        arg_str0(NULL, "probe-word", "<98 x S|L>", "research: send this exact ID8A probe word instead"),
+        arg_str0(NULL, "probe-type", "<hex>", "research: word B with its candidate type field set to this byte"),
+        arg_param_end
+    };
     CLIExecWithReturn(ctx, Cmd, argtable, true);
+    lf_xhorse_rdopt_t opt;
+    memset(&opt, 0, sizeof(opt));
+    int pres = xh_parse_probe((struct arg_str *)argtable[1], (struct arg_str *)argtable[2],
+                              (struct arg_str *)argtable[3], &opt);
     CLIParserFree(ctx);
+    if (pres != PM3_SUCCESS) {
+        return pres;
+    }
 
     lf_xhorse_info_t nfo;
-    int res = xh_request_info(CMD_LF_XHORSE_INFO, NULL, 0, &nfo);
+    int res = xh_request_info(CMD_LF_XHORSE_INFO, (uint8_t *)&opt, sizeof(opt), &nfo);
     if (res != PM3_SUCCESS) {
         return res;
     }
@@ -391,16 +489,33 @@ static int CmdLFXhorseDump(const char *Cmd) {
                   "the type byte, and pages 0x00..0x3F of both banks: bank 0 (the emulated-tag\n"
                   "image) and bank 1 (configuration and identity).  Each bank is read in its own session.\n"
                   "An XT136 has no banks and only pages 0x00..0x0F: they are read in one session.",
-                  "lf xhorse dump");
-    void *argtable[] = { arg_param_begin, arg_param_end };
+                  "lf xhorse dump\n"
+                  "lf xhorse dump --probe b    -> dump an ID8A chip; reverts its type byte to 0x36\n"
+                  "lf xhorse dump --probe a    -> the VVDI's other word; zeroes the type byte instead");
+    void *argtable[] = {
+        arg_param_begin,
+        arg_str0(NULL, "probe", "<a|b>", "also try the ID8A probe to reach an ID8A chip; both words cost its type byte (b -> 0x36, a -> 0x00)"),
+        arg_str0(NULL, "probe-word", "<98 x S|L>", "research: send this exact ID8A probe word instead"),
+        arg_str0(NULL, "probe-type", "<hex>", "research: word B with its candidate type field set to this byte"),
+        arg_param_end
+    };
     CLIExecWithReturn(ctx, Cmd, argtable, true);
+    lf_xhorse_rdopt_t popt;
+    memset(&popt, 0, sizeof(popt));
+    int pres = xh_parse_probe((struct arg_str *)argtable[1], (struct arg_str *)argtable[2],
+                              (struct arg_str *)argtable[3], &popt);
     CLIParserFree(ctx);
+    if (pres != PM3_SUCCESS) {
+        return pres;
+    }
 
     // One firmware reply holds one bank (both would exceed the reply size), so ask for each in turn.
     lf_xhorse_info_t nfo[2];
     uint8_t got = 0;
     for (uint8_t bank = 0; bank < 2; bank++) {
-        int res = xh_request_info(CMD_LF_XHORSE_DUMP, &bank, 1, &nfo[bank]);
+        lf_xhorse_rdopt_t opt = popt;
+        opt.bank = bank;
+        int res = xh_request_info(CMD_LF_XHORSE_DUMP, (uint8_t *)&opt, sizeof(opt), &nfo[bank]);
         if (res != PM3_SUCCESS) {
             if (bank == 0) {
                 return res;

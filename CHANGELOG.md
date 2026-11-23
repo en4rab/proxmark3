@@ -17,6 +17,45 @@ This project uses the changelog in accordance with [keepchangelog](http://keepac
    because a stuck chip cannot be asked what it is emulating; `--word 7935` sends only this one.
    Verified end to end twice on an XT57B: wipe, deaf, `reset`, `restore`, `lf hitag info` shows
    the UID again - 17 s on the default path.
+ - **`lf xhorse info` / `lf xhorse dump` take `--probe <a|b>`, and the VVDI's two ID8A probe words
+   turn out to do different things** (docs/implementation-plan.md Updates 31-32,
+   docs/xt57b-fullread.md SS12.4). A chip set to ID8A answers no handshake at any power-up delay,
+   so a read reports it as not found; the only thing that reaches it is the VVDI's TI-style probe.
+   `--probe b` sends the word the firmware already used, from a read instead of only from
+   reset/configure, trading the chip's type byte for a dump. `--probe a` sends the VVDI's *other*
+   word - the one it sends twice first - and then puts `XHORSE` to the chip, which the VVDI never
+   does: after word A it only ever tries `XMICRO`, which an ID8A chip ignores in any state.
+   Hardware, on an XT27A set to ID8A: word A **does** open a session (timing 3, 4R echo `41be`),
+   but bank-1 0x3C then reads **0x00** where word B leaves **0x36** - three runs each against a
+   `configure` that had just verified 0x8A. So word A is not a non-destructive read, and the two
+   words are not interchangeable wake patterns: they carry different payloads. `--probe b` stays
+   the one to use (0x36 is a valid type, 0x00 is not), and reads send no probe by default.
+ - **`--probe-word` / `--probe-type`, and the ID8A probe word turns out to be parity-checked**
+   (docs/implementation-plan.md Updates 33-34, docs/xt57b-fullread.md SS12.4). Aligning words A and
+   B against their known outcomes gives one candidate - bits 17..24 read 0x36 in B and 0x00 in A,
+   the two type bytes exactly - but nothing in the traces can confirm it, so `lf xhorse info|dump`
+   gained `--probe-word <98 S/L>` to send an arbitrary word and `--probe-type <hex>` to rewrite
+   just those eight symbols of word B. `--probe-type 36` rebuilds word B to the symbol and opens
+   the chip, as the control. The candidate is **falsified**: rewriting bits 17..24 makes the chip
+   ignore the word rather than write the byte. `tools/analysis/probe8a_sweep.py` then swept all 98
+   single-symbol flips against hardware (`data/probe8a-sweep.jsonl`): **97 are refused**, including
+   every flip inside the long run of S - so none of the word is padding - and the one exception is
+   symbol 5, which is accepted and leaves the type byte at 0x00. One rule covers every point:
+   the check is on the symbol values rather than timing - A and B differ in total duration and both
+   work - and 0x00 is just "passed the check but is not word B" (word A and B-with-symbol-5-flipped
+   both land there) while 0x36 is what word B writes. `--flips` then takes arbitrary flip sets, and 52 more
+   points (`data/probe8a-pairs.jsonl`, `-pos5`, `-cut`, `-header`) first rule out a checksum - six
+   different double flips away from symbol 5 are refused, which any equal-weight checksum would
+   wave through, while 5+40 and 5+60 are accepted - and then give the structure: **the chip reads
+   thirteen of the 98 symbols.** Symbols 0..14 are a fixed preamble, ignoring symbols 5 and 9
+   inside it; symbol 5 is a one-bit command selector. With `L` there the header alone is acted on
+   and symbols 15..97 are ignored outright (the header with the tail all `S`, and with it all `L`,
+   are both accepted); with `S` there the 83 remaining symbols are a payload and exactly two are
+   accepted, word A's tail and word B's tail, with no tolerance anywhere in them - which is why
+   replay is the only way in. The rule reproduces all 151 hardware points over 142 distinct words:
+   21 of them open the chip and leave 0x00, and exactly one leaves 0x36, which is word B. A
+   rejected word leaves the chip untouched and deaf, and every accepted word leaves bank 0
+   byte-identical - the emulated type byte is the only casualty.
  - **The ID8A probe analysed: three words in one code, none of which decode**
    (docs/xt57b-fullread.md SS12.4, `tools/analysis/probe8a.py`). The TI-style command the VVDI
    must send before it can open a session with a chip set to ID8A is a binary pulse-distance code
@@ -547,7 +586,12 @@ This project uses the changelog in accordance with [keepchangelog](http://keepac
    window. It is the write-mode window's index-2 location, which reads `00000000` on an undamaged
    chip; a non-zero value there is what makes an XT57B report `XT5F`. Writing zero back restores
    `"XT57X"` (@claude)
+- `docs/at100.md` SS9c - the AT100 config word is mostly decoration. Page `0xFE` stores whatever is written to it verbatim, so the fields had to be tested against the emulation rather than a read-back: with the chip configured to ID13 (whose payload is a literal EM4102 frame, so `lf em 410x reader` is a direct readout of the emulation engine) `b0` and `b3` turn out not to be read at all - mangled singly and together, the tag still answered `0456B307C8` - and of `b2` only bit 0 is, confirmed by two independent one-bit flips (`04`->`05` and `06`->`07` both silence it, while `04`->`06` and `04`->`FC` do nothing). The engine follows `b1`: `b1 = 02` with everything else left at ID13's values stopped the EM output, while `b1 = 01` with `b2 >> 2 = 02` kept it. So the four-block `(b3, g)` partition is not an engine selector and `g` was never a 2-bit field (@claude)
+- Added `lf autel write` warning on pages `0xFB`-`0xFD` - they are live, not an identity stamp, which write tests settled: `0xFB` *is* the UID (write it, power-cycle, and the chip announces the new one in the wake handshake, authenticating with it consistently), and `0xFD:0xFC` is the live 48-bit device key, not a genuineness signature (change one byte of either half and the old key gets the UID then a refused `{nR}{aR}` while the new key opens a full session). Each was tested one page at a time with one byte changed and restored; the chip swept back byte-identical. So an AT100 can be re-keyed and re-UID'd by anyone who can authenticate, which - the key being shared and readable - is anyone. The warning exists because every AT100 command authenticates first, so a key written and then forgotten locks the chip permanently. See `docs/at100.md` SS8b (@claude)
+- Changed `lf autel dump` - prints the whole readable space, all 255 pages `0x00`-`0xFE`, in two columns (`0x00`-`0x7F` beside `0x80`-`0xFE`) so it is 128 rows rather than 255, with a footer counting blank versus used pages. It was printing only the 59 pages the Autel programmer touches, which read as a window onto the chip rather than the whole of it. One reply carries at most `AUTEL_MAX_PAGES`, so a full dump is four READ chunks merged in the client; a chunk that fails names its range instead of printing zeros. `--used` keeps the old short view and still takes a single session (@claude)
+- Changed `lf autel dump` - now also reads pages `0xFB` and `0xFD`, two factory pages the Autel programmer never touches: `0xFB` is the UID and `0xFD` the device key's high 16 bits, so `0xFD:0xFC` is the whole 48-bit `9F63A5E8B14B` in plain sight. Found by sweeping all 256 addresses, which also settled what the dump's curated page list had left open: every address `0x00`-`0xFE` answers a READ, the 196 the Autel never uses all read `FFFFFFFF`, and `0xFF` alone is silent - four READs on it return `Edges count: 0`, and the word a dump prints for it is cipher keystream, reproducible per session position, which is why it is always flagged `?`. So `0xFE` is the last page of memory, not the end of the dump. A write test on all 196 blank pages - each given a distinct value, so one sweep checks existence and aliasing at once - shows every one is real read/write EEPROM, independently addressed with no aliasing, no leakage into the 59 data pages and settable both ways; 392 writes, all verified, and the chip swept back byte-identical to its baseline. So an AT100 has 196 free pages = 784 bytes the Autel never touches. See `docs/at100.md` SS8a (@claude)
 - Added `lf autel` - Autel AT100 programmable transponder support: `list`, `dump`, `read`, `write`, `configure`, `reset`. 18 emulated types, each image replayed byte-for-byte from a decrypted Autel capture. Reads and reconfigures a chip in any emulated type, including the talk-first EM4102 types (ID11/ID12/ID13), which need a wider reader gap than the Hitag default. See `docs/at100.md` (@en4rab)
+- Fixed `lf autel` auth-stage hint - a tag that returns its UID and then ignores `{nR}{aR}` was blamed on a talk-first emulated type, but a wrong `-k` key reaches exactly the same stage; the hint now names both (@claude)
 - Changed `lf autel` session open - a real power-down is tried first instead of the DOUT-only field gap, which a continuously-transmitting chip does not reboot from; a chip emulating ID4C now reads 8/8 where it managed 4/33 (@en4rab)
 - Added `g_hitag_t_low` - the reader's field-off pulse width is now settable at runtime instead of fixed at `HITAG_T_LOW`; `lf autel` uses 12 T0, matching the Autel programmer's own gaps, and restores the default on teardown (@en4rab)
 - Added `lf xhorse` - Xhorse XT27A super-chip support: `info`, `dump`, `configure`, `reset`, `types`; `reset`/`configure` also recover a chip stuck emulating an EM type; `info` identifies XT27B/XT57B (channel B) chips as unsupported. See `doc/xhorse_notes.md` (@CHANGEME)

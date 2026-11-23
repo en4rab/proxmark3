@@ -140,6 +140,30 @@ typedef struct {
     uint16_t aux;         // config word for XHORSE_R_TEMPLATE
 } PACKED lf_xhorse_data_t;
 
+// Which ID8A probe word xh_open_session may send as its fourth timing.  The probe is the only
+// way to reach a chip set to ID8A, but word B reverts the chip's emulated type byte to 0x36
+// (implementation-plan.md Update 29), so a read command sends nothing unless asked to.
+typedef enum {
+    XHORSE_PROBE_NONE = 0,    // timings 0..2 only - safe, but an ID8A chip will not answer
+    XHORSE_PROBE_B,           // the word the VVDI sends last; opens the chip, type byte -> 0x36
+    XHORSE_PROBE_A,           // the word it sends first, twice; opens it too, type byte -> 0x00
+    XHORSE_PROBE_CUSTOM,      // a word supplied in lf_xhorse_rdopt_t.word - for probing the code
+} xhorse_probe_t;
+
+#define XHORSE_ID8A_SYMS  98      // S/L symbols in one ID8A probe word
+
+// Client -> firmware payload for `lf xhorse info` and `lf xhorse dump`.  Both are optional: an
+// empty packet means bank 0 with no probe, which is what older clients send.
+typedef struct {
+    uint8_t  bank;        // dump: 0 = emulated image, 1 = config/identity.  info: unused
+    uint8_t  probe;       // xhorse_probe_t
+    // XHORSE_PROBE_CUSTOM only: the 98 symbols to send in place of word A or B, as 'S'/'L'.
+    // The two known words differ in 20 of the 98, and what the differences mean is open
+    // (docs/xt57b-fullread.md SS12.4), so this exists to ask the chip directly.  It is a research
+    // control: the chip acts on whatever is sent, and a word it rejects opens no session.
+    char     word[XHORSE_ID8A_SYMS];
+} PACKED lf_xhorse_rdopt_t;
+
 // Firmware -> client reply for info/dump.
 typedef struct {
     uint8_t  found;           // 1 => an XT27A or XT136 answered the handshake (see family)

@@ -23,8 +23,8 @@
 #include "../include/xhorse.h"
 
 // dispatch functions (appmain.c)
-void Xhorse_Info(bool ledcontrol);
-void Xhorse_Dump(uint8_t bank, bool ledcontrol);
+void Xhorse_Info(const lf_xhorse_rdopt_t *opt, bool ledcontrol);
+void Xhorse_Dump(uint8_t bank, const lf_xhorse_rdopt_t *opt, bool ledcontrol);
 void Xhorse_Configure(const lf_xhorse_data_t *packet, bool ledcontrol);
 void Xhorse_Reset(bool ledcontrol);
 void Xhorse_Xt57Nonce(const lf_xhorse_xt57_t *packet, bool ledcontrol);
