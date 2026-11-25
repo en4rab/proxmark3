@@ -76,6 +76,11 @@
 // a fresh power-up, and retry until we get a full 16-bit 7372 reply.
 #define XH_TRIES_PER_TIMING  3        // session-open attempts per timing (xh_open_session)
 #define XH_T_FIELD_OFF_US    20000    // coil off long enough to reset the chip (VVDI uses 20-60 ms)
+// A chip emulating a type it goes deaf on - ID48, ID8E, ID8A, an EM type, a blanked 7935 - needs far
+// longer off the coil before it listens for XMICRO again.  The Xhorse tool's own recovery drops the
+// field for 720.3 ms (90043 T0) and only then gets its ack, which is why 20 ms here and the 228 ms
+// between reset rounds never reached an ID48'd XT37 (docs/xt37.md SS5s/SS5t).
+#define XH_T_FIELD_OFF_LONG_US 760000
 #define XH_T_POWERUP_US      3000     // let the chip power up again before XHORSE
 // A chip set to ID8A ignored every XHORSE we sent 3 ms, 30 ms or 198 ms after power-up, even
 // after a 1.57 s cold-boot.  Before its first XHORSE to such a chip the VVDI keeps the field off
@@ -1280,7 +1285,40 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
 //   reader -> XMICRO (48b)          tag -> 0x5AA5 ACK
 //   reader -> 0b0011 (4b identify)  tag -> ASCII family string, e.g. "XT37"
 // On success fills type[] with the ASCII the chip reported and returns PM3_SUCCESS.
+// CRC-8 of the channel-B frame format: poly 0x07, init 0, no reflection, no final xor, over the
+// on-air bytes including the reader command that provoked the reply (docs/xt57-auth.md SS7.1).
+static uint8_t xh_crc8(const uint8_t *d, size_t n) {
+    uint8_t c = 0;
+    for (size_t i = 0; i < n; i++) {
+        c ^= d[i];
+        for (int b = 0; b < 8; b++) {
+            c = (c & 0x80) ? (uint8_t)((c << 1) ^ 0x07) : (uint8_t)(c << 1);
+        }
+    }
+    return c;
+}
+
+// The identify reply is four family bytes plus that CRC, taken over the 0011 command byte and the
+// family (docs/xt57-auth.md SS4): "XT57" -> 0x58, which is why it was long read as the string
+// "XT57X"; "XT37" -> 0x26.  Checking it is what makes the family bytes safe to build a select from.
+static bool xh_ident_crc_ok(const uint8_t *rx, size_t rxlen) {
+    if (rxlen < 40) {
+        return false;                        // truncated: no CRC byte to check
+    }
+    const uint8_t over[5] = { 0x03, rx[0], rx[1], rx[2], rx[3] };
+    return xh_crc8(over, sizeof(over)) == rx[4];
+}
+
+static int xh_xmicro_identify_off(xh_sess_t *s, uint32_t off_us,
+                                  uint8_t *type, size_t typesz, size_t *tlen);
+
+// The normal probe: a short field-off, which is all a chip that is not emulating needs.
 static int xh_xmicro_identify(xh_sess_t *s, uint8_t *type, size_t typesz, size_t *tlen) {
+    return xh_xmicro_identify_off(s, XH_T_FIELD_OFF_US, type, typesz, tlen);
+}
+
+static int xh_xmicro_identify_off(xh_sess_t *s, uint32_t off_us,
+                                  uint8_t *type, size_t typesz, size_t *tlen) {
     static const uint8_t xmicro[6] = { 'X', 'M', 'I', 'C', 'R', 'O' };
     static const uint8_t query[1]  = { 0x30 };   // 4 bits, 0b0011 (MSB-aligned)
     uint8_t rx[32];
@@ -1290,7 +1328,7 @@ static int xh_xmicro_identify(xh_sess_t *s, uint8_t *type, size_t typesz, size_t
 
     // Fresh power-up, then give the chip the VVDI's 120 ms before probing (XH_T_XMICRO_POWERUP_US).
     Gpio_SSC_DOUT_High();
-    xh_delay_us(XH_T_FIELD_OFF_US);
+    xh_delay_us(off_us);
     Gpio_SSC_DOUT_Low();
     xh_delay_us(XH_T_XMICRO_POWERUP_US);
 
@@ -1314,6 +1352,17 @@ static int xh_xmicro_identify(xh_sess_t *s, uint8_t *type, size_t typesz, size_t
     // types (7938 seen) answers XMICRO with something but says nothing to the identify query; it
     // is still an XT27A, so let the caller go on to the channel-A handshake.
     if ((rxlen < 32) || (rx[0] != 'X') || (rx[1] != 'T')) {
+        return PM3_EFAILED;
+    }
+    // A full 40-bit reply carries the CRC: check it rather than trust two ASCII bytes, so a
+    // mis-demodulated family cannot pass as a real one.  A 32-bit reply has no CRC to check and is
+    // still accepted - the XT57B traces show the 5th byte dropping out on weak coupling.
+    if ((rxlen >= 40) && (xh_ident_crc_ok(rx, rxlen) == false)) {
+        if (g_dbglevel >= DBG_ERROR) {
+            Dbprintf("xhorse: identify CRC bad: %02x %02x %02x %02x %02x (want %02x)",
+                     rx[0], rx[1], rx[2], rx[3], rx[4],
+                     xh_crc8((uint8_t[5]) { 0x03, rx[0], rx[1], rx[2], rx[3] }, 5));
+        }
         return PM3_EFAILED;
     }
     size_t n = rxlen / 8;
@@ -1443,7 +1492,7 @@ void Xhorse_Xt57Reset(const lf_xhorse_xt57_reset_t *q, bool ledcontrol) {
     // If it already answers XMICRO it is not stuck, and there is nothing for the burst to do.
     // `force` sends the bursts anyway, which is how the sequence gets exercised on a healthy chip.
     size_t tlen = 0;
-    if ((force == false) && xh_xmicro_identify(&s, out.bchip_type, sizeof(out.bchip_type), &tlen) == PM3_SUCCESS) {
+    if ((force == false) && xh_xmicro_identify_off(&s, XH_T_FIELD_OFF_LONG_US, out.bchip_type, sizeof(out.bchip_type), &tlen) == PM3_SUCCESS) {
         out.bchip = 1;
         out.bchip_type_len = (uint8_t)tlen;
         out.found = 1;                                           // already reachable
@@ -1467,8 +1516,11 @@ void Xhorse_Xt57Reset(const lf_xhorse_xt57_reset_t *q, bool ledcontrol) {
         for (int round = 0; round < XT57_EM_ROUNDS; round++) {
             xt57_em_round(at_us, word, on_us, off_us);
 
-            // xh_xmicro_identify power-cycles and waits XH_T_XMICRO_POWERUP_US itself
-            if (xh_xmicro_identify(&s, out.bchip_type, sizeof(out.bchip_type), &tlen) == PM3_SUCCESS) {
+            // xh_xmicro_identify_off power-cycles and waits XH_T_XMICRO_POWERUP_US itself.  The
+            // long off is the point of this path: an emulating chip needs ~720 ms down before it
+            // listens again (docs/xt37.md SS5t), and the bursts are secondary.
+            if (xh_xmicro_identify_off(&s, XH_T_FIELD_OFF_LONG_US, out.bchip_type,
+                                       sizeof(out.bchip_type), &tlen) == PM3_SUCCESS) {
                 out.bchip = 1;
                 out.bchip_type_len = (uint8_t)tlen;
                 hitag_cleanup(ledcontrol);
@@ -1503,7 +1555,8 @@ void Xhorse_Xt57Reset(const lf_xhorse_xt57_reset_t *q, bool ledcontrol) {
             xh_delay_us(XT57_EM_ROUND_OFF_US);
             Gpio_SSC_DOUT_Low();
 
-            if (xh_xmicro_identify(&s, out.bchip_type, sizeof(out.bchip_type), &tlen) == PM3_SUCCESS) {
+            if (xh_xmicro_identify_off(&s, XH_T_FIELD_OFF_LONG_US, out.bchip_type,
+                                       sizeof(out.bchip_type), &tlen) == PM3_SUCCESS) {
                 out.bchip = 1;
                 out.bchip_type_len = (uint8_t)tlen;
                 // the winning burst is somewhere in the block just sent; report the last of them,
@@ -1543,7 +1596,13 @@ void Xhorse_Info(const lf_xhorse_rdopt_t *opt, bool ledcontrol) {
     // Try the XMICRO / channel-B identify first.  A family name means a newer super-chip family
     // (XT57 / XT37-class) that this command does not yet support - report it and stop.
     size_t tlen = 0;
-    if (xh_xmicro_identify(&s, out.bchip_type, sizeof(out.bchip_type), &tlen) == PM3_SUCCESS) {
+    // A chip emulating a deaf type answers only after a long power-down, so if the quick probe finds
+    // nothing, spend the 760 ms once before concluding there is no channel-B chip (docs/xt37.md SS5t).
+    if (xh_xmicro_identify(&s, out.bchip_type, sizeof(out.bchip_type), &tlen) != PM3_SUCCESS) {
+        xh_xmicro_identify_off(&s, XH_T_FIELD_OFF_LONG_US, out.bchip_type,
+                               sizeof(out.bchip_type), &tlen);
+    }
+    if (tlen > 0) {
         out.bchip = 1;
         out.bchip_type_len = (uint8_t)tlen;
         hitag_cleanup(ledcontrol);
@@ -2123,6 +2182,10 @@ static void xt57_session(xh_sess_t *s, const lf_xhorse_xt57_t *p, int32_t val, l
     if (rxlen >= 16) {
         memcpy(r->ident, rx, sizeof(r->ident));
     }
+    bool ident_crc = xh_ident_crc_ok(rx, rxlen);
+    if (ident_crc) {
+        r->flags |= XT57_F_IDCRC;
+    }
     if ((rxlen >= 32) && (rx[0] == 'X') && (rx[1] == 'T')) {
         r->flags |= XT57_F_IDENT;
     } else if (p->press_on == 0) {
@@ -2131,7 +2194,21 @@ static void xt57_session(xh_sess_t *s, const lf_xhorse_xt57_t *p, int32_t val, l
 
     uint16_t selbits = p->selbits ? p->selbits : (XHORSE_XT57_SELLEN * 8);
     if (selbits > XHORSE_XT57_SELLEN * 8) selbits = XHORSE_XT57_SELLEN * 8;
-    rxlen = xh_xfer_clear(s, p->select, selbits, rx, sizeof(rx), t_id_sel);
+
+    // A chip ignores a select that does not carry its own family bytes: an XT37 given a "XT57"
+    // select acks and identifies and then answers no nonce at all (docs/xt37.md SS3).  So build the
+    // select from the family the chip just named, rather than from a constant - but only on the
+    // standard 13-byte 0xC0 form, and only when the reply's CRC validated, so a bad demod cannot
+    // put rubbish in the frame.  `sel_auto == 0` sends select[] exactly as the client gave it.
+    uint8_t sel[XHORSE_XT57_SELLEN];
+    memcpy(sel, p->select, sizeof(sel));
+    if (p->sel_auto && ident_crc && (selbits == XHORSE_XT57_SELLEN * 8) && (sel[0] == 0xC0)) {
+        if (memcmp(&sel[1], rx, 4) != 0) {
+            memcpy(&sel[1], rx, 4);
+        }
+        r->flags |= XT57_F_SELFAM;
+    }
+    rxlen = xh_xfer_clear(s, sel, selbits, rx, sizeof(rx), t_id_sel);
     r->nonce_bits = (uint8_t)((rxlen > 255) ? 255 : rxlen);
     memcpy(r->nonce, rx, sizeof(r->nonce));
     if (rxlen < 32) {

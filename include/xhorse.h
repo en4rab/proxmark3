@@ -176,10 +176,11 @@ typedef struct {
     uint8_t  image_pages;     // how many pages of `bank` are in image[]
     // XMICRO / "channel B" probe (XT57 / XT37-class chips).  An XT27A set to some types (7938)
     // answers XMICRO too, but only a newer, not-yet-supported family names itself ("XT37",
-    // "XT57") in reply to the identify query that follows.
+    // "XT57") in reply to the identify query that follows.  That reply is four family bytes plus a
+    // CRC-8 over the command byte and the family, not a five-character string (docs/xt57-auth.md SS4).
     uint8_t  bchip;           // 1 => a B-channel (XMICRO) chip answered the identify probe
     uint8_t  bchip_type_len;  // number of ASCII bytes in bchip_type[]
-    uint8_t  bchip_type[8];   // ASCII family string the chip reported (e.g. "XT37")
+    uint8_t  bchip_type[8];   // the raw identify reply: 4 ASCII family bytes + CRC (e.g. 5854333726)
     uint8_t  page_ok[8];      // bit (n % 8) of byte n / 8 set => two consecutive reads of page n agreed
     uint8_t  family;          // xhorse_family_t
     uint16_t seed_reply;      // the tag's reply to 7372 (XT27A) / E430 (XT136) that seeds the cipher
@@ -215,7 +216,7 @@ typedef struct {
 } PACKED lf_xhorse_io_reply_t;
 
 // XT57B (channel B / XMICRO) nonce collection, `lf xhorse xt57 nonce`.  doc/xhorse_notes.md.
-// Session: field on, XMICRO -> 0x5AA5, 0011 -> "XT57X", 104-bit select -> 32-bit nonce, 32-bit answer -> 64-bit reply.
+// Session: field on, XMICRO -> 0x5AA5, 0011 -> "XT57" + CRC, 104-bit select -> 32-bit nonce, 32-bit answer -> 64-bit reply.
 // The answer and reply depend only on the nonce; XHORSE_XT57_KNOWN lists the (nonce, answer, reply) triples seen
 // from a VVDI mini, X(nonce, answer, reply_hi, reply_lo).
 #define XHORSE_XT57_KNOWN     X(0x2CFE132E, 0xFB33A1F1, 0xE58572D5, 0xE585F912)     X(0x59FC265C, 0x4FBDCA62, 0xB1F0879E, 0x404AFF59)     X(0xB3F84CB9, 0x2E21740A, 0xCC4B51BC, 0x6A69F0B3)     X(0x67F09973, 0x99AAEF6B, 0x55B462CA, 0x132478D0)     X(0xCFE132E7, 0xA9CBEA5B, 0xB72636B1, 0x155D7F00)     X(0x9FC265CF, 0xC9ABF021, 0x983E9981, 0x0367AD7A)     X(0x7F09973E, 0xA0D63F3E, 0x93D4AEEB, 0x592AE381)     X(0xFE132E7C, 0x7CCA106D, 0x6BECC747, 0x19267F38)     X(0xFC265CF9, 0xF24F7DBA, 0x919B81F2, 0x37FC0428)     X(0xF9B735D1, 0x914F41D0, 0xE4F40216, 0xE2070455)     X(0xCDB9AE8C, 0x1BA796D1, 0x79B67285, 0x0078F49D)     X(0x36E6BA31, 0xC64A3095, 0x703C397F, 0xC27ADBF5)     X(0x6DCD7463, 0x519F0319, 0x6B6E92C6, 0x91C91277)
@@ -252,7 +253,7 @@ typedef struct {
 typedef enum {
     XT57_SWEEP_POWERUP = 0,   // field on -> XMICRO, us (default 120140)
     XT57_SWEEP_ACK_ID,        // 0x5AA5 -> 0011, T0 since the last tag edge (default 88)
-    XT57_SWEEP_ID_SEL,        // "XT57X" -> select, T0 (default 82)
+    XT57_SWEEP_ID_SEL,        // identify reply -> select, T0 (default 82)
     XT57_SWEEP_NONCE_ANS,     // nonce -> answer, T0 (default 144)
     XT57_SWEEP_FIELD_OFF,     // field-off time before the session, us (default 20000)
     XT57_SWEEP_NONE,          // nothing: repeat the default session
@@ -277,6 +278,10 @@ typedef struct {
     //                           the sweep when that is XT57_SWEEP_POWERUP.
     uint8_t  press_on;        // send the select even when the 0011 identify went unanswered -
     //                           a diagnostic for a chip that acks XMICRO and nothing else.
+    uint8_t  sel_auto;        // 1 => overwrite select[1..4] with the family bytes the chip just
+    //                           named, when the identify CRC validated and select[] is the
+    //                           standard 0xC0 + family + 8 tail form.  A chip answers no nonce at
+    //                           all to a select carrying someone else's family (docs/xt37.md SS3).
     uint8_t  select[XHORSE_XT57_SELLEN];
     // Post-auth script.  Only run when the session's nonce equals `want` (or want == 0), because a
     // swept delay lands on the wanted nonce only now and then and the keystream is nonce-specific.
@@ -306,6 +311,8 @@ typedef struct {
 #define XT57_F_IDENT   0x02   // reply to 0011 started "XT"
 #define XT57_F_NONCE   0x04   // 32-bit nonce demodulated
 #define XT57_F_ANSWER  0x08   // an answer was sent
+#define XT57_F_IDCRC   0x10   // the identify reply's CRC-8 validated (docs/xt57-auth.md SS4)
+#define XT57_F_SELFAM  0x20   // the select's family bytes were taken from that reply
 
 typedef struct {
     uint8_t  flags;           // XT57_F_*

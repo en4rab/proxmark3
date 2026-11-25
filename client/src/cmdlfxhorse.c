@@ -36,6 +36,15 @@
 #include "xhorse.h"       // shared struct / recipe enum
 
 static int CmdHelp(const char *Cmd);
+// Channel-B CRC-8 (poly 0x07, init 0); defined with the xt57 helpers below, used by `info`
+// to check the identify reply's CRC (docs/xt57-auth.md SS4).
+static uint8_t xt57_crc8(const uint8_t *d, size_t n);
+// Channel-B helpers, defined with the xt57 code below; `info` uses them to read an XT37/XT57's
+// emulated type byte out of its config block (docs/xt37.md SS5o).
+static const char *xt_type_name(uint8_t t);
+static int xt_read_typeword(bool is37, uint32_t *word);
+typedef struct xt57_ks_s xt57_ks_t_fwd;
+static int xt_steer(const struct xt57_ks_s *ks, int32_t from, int32_t *at, bool verbose);
 
 //-----------------------------------------------------------------------------
 // Type catalog
@@ -439,9 +448,9 @@ static int CmdLFXhorseInfo(const char *Cmd) {
     // A reply to the XMICRO / channel-B identify means a newer super-chip family
     // (XT57 / XT37-class) that this command does not yet support.
     if (nfo.bchip) {
-        // The family tag is a fixed 4 ASCII chars (e.g. "XT37").  A 5th byte often follows in
-        // the reply; it is not part of the name and is ignored here.  It varies, and may be a
-        // seed for channel-B encryption, as the 7372 reply is for channel A.
+        // The reply is 4 ASCII family bytes (e.g. "XT37") followed by a CRC-8 over the 0011
+        // command byte and those four - not a 5-character name, and not a seed: "XT57" -> 0x58,
+        // which is why it read as "XT57X", and "XT37" -> 0x26 (docs/xt57-auth.md SS4).
         char type[5] = {0};
         size_t n = (nfo.bchip_type_len < 4) ? nfo.bchip_type_len : 4;
         size_t j = 0;
@@ -452,9 +461,33 @@ static int CmdLFXhorseInfo(const char *Cmd) {
         const char *type_str = (j == 0) ? "(unknown)" : type;
         PrintAndLogEx(NORMAL, "");
         PrintAndLogEx(INFO, "Found an Xhorse " _YELLOW_("channel-B") " (XMICRO) super-chip");
-        PrintAndLogEx(WARNING, "Chip type " _YELLOW_("%s") " is not currently supported.", type_str);
-        PrintAndLogEx(INFO, "Identify reply... %s", sprint_hex_inrow(nfo.bchip_type, nfo.bchip_type_len));
-        PrintAndLogEx(HINT, "Support for newer families may be added once the channel-B protocol is decoded.");
+        PrintAndLogEx(INFO, "Chip type...... " _YELLOW_("%s"), type_str);
+        if (nfo.bchip_type_len >= 5) {
+            const uint8_t over[5] = { 0x03, nfo.bchip_type[0], nfo.bchip_type[1],
+                                      nfo.bchip_type[2], nfo.bchip_type[3] };
+            uint8_t want = xt57_crc8(over, sizeof(over));
+            PrintAndLogEx(INFO, "Identify reply... %s  (%s + CRC %02X %s)",
+                          sprint_hex_inrow(nfo.bchip_type, nfo.bchip_type_len), type_str,
+                          nfo.bchip_type[4],
+                          (want == nfo.bchip_type[4]) ? _GREEN_("ok") : _RED_("BAD"));
+        } else {
+            PrintAndLogEx(INFO, "Identify reply... %s  (%d bytes, no CRC byte)",
+                          sprint_hex_inrow(nfo.bchip_type, nfo.bchip_type_len), nfo.bchip_type_len);
+        }
+        // The emulated type lives in the config block, not in the identify reply, so reading it
+        // means opening an authenticated session - which needs a nonce this chip reaches, and that
+        // is a per-tag power-up delay the search has to hunt for (docs/xt37.md SS4a).
+        bool is37 = (n >= 4 && nfo.bchip_type[2] == '3' && nfo.bchip_type[3] == '7');
+        uint32_t tw = 0;
+        PrintAndLogEx(INFO, "reading the type byte (needs a session; this can take a moment)...");
+        if (xt_read_typeword(is37, &tw) == PM3_SUCCESS) {
+            PrintAndLogEx(SUCCESS, "Emulated type.. " _GREEN_("%02X") " (%s)",
+                          (uint8_t)(tw & 0xFF), xt_type_name((uint8_t)(tw & 0xFF)));
+            PrintAndLogEx(INFO, "config word.... %08X   (segment 3 block 1F page 4)", tw);
+        } else {
+            PrintAndLogEx(WARNING, "could not read the type byte - no recorded nonce came up");
+            PrintAndLogEx(HINT, "the delay that reaches a nonce is per-tag; `lf xhorse xt57 read --at <us>`");
+        }
         return PM3_SUCCESS;
     }
 
@@ -1182,14 +1215,17 @@ static int CmdLFXhorseXt57Nonce(const char *Cmd) {
                   "lf xhorse xt57 nonce --sweep powerup --step 8 -n 200   -> field-on delay 120140, 120148, ...\n"
                   "lf xhorse xt57 nonce --sweep idsel --base 70 --step 1 -n 40\n"
                   "lf xhorse xt57 nonce --noanswer -f nonces.csv -n 500\n"
-                  "lf xhorse xt57 nonce --noanswer --select FF58543537 --selbits 40   -> a 40 bit select frame");
+                  "lf xhorse xt57 nonce --noanswer --select FF58543537 --selbits 40   -> a 40 bit select frame\n"
+                  "\n"
+                  "By default the select carries the family bytes the chip itself reports to the 0011 identify,\n"
+                  "so an XT37 needs no --select; a chip refuses a select carrying another family (docs/xt37.md).");
     void *argtable[] = {
         arg_param_begin,
         arg_int0("n", "count", "<dec>", "number of sessions (def 32)"),
         arg_str0(NULL, "sweep", "<name>", "gap to step: powerup, ackid, idsel, nonans, off or none (def none)"),
         arg_int0(NULL, "base", "<dec>", "swept gap for session 0, us or T0 (def: the VVDI's)"),
         arg_int0(NULL, "step", "<dec>", "added to the swept gap each session (def 1)"),
-        arg_str0(NULL, "select", "<hex>", "13 byte select frame (def C0 'XT57' 123456789ABCDEF0)"),
+        arg_str0(NULL, "select", "<hex>", "13 byte select frame, sent verbatim (def: C0 + the chip's own family + 123456789ABCDEF0)"),
         arg_str0(NULL, "answer", "<hex>", "always send this 32-bit answer"),
         arg_lit0(NULL, "noanswer", "do not answer, only record nonces"),
         arg_str0("f", "file", "<fn>", "also write a CSV of the sessions"),
@@ -1345,6 +1381,10 @@ static int CmdLFXhorseXt57Nonce(const char *Cmd) {
     p.rfirst = (uint8_t)rfirst;
     p.powerup_us = (uint32_t)powerup;
     p.press_on = presson ? 1 : 0;
+    // With no --select, let the firmware fill the family bytes in from the chip's own identify
+    // reply: a chip answers no nonce at all to a select carrying another family's bytes
+    // (docs/xt37.md SS3).  An explicit --select is sent exactly as given.
+    p.sel_auto = (sellen == 0) ? 1 : 0;
     p.selbits = (uint8_t)selbits;
 
     if (npost > 0) {
@@ -1374,7 +1414,9 @@ static int CmdLFXhorseXt57Nonce(const char *Cmd) {
 
     PrintAndLogEx(INFO, "%d sessions, sweep " _YELLOW_("%s") " from %d step %d %s.  Press " _GREEN_("Enter") " to stop",
                   total, xt57_sweep_names[sweep], base, step, xt57_sweep_units[sweep]);
-    PrintAndLogEx(INFO, "  #  %-9s flg nonce     off  answer    reply             check",
+    // flags: A = XMICRO ack, I = identify named a family, C = that reply's CRC validated,
+    // F = the select's family bytes came from it, N = a nonce came back.
+    PrintAndLogEx(INFO, "  #  %-9s flags nonce     off  answer    reply             check",
                   (sweep == XT57_SWEEP_NONE) ? "" : xt57_sweep_names[sweep]);
 
     uint32_t seen[512];
@@ -1441,7 +1483,10 @@ static int CmdLFXhorseXt57Nonce(const char *Cmd) {
                     snprintf(cstr, sizeof(cstr), "no XMICRO ack");
                 }
             } else if ((r->flags & XT57_F_IDENT) == 0) {
-                snprintf(cstr, sizeof(cstr), "ack %02X%02X, no XT57X: %s", r->ack[0], r->ack[1], sprint_hex_inrow(r->ident, 5));
+                snprintf(cstr, sizeof(cstr), "ack %02X%02X, no family reply: %s",
+                         r->ack[0], r->ack[1], sprint_hex_inrow(r->ident, 5));
+            } else if ((r->flags & XT57_F_IDCRC) == 0) {
+                snprintf(cstr, sizeof(cstr), "identify CRC bad: %s", sprint_hex_inrow(r->ident, 5));
             } else {
                 snprintf(cstr, sizeof(cstr), "no nonce (%u bits)", r->nonce_bits);
             }
@@ -1469,8 +1514,9 @@ static int CmdLFXhorseXt57Nonce(const char *Cmd) {
                 }
             }
 
-            PrintAndLogEx(INFO, "%3d %9d  %c%c%c %-9s %-4s %-9s %-17s %s", idx + 1, val,
+            PrintAndLogEx(INFO, "%3d %9d  %c%c%c%c%c %-9s %-4s %-9s %-17s %s", idx + 1, val,
                           (r->flags & XT57_F_ACK) ? 'A' : '-', (r->flags & XT57_F_IDENT) ? 'I' : '-',
+                          (r->flags & XT57_F_IDCRC) ? 'C' : '-', (r->flags & XT57_F_SELFAM) ? 'F' : '-',
                           (r->flags & XT57_F_NONCE) ? 'N' : '-', nstr, ostr, astr, rstr, cstr);
             if (csv) {
                 fprintf(csv, "%d,%d,%02X,%s,%u,%s,%s,%u,%s,%s\n", idx + 1, val, r->flags, sprint_hex_inrow(r->ident, 5),
@@ -1700,7 +1746,7 @@ static const uint32_t xt57_ksC_K[183] = {
     0xD90CDD4F, 0xBFD2E386, 0x00000000
 };
 
-typedef struct {
+typedef struct xt57_ks_s {
     uint32_t        nonce;
     uint32_t        answer;
     int             nex;        // exchanges this keystream reaches, 1..nex
@@ -1708,6 +1754,15 @@ typedef struct {
     //                             only a terminator ('E', a command byte alone) may be built.
     const uint8_t  *k0;
     const uint32_t *K;
+    int32_t         off_us;     // field-off before each session.  This is family-critical: an XT37
+    //                             holds its nonce state through 45 ms, so at the XT57's 45000 its
+    //                             nonce is *pinned* and no longer tracks the power-up delay at all
+    //                             (docs/xt37.md SS4a) - which makes steering impossible and reads a
+    //                             lottery.  200 ms restores the delay -> nonce mapping.
+    uint8_t         sel_auto;   // 1 => let the firmware fill the select's family bytes in from the
+    //                             chip's own identify reply (docs/xt37.md SS3).  An XT37's recorded
+    //                             sessions use `C0 "XT37" 123456789ABCDEF0`, exactly what that
+    //                             produces, so one table serves any chip of the family.
     int32_t         centre;     // default centre of the power-up search, us
     int32_t         span;       // default half-width, us
     int32_t         step;       // search step, us.  The nonce window advances one stream bit per
@@ -1717,20 +1772,294 @@ typedef struct {
     //                             four steps, which it is not worth missing a session over.
 } xt57_ks_t;
 
-// Which nonce a given power-up delay produces is not quite repeatable: the window the chip
-// takes drifts a bit either way, so some nonces sit on a wide plateau and some are only hit
-// now and then.  On the tag here CDB9AE8C holds for about 10 us while 6DCD7463 is interleaved
-// with its two neighbours and turns up in roughly one sample in forty - which is a session
-// that silently does nothing.  So the search tries each nonce that reaches far enough, in
-// order, and runs at the first one it lands on; that ordering is the only thing separating
-// them, since a built session is not tied to the nonce the VVDI happened to record it at.
+// XT37, nonce AD4BD054: 178 contiguous exchanges (docs/xt37.md SS5n/SS5p)
+static const uint8_t xt37_ks_AD4BD054_k0[179] = {
+    0x00, 0x60, 0x8D, 0xD5, 0x29, 0xBC, 0xF0, 0x5F, 0x0A, 0x7A, 0x0A, 0xB9,
+    0x21, 0xD3, 0x62, 0x21, 0xF6, 0xDE, 0xD5, 0x1C, 0xFC, 0x28, 0x7D, 0x2F,
+    0x53, 0x5A, 0x37, 0x70, 0x69, 0x3F, 0xC0, 0xA7, 0x2C, 0x2F, 0xC9, 0x12,
+    0xFA, 0x89, 0xC8, 0x55, 0xBC, 0x9B, 0x7D, 0x1F, 0xF3, 0x3D, 0x0B, 0x07,
+    0x0E, 0xB2, 0xA4, 0xBB, 0x8B, 0xC4, 0x5F, 0xF4, 0x95, 0xE4, 0x3A, 0x05,
+    0x74, 0x3B, 0xAD, 0xEA, 0x28, 0x92, 0x54, 0x15, 0x5A, 0xFF, 0x8E, 0x63,
+    0x65, 0xFE, 0x66, 0x54, 0xB0, 0x34, 0x2F, 0xEC, 0x69, 0xD7, 0xE7, 0x7C,
+    0xA0, 0x85, 0xF1, 0x6E, 0x57, 0x3B, 0x8E, 0xF8, 0xF3, 0xB3, 0xBF, 0x11,
+    0xB1, 0x13, 0x52, 0xFC, 0xD9, 0x0C, 0x0E, 0x8E, 0xB4, 0x1D, 0x5D, 0x5B,
+    0x3E, 0x2B, 0x33, 0x7D, 0x61, 0x4A, 0x19, 0x6C, 0x26, 0x03, 0x8B, 0xBD,
+    0x0F, 0xAD, 0xE8, 0x4E, 0xF3, 0xC8, 0x22, 0x6F, 0xBA, 0x15, 0x4A, 0x78,
+    0x8A, 0x95, 0xEC, 0x66, 0x58, 0xFF, 0x98, 0x8A, 0x86, 0xB8, 0xFF, 0x8B,
+    0xC8, 0x7C, 0x14, 0x6E, 0x96, 0x23, 0xAF, 0x40, 0x1A, 0xDE, 0xEB, 0xBC,
+    0x6D, 0x24, 0x4B, 0xB2, 0x59, 0x3D, 0x2A, 0xB0, 0xB9, 0xA1, 0x03, 0x11,
+    0x0F, 0xD2, 0x2D, 0x4D, 0x72, 0x7B, 0xAF, 0xA3, 0xA9, 0xF6, 0x98
+};
+static const uint32_t xt37_ks_AD4BD054_K[179] = {
+    0x00000000, 0x9FA57938, 0x5A45317F, 0x86C42898, 0x2FEA11C7, 0x37A3315B,
+    0x21F29B5C, 0xA162B782, 0x5916234E, 0x86A68223, 0xC0B2590C, 0x42D00D27,
+    0x901E855F, 0x7142865F, 0x2383D5C0, 0x7BCA9C0B, 0x3A1F0F5A, 0x6E3084E1,
+    0x539BBC75, 0xE72BA04F, 0x66824EA7, 0xDE083A76, 0x81D79509, 0xF0E54E51,
+    0x05E953A8, 0x5D928518, 0xA5BA2F40, 0x243527A8, 0xACBEF7F0, 0x8C57598D,
+    0xCE192DB0, 0x0D413FB3, 0xE257411F, 0x48D97B03, 0x56F18879, 0x63C197AD,
+    0xA8F0D94F, 0x5BEB16DD, 0xF7632754, 0x4AFC0EDB, 0xEFA103F6, 0xD83354E1,
+    0x75775A94, 0xE4694117, 0x522C58C3, 0xEEB14BA9, 0x6AD6AE88, 0x7C51EF16,
+    0x726C0BF7, 0x955BEE10, 0x86398756, 0x79A0ECE9, 0x59C4430A, 0x29ABDFD4,
+    0x5A63C615, 0x766DB1AD, 0x97C9C035, 0x43BB57F5, 0xF07E3A08, 0xDF5D1D4D,
+    0x9ADC0631, 0x3E44F465, 0xC896D2B5, 0x8BA95C8A, 0x4CC6CE2F, 0xE4E08CE6,
+    0x0696A064, 0x0BDFBA53, 0xAB54049D, 0xF91876BE, 0x6D774B6C, 0xBD454C1A,
+    0xBE94A498, 0xF97118D3, 0x8093C265, 0xF2348827, 0x1309C812, 0xA541F653,
+    0xD827E1B3, 0xD3E83730, 0x547E7C8C, 0xF8CE11DE, 0x026BD39A, 0x3FEE5F92,
+    0x86CFFDCD, 0x392DD17C, 0x3114FF41, 0xF94AB80F, 0xAF28AE78, 0xF24FC65C,
+    0xC2463BC4, 0x0651D494, 0x097D26B9, 0x30E952EF, 0x10611E07, 0x826155D3,
+    0xE695CACE, 0x3A3C90A9, 0x0421472A, 0x7EDD698F, 0xD5C9C5CE, 0x08162BC7,
+    0x2D1DE3C4, 0x96FD7A44, 0x5ED22052, 0x7D034F10, 0x89A872B9, 0xFB86CFEE,
+    0x2EC60C96, 0xB445FDE6, 0x40E312D5, 0x34E056FC, 0xB6B44207, 0xF39FD03E,
+    0x3F8AA717, 0x2D2372A5, 0x99E7D2FC, 0xE5603564, 0xBCAA917D, 0x8FF6AC86,
+    0xFDAA2652, 0xEC2D3785, 0x3E950628, 0x73F25E41, 0xB7E8C7FD, 0x4357DF2D,
+    0x9D0E8951, 0xD05DD2F1, 0x6B7EF40A, 0x729B19E0, 0xD07DDA7A, 0x219C873F,
+    0x29D1B835, 0x96B8A6AA, 0xA4255E5C, 0xF96471E9, 0xDBDC7D42, 0xAAF069D5,
+    0xA5B159AB, 0xBE36A6B2, 0xEB07FBCD, 0xF47325FA, 0x9B772AAB, 0x5E76000E,
+    0xEB9213C3, 0x97A30B81, 0x61FC8E4E, 0xF5E4A516, 0xA0A8BB08, 0x37AB728E,
+    0x9EB546D1, 0x664E3298, 0xBD52C60E, 0xD3D9BE38, 0x451B0798, 0xAEDD63CA,
+    0x64FE9F03, 0x126EAD9F, 0x9DE24E5C, 0x3CAF310D, 0xAFD4C501, 0x0A977245,
+    0xF8F4E173, 0xF3E90C5F, 0x7F589DCA, 0x7C8A90B3, 0x8451D1E5, 0xFB85E74E,
+    0xB5497650, 0xE870819D, 0x42B6D7FD, 0x9209E8AD, 0x5849CDC6, 0x4E3580A3,
+    0xE01E54A0, 0xB8BBC9C2, 0xBCC24F63, 0x39FFAED6, 0xBC269AA7
+};
+// XT37, nonce D4BD0543: 170 contiguous exchanges (docs/xt37.md SS5n/SS5p)
+static const uint8_t xt37_ks_D4BD0543_k0[171] = {
+    0x00, 0x83, 0x8E, 0xA3, 0xD9, 0xD7, 0xEC, 0x1E, 0x06, 0x25, 0xD2, 0x71,
+    0x2E, 0x9C, 0x00, 0x97, 0x71, 0x0E, 0x5F, 0x57, 0xD2, 0x53, 0xFA, 0x02,
+    0xAE, 0x5F, 0xFC, 0x40, 0x46, 0x55, 0x09, 0x55, 0x77, 0x37, 0x08, 0xFD,
+    0x0D, 0xAB, 0x6A, 0x84, 0x65, 0x32, 0x26, 0x62, 0x2B, 0xBE, 0x29, 0x69,
+    0xC4, 0x0F, 0x1D, 0x68, 0x32, 0xA8, 0xE2, 0x24, 0xAF, 0xB9, 0x9D, 0x2F,
+    0x26, 0x02, 0x0C, 0x70, 0xBC, 0x27, 0xC5, 0x77, 0x82, 0x27, 0xD8, 0x2D,
+    0x37, 0x00, 0xC1, 0x76, 0x31, 0x7A, 0x03, 0x91, 0x99, 0x83, 0x9A, 0x29,
+    0x45, 0xCD, 0x90, 0x22, 0x61, 0x13, 0x98, 0xB3, 0xA9, 0x1C, 0x2B, 0x38,
+    0x53, 0x60, 0x38, 0x6F, 0x5A, 0xAC, 0x7B, 0x99, 0x37, 0x0B, 0x9E, 0xDA,
+    0x0E, 0xB9, 0x6B, 0xAC, 0xAE, 0x40, 0x5D, 0x38, 0x86, 0xCF, 0xB7, 0xED,
+    0xB7, 0xEE, 0xE2, 0xF5, 0xBE, 0xAF, 0x3F, 0xD8, 0xFE, 0x9A, 0xFE, 0x4F,
+    0xBF, 0x71, 0x44, 0xDF, 0x3B, 0x12, 0x7F, 0x78, 0xF1, 0x78, 0x90, 0x47,
+    0x42, 0xC2, 0x93, 0x91, 0xB9, 0x00, 0xB0, 0x74, 0x63, 0xD4, 0x5E, 0x0C,
+    0xE0, 0x7B, 0xA3, 0x12, 0xD9, 0x79, 0x48, 0x39, 0x4C, 0x8D, 0x46, 0xA5,
+    0x9D, 0x64, 0x04
+};
+static const uint32_t xt37_ks_D4BD0543_K[171] = {
+    0x00000000, 0x3C67C70E, 0x08940100, 0x06758FD3, 0x9E074368, 0xBB17627D,
+    0xB15817BB, 0xA1AF9A9A, 0x081C85EB, 0x247A4766, 0x97794809, 0xB3ED3D6A,
+    0x63A84A32, 0x17457CF1, 0xC5656083, 0xE93A7897, 0x3CCCECDE, 0x0C8F06A9,
+    0xA5A34758, 0x6C076AF5, 0x89F76556, 0x4649423B, 0xF2D19CB5, 0xC38D58E7,
+    0x957C1263, 0x20264791, 0x637E3F12, 0x1D55E31D, 0x94FF5E11, 0x13F23F2C,
+    0xDA76E50C, 0x03BEF4D5, 0xF07E2E9E, 0x31C48463, 0xC5D8241F, 0xA1A64120,
+    0xC5456C05, 0xA92AF477, 0x8D177533, 0xD72C5842, 0xF12BB100, 0xD861A5D4,
+    0xE0F296F9, 0xE3F43368, 0x93470E7C, 0xC235E307, 0x5A323228, 0x9FE0FDC4,
+    0x4508A549, 0x80C9E96E, 0xEF248FB1, 0x45C3BEF4, 0x60960F8C, 0x9C9BDBB6,
+    0x2B563AFF, 0xC65548CF, 0x0EE9638A, 0x32EBF83D, 0xEA96A847, 0xF8D95476,
+    0x4BD709CB, 0x5B85BD50, 0x415D0A5C, 0x2A4465EE, 0x2D6010F2, 0xED623007,
+    0xD4B33ABF, 0xA53173F0, 0x1E26991B, 0xBE882ADA, 0xDB6E33E3, 0xD5587252,
+    0x7D2D7EE3, 0x08370271, 0xE9E17161, 0x12359F90, 0x72197579, 0x1BE69319,
+    0x9E51B3A9, 0xB9FB82D3, 0x5DFC2F17, 0x18BCA741, 0x1079CFC9, 0xCF58CC10,
+    0xF55B407A, 0x55B1F81E, 0x818DA187, 0xEB02C772, 0xE8F1F393, 0x27A0905A,
+    0xDD445F7B, 0x52E9ACFE, 0x947DB58A, 0x89079522, 0x902D25E3, 0x1369CCC4,
+    0xF2A295C7, 0xDA27C01D, 0x802BD375, 0xE4C770BC, 0x6464E121, 0xD6E34ED6,
+    0xEA7F3303, 0x1534B305, 0x52E0FCA1, 0xA7232993, 0xA8E386D5, 0x767BECE9,
+    0x2564312D, 0x07684A7B, 0xA16F5C9D, 0x700CE03C, 0x5C59522B, 0x5C9E483D,
+    0xF43399AF, 0xEB3C0E06, 0x50A0E9AD, 0x2F32A348, 0x3429FC7E, 0x1E50CE10,
+    0x2D19BA3C, 0xD4A758D4, 0xB1E61DA6, 0xEEC33001, 0x59DF50D1, 0xAE704914,
+    0x58C7CEB5, 0x26CCD001, 0x47EE4270, 0x15BE6132, 0x79052EFD, 0xA28E3210,
+    0x276FDCDA, 0xD821AB4D, 0x63B36A64, 0xCB6E9019, 0xA470BAE1, 0x2A563E01,
+    0x18AF09A9, 0x0A43637C, 0xE3EF615E, 0xC8527667, 0x45DA2C5F, 0xCCD4EC4F,
+    0x18DA5FA9, 0x0410FF2C, 0x5AA021A8, 0x552B9955, 0x97B15150, 0x0B2A46B9,
+    0xA090CCA4, 0xD47BAEF9, 0xA151DB9A, 0xD4BF6BEE, 0x1CA9FA01, 0x1E9C00BD,
+    0x7325CB34, 0xF75D1DB6, 0x78A909F8, 0xA5FC9CE3, 0x1DB09C32, 0xD03D5EFC,
+    0xF1E7CCD6, 0x8337320D, 0x44F01E3D, 0xB0D80C03, 0x6C6A5E36, 0x0D79CC79,
+    0xA4EB6DD8, 0x08DAB2B3, 0x94B6A644
+};
+
+// Emulated images, decrypted from the Xhorse tool's own set sessions (docs/xt37.md SS5p).
+// Each entry is one page write: (select operand, page, value).  The type byte is not here -
+// setimage commits it separately, after the image, per xt57b-fullread.md SS12.7.
+typedef struct { uint8_t arg; uint8_t page; uint32_t val; } xt_imgpage_t;
+// `cfg4`/`cfg5` are the config-block words the tool wrote for this type, not just its type byte.
+// The upper half is not a constant - 01F0 for most, 3FF0 for ID48 and MQB, 7FF0 for ID7935 - so it
+// has to come from the capture rather than be carried over from whatever the chip held (SS5p).
+// cfg5 is written only where the tool wrote page 5 at all (ID7935 alone, so far).
+typedef struct {
+    const char *name; uint8_t type; const xt_imgpage_t *pages; uint16_t n;
+    uint32_t cfg4; uint32_t cfg5;
+} xt_image_t;
+
+static const xt_imgpage_t xt_img_ID11[5] = {
+    { 0x00, 0, 0x00000010 }, { 0x00, 1, 0x00000000 }, { 0x00, 2, 0x0000BEFA }, { 0x00, 3, 0x00000000 },
+    { 0x00, 4, 0x00000000 }
+};
+static const xt_imgpage_t xt_img_ID12[5] = {
+    { 0x00, 0, 0x00000014 }, { 0x00, 1, 0x00000000 }, { 0x00, 2, 0x000066F0 }, { 0x00, 3, 0x00000000 },
+    { 0x00, 4, 0x00000000 }
+};
+static const xt_imgpage_t xt_img_ID13[5] = {
+    { 0x00, 0, 0x00000018 }, { 0x00, 1, 0x00000000 }, { 0x00, 2, 0x0000FF01 }, { 0x00, 3, 0x00000000 },
+    { 0x00, 4, 0x00000000 }
+};
+static const xt_imgpage_t xt_img_ID48[16] = {
+    { 0x00, 0, 0x00005678 }, { 0x00, 1, 0x0000A167 }, { 0x00, 2, 0x00000419 }, { 0x00, 3, 0x000078B9 },
+    { 0x00, 4, 0x0000AAAA }, { 0x00, 5, 0x0000AAAA }, { 0x00, 6, 0x0000AAAA }, { 0x00, 7, 0x0000AAAA },
+    { 0x01, 0, 0x0000AAAA }, { 0x01, 1, 0x0000AAAA }, { 0x01, 2, 0x0000AAAA }, { 0x01, 3, 0x0000AAAA },
+    { 0x01, 4, 0x0000AAAA }, { 0x01, 5, 0x0000AAAA }, { 0x01, 6, 0x0000AAAA }, { 0x01, 7, 0x0000AAAA }
+};
+static const xt_imgpage_t xt_img_ID4A[12] = {
+    { 0x00, 0, 0xE06C7617 }, { 0x00, 1, 0x11112222 }, { 0x00, 2, 0x33334444 }, { 0x00, 3, 0x55556666 },
+    { 0x00, 4, 0x77778888 }, { 0x00, 5, 0x00FFFFFF }, { 0x00, 6, 0x55555555 }, { 0x00, 7, 0xAAAAAAAA },
+    { 0x0F, 0, 0x00000000 }, { 0x0F, 1, 0x00000000 }, { 0x0F, 2, 0x00000000 }, { 0x0F, 3, 0x00000000 }
+};
+static const xt_imgpage_t xt_img_ID4C[3] = {
+    { 0x04, 4, 0x00000000 }, { 0x04, 5, 0x00000000 }, { 0x04, 6, 0x00000000 }
+};
+static const xt_imgpage_t xt_img_ID4D[41] = {
+    { 0x00, 0, 0x00000000 }, { 0x00, 1, 0x00000000 }, { 0x00, 2, 0x00000000 }, { 0x00, 3, 0x00000000 },
+    { 0x00, 4, 0x00000000 }, { 0x00, 5, 0x00000000 }, { 0x00, 6, 0x00000000 }, { 0x00, 7, 0x00000000 },
+    { 0x01, 0, 0x00000000 }, { 0x01, 1, 0x00000000 }, { 0x01, 2, 0x00000000 }, { 0x01, 3, 0x00000000 },
+    { 0x01, 4, 0x00000000 }, { 0x01, 5, 0x00000000 }, { 0x01, 6, 0x00000000 }, { 0x01, 7, 0x00000000 },
+    { 0x02, 0, 0x00000000 }, { 0x02, 1, 0x00000000 }, { 0x02, 2, 0x00000000 }, { 0x02, 3, 0x00000000 },
+    { 0x02, 4, 0x00000000 }, { 0x02, 5, 0x00000000 }, { 0x02, 6, 0x00000000 }, { 0x02, 7, 0x00000000 },
+    { 0x03, 0, 0x00000000 }, { 0x03, 1, 0x00000000 }, { 0x03, 2, 0x00000000 }, { 0x03, 3, 0x00000000 },
+    { 0x03, 4, 0x00000000 }, { 0x03, 5, 0x00000000 }, { 0x03, 6, 0x00000000 }, { 0x04, 0, 0x00000003 },
+    { 0x04, 1, 0x00000000 }, { 0x04, 2, 0x00109DD4 }, { 0x04, 3, 0x0000036C }, { 0x04, 4, 0x00000000 },
+    { 0x04, 5, 0x00000000 }, { 0x04, 6, 0x00000000 }, { 0x04, 7, 0x00000000 }, { 0x05, 0, 0x00000000 },
+    { 0x0A, 3, 0x00004600 }
+};
+static const xt_imgpage_t xt_img_ID4E[41] = {
+    { 0x00, 0, 0x00000000 }, { 0x00, 1, 0x00000000 }, { 0x00, 2, 0x00000000 }, { 0x00, 3, 0x00000000 },
+    { 0x00, 4, 0x00000000 }, { 0x00, 5, 0x00000000 }, { 0x00, 6, 0x00000000 }, { 0x00, 7, 0x00000000 },
+    { 0x01, 0, 0x00000000 }, { 0x01, 1, 0x00000000 }, { 0x01, 2, 0x00000000 }, { 0x01, 3, 0x00000000 },
+    { 0x01, 4, 0x00000000 }, { 0x01, 5, 0x00000000 }, { 0x01, 6, 0x00000000 }, { 0x01, 7, 0x00000000 },
+    { 0x02, 0, 0x00000000 }, { 0x02, 1, 0x00000000 }, { 0x02, 2, 0x00000000 }, { 0x02, 3, 0x00000000 },
+    { 0x02, 4, 0x00000000 }, { 0x02, 5, 0x00000000 }, { 0x02, 6, 0x00000000 }, { 0x02, 7, 0x00000000 },
+    { 0x03, 0, 0x00000000 }, { 0x03, 1, 0x00000000 }, { 0x03, 2, 0x00000000 }, { 0x03, 3, 0x00000000 },
+    { 0x03, 4, 0x00000000 }, { 0x03, 5, 0x00000000 }, { 0x03, 6, 0x00000000 }, { 0x04, 0, 0x00000003 },
+    { 0x04, 1, 0x00000000 }, { 0x04, 2, 0x004AFFFE }, { 0x04, 3, 0x0000036C }, { 0x04, 4, 0x00000000 },
+    { 0x04, 5, 0x00000000 }, { 0x04, 6, 0x00000000 }, { 0x04, 7, 0x00000000 }, { 0x05, 0, 0x00000000 },
+    { 0x0A, 3, 0x00004600 }
+};
+static const xt_imgpage_t xt_img_ID7935[80] = {
+    { 0x00, 0, 0x00000000 }, { 0x00, 1, 0x00000000 }, { 0x00, 2, 0x00000000 }, { 0x00, 3, 0x00000000 },
+    { 0x00, 4, 0x00000000 }, { 0x00, 5, 0x00000000 }, { 0x00, 6, 0x00000000 }, { 0x00, 7, 0x00000000 },
+    { 0x01, 0, 0x00000000 }, { 0x01, 1, 0x00000000 }, { 0x01, 2, 0x00000000 }, { 0x01, 3, 0x00000000 },
+    { 0x01, 4, 0x00000000 }, { 0x01, 5, 0x00000000 }, { 0x01, 6, 0x00000000 }, { 0x01, 7, 0x00000000 },
+    { 0x02, 0, 0x00000000 }, { 0x02, 1, 0x00000000 }, { 0x02, 2, 0x00000000 }, { 0x02, 3, 0x00000000 },
+    { 0x02, 4, 0x00000000 }, { 0x02, 5, 0x00000000 }, { 0x02, 6, 0x00000000 }, { 0x02, 7, 0x00000000 },
+    { 0x03, 0, 0x00000000 }, { 0x03, 1, 0x00000000 }, { 0x03, 2, 0x00000000 }, { 0x03, 3, 0x00000000 },
+    { 0x03, 4, 0x00000000 }, { 0x03, 5, 0x00000000 }, { 0x03, 6, 0x00000000 }, { 0x03, 7, 0x00000007 },
+    { 0x04, 0, 0x00000000 }, { 0x04, 1, 0x00000000 }, { 0x04, 2, 0x00000000 }, { 0x04, 3, 0x00000000 },
+    { 0x04, 4, 0x00000000 }, { 0x04, 5, 0x00000000 }, { 0x04, 6, 0x00000000 }, { 0x04, 7, 0x00000000 },
+    { 0x05, 0, 0x00000000 }, { 0x05, 1, 0x00000000 }, { 0x05, 2, 0x00000000 }, { 0x05, 3, 0x00000000 },
+    { 0x05, 4, 0x00000000 }, { 0x05, 5, 0x00000000 }, { 0x05, 6, 0x00000000 }, { 0x05, 7, 0x00000000 },
+    { 0x06, 0, 0x00000000 }, { 0x06, 1, 0x00000000 }, { 0x06, 2, 0x00000000 }, { 0x06, 3, 0x00000000 },
+    { 0x06, 4, 0x00000000 }, { 0x06, 5, 0x00000000 }, { 0x06, 6, 0x00000000 }, { 0x06, 7, 0x00000000 },
+    { 0x07, 0, 0x00000000 }, { 0x07, 1, 0x00000000 }, { 0x07, 2, 0x00000000 }, { 0x07, 3, 0x00000000 },
+    { 0x07, 4, 0x00000000 }, { 0x07, 5, 0x00000000 }, { 0x07, 6, 0x00000000 }, { 0x07, 7, 0x00000000 },
+    { 0x08, 0, 0x00000000 }, { 0x08, 1, 0x00000000 }, { 0x08, 2, 0x00000000 }, { 0x08, 3, 0x00000000 },
+    { 0x08, 4, 0x00000000 }, { 0x08, 5, 0x00000000 }, { 0x08, 6, 0x00000000 }, { 0x08, 7, 0x00000000 },
+    { 0x09, 0, 0x00000000 }, { 0x09, 1, 0x00000000 }, { 0x09, 2, 0x00000000 }, { 0x09, 3, 0x00000000 },
+    { 0x09, 4, 0x00000000 }, { 0x09, 5, 0x00000000 }, { 0x09, 6, 0x00000000 }, { 0x09, 7, 0x00000000 }
+};
+static const xt_imgpage_t xt_img_ID7936[4] = {
+    { 0x00, 0, 0x5C74DD1F }, { 0x00, 1, 0x4D494B52 }, { 0x00, 2, 0x00004F4E }, { 0x00, 3, 0x06AA4854 }
+};
+static const xt_imgpage_t xt_img_ID7937[4] = {
+    { 0x00, 0, 0x628786BE }, { 0x00, 1, 0x4D494B52 }, { 0x00, 2, 0x00004F4E }, { 0x00, 3, 0x06AA4854 }
+};
+static const xt_imgpage_t xt_img_ID7938[8] = {
+    { 0x00, 0, 0x850E6F16 }, { 0x00, 1, 0x11112222 }, { 0x00, 2, 0x33334444 }, { 0x00, 3, 0x55556666 },
+    { 0x00, 4, 0x00FFFFFF }, { 0x0F, 0, 0x00000000 }, { 0x0F, 1, 0x00000000 }, { 0x0F, 2, 0x00000000 }
+};
+static const xt_imgpage_t xt_img_ID7939[12] = {
+    { 0x00, 0, 0xFF358A13 }, { 0x00, 1, 0x00000000 }, { 0x00, 2, 0x00000000 }, { 0x00, 3, 0x00000000 },
+    { 0x00, 4, 0x00000000 }, { 0x00, 5, 0x00000000 }, { 0x00, 6, 0x00000000 }, { 0x00, 7, 0x00000000 },
+    { 0x3C, 0, 0x00000000 }, { 0x3C, 1, 0x00000000 }, { 0x3C, 2, 0x00000000 }, { 0x3C, 3, 0x00000000 }
+};
+static const xt_imgpage_t xt_img_ID7946[4] = {
+    { 0x00, 0, 0x050B3126 }, { 0x00, 1, 0x4D494B52 }, { 0x00, 2, 0x00004F4E }, { 0x00, 3, 0x06AA4854 }
+};
+static const xt_imgpage_t xt_img_ID8C[11] = {
+    { 0x00, 0, 0x0000003F }, { 0x00, 1, 0x00000000 }, { 0x00, 2, 0x00006500 }, { 0x00, 3, 0x00000000 },
+    { 0x00, 4, 0x00006500 }, { 0x00, 5, 0x0000FF00 }, { 0x00, 6, 0x000046FF }, { 0x00, 7, 0x00004F46 },
+    { 0x01, 0, 0x00000045 }, { 0x01, 1, 0x00000000 }, { 0x01, 2, 0x00000702 }
+};
+static const xt_imgpage_t xt_img_ID8E[32] = {
+    { 0x00, 0, 0x00004471 }, { 0x00, 1, 0x00007000 }, { 0x00, 2, 0x0000D006 }, { 0x00, 3, 0x00000000 },
+    { 0x00, 4, 0x00000000 }, { 0x00, 5, 0x00000000 }, { 0x00, 6, 0x00000000 }, { 0x00, 7, 0x00000000 },
+    { 0x01, 0, 0x00000000 }, { 0x01, 1, 0x00000000 }, { 0x01, 2, 0x000026B1 }, { 0x01, 3, 0x0000D809 },
+    { 0x01, 4, 0x00000000 }, { 0x01, 5, 0x00000000 }, { 0x01, 6, 0x00000000 }, { 0x01, 7, 0x00000000 },
+    { 0x02, 0, 0x00000000 }, { 0x02, 1, 0x00000000 }, { 0x02, 2, 0x00000000 }, { 0x02, 3, 0x00000000 },
+    { 0x02, 4, 0x00000000 }, { 0x02, 5, 0x00000000 }, { 0x02, 6, 0x00000000 }, { 0x02, 7, 0x00000000 },
+    { 0x03, 0, 0x00000000 }, { 0x03, 1, 0x00000000 }, { 0x03, 2, 0x00000000 }, { 0x03, 3, 0x00000000 },
+    { 0x03, 4, 0x00000000 }, { 0x03, 5, 0x00000000 }, { 0x03, 6, 0x00000000 }, { 0x03, 7, 0x00000000 }
+};
+static const xt_imgpage_t xt_img_MQB[77] = {
+    { 0x00, 0, 0x00009765 }, { 0x00, 1, 0x0000A000 }, { 0x00, 2, 0x0000FFFC }, { 0x00, 3, 0x0000FFFF },
+    { 0x00, 4, 0x00000000 }, { 0x00, 5, 0x00000000 }, { 0x00, 6, 0x00000000 }, { 0x00, 7, 0x00000000 },
+    { 0x01, 0, 0x00000000 }, { 0x01, 1, 0x00000000 }, { 0x01, 2, 0x00000000 }, { 0x01, 3, 0x00000000 },
+    { 0x01, 4, 0x00001218 }, { 0x01, 5, 0x00000A51 }, { 0x01, 6, 0x00000AB8 }, { 0x01, 7, 0x0000380A },
+    { 0x03, 7, 0x00000007 }, { 0x04, 0, 0x00000000 }, { 0x04, 1, 0x00000000 }, { 0x04, 2, 0x00000000 },
+    { 0x04, 3, 0x00000000 }, { 0x04, 4, 0x00000000 }, { 0x04, 5, 0x00000000 }, { 0x04, 6, 0x00000000 },
+    { 0x04, 7, 0x00000000 }, { 0x07, 3, 0x000028D6 }, { 0x07, 4, 0x00008377 }, { 0x0C, 0, 0x00008810 },
+    { 0x0C, 1, 0x00004788 }, { 0x0C, 2, 0x0000D645 }, { 0x0C, 3, 0x000045A0 }, { 0x0C, 4, 0x00000044 },
+    { 0x0C, 5, 0x00003641 }, { 0x0C, 6, 0x00003030 }, { 0x0C, 7, 0x00003931 }, { 0x0D, 0, 0x00004748 },
+    { 0x0D, 1, 0x00003341 }, { 0x0D, 2, 0x00003735 }, { 0x0D, 3, 0x00003539 }, { 0x0D, 4, 0x00003639 },
+    { 0x0D, 5, 0x00003547 }, { 0x0D, 6, 0x00000000 }, { 0x0D, 7, 0x00000000 }, { 0x0E, 0, 0x00000000 },
+    { 0x0E, 1, 0x00000000 }, { 0x0E, 2, 0x00000000 }, { 0x0E, 3, 0x00000000 }, { 0x0E, 4, 0x00000000 },
+    { 0x0E, 5, 0x00000000 }, { 0x0E, 6, 0x00000000 }, { 0x0E, 7, 0x00000000 }, { 0x0F, 0, 0x00000000 },
+    { 0x0F, 1, 0x00000000 }, { 0x0F, 2, 0x00000000 }, { 0x0F, 3, 0x00000000 }, { 0x0F, 4, 0x00000000 },
+    { 0x0F, 5, 0x00000000 }, { 0x0F, 6, 0x00000000 }, { 0x0F, 7, 0x00000000 }, { 0x10, 0, 0x00002101 },
+    { 0x10, 1, 0x00001100 }, { 0x10, 2, 0x00000000 }, { 0x10, 3, 0x00000000 }, { 0x10, 4, 0x00000000 },
+    { 0x10, 5, 0x00000000 }, { 0x10, 6, 0x00000000 }, { 0x10, 7, 0x00000000 }, { 0x11, 0, 0x00000000 },
+    { 0x11, 1, 0x00000000 }, { 0x11, 2, 0x00000000 }, { 0x11, 3, 0x00000000 }, { 0x11, 4, 0x00000000 },
+    { 0x11, 5, 0x00000000 }, { 0x11, 6, 0x00000000 }, { 0x11, 7, 0x00000000 }, { 0x12, 0, 0x00000305 },
+    { 0x12, 1, 0x00000000 }
+};
+
+static const xt_image_t xt_images[] = {
+    { "ID11", 0x8C, xt_img_ID11, ARRAYLEN(xt_img_ID11), 0x01F0008C, 0x00000000 },
+    { "ID12", 0x8C, xt_img_ID12, ARRAYLEN(xt_img_ID12), 0x01F0008C, 0x00000000 },
+    { "ID13", 0x8C, xt_img_ID13, ARRAYLEN(xt_img_ID13), 0x01F0008C, 0x00000000 },
+    { "ID48", 0x48, xt_img_ID48, ARRAYLEN(xt_img_ID48), 0x3FF00048, 0x00000000 },
+    { "ID4A", 0x4A, xt_img_ID4A, ARRAYLEN(xt_img_ID4A), 0x01F0004A, 0x00000000 },
+    { "ID4C", 0x4C, xt_img_ID4C, ARRAYLEN(xt_img_ID4C), 0x01F0004C, 0x00000000 },
+    { "ID4D", 0x4D, xt_img_ID4D, ARRAYLEN(xt_img_ID4D), 0x01F0004D, 0x00000000 },
+    { "ID4E", 0x64, xt_img_ID4E, ARRAYLEN(xt_img_ID4E), 0x01F00064, 0x00000000 },
+    { "ID7935", 0x35, xt_img_ID7935, ARRAYLEN(xt_img_ID7935), 0x7FF00035, 0x00000240 },
+    { "ID7936", 0x36, xt_img_ID7936, ARRAYLEN(xt_img_ID7936), 0x01F00036, 0x00000000 },
+    { "ID7937", 0x37, xt_img_ID7937, ARRAYLEN(xt_img_ID7937), 0x01F00037, 0x00000000 },
+    { "ID7938", 0x47, xt_img_ID7938, ARRAYLEN(xt_img_ID7938), 0x01F00047, 0x00000000 },
+    { "ID7939", 0x39, xt_img_ID7939, ARRAYLEN(xt_img_ID7939), 0x01F00039, 0x00000000 },
+    { "ID7946", 0x46, xt_img_ID7946, ARRAYLEN(xt_img_ID7946), 0x01F00046, 0x00000000 },
+    { "ID8C", 0x8C, xt_img_ID8C, ARRAYLEN(xt_img_ID8C), 0x01F0008C, 0x00000000 },
+    { "ID8E", 0x8E, xt_img_ID8E, ARRAYLEN(xt_img_ID8E), 0x01F0008E, 0x00000000 },
+    { "MQB", 0x8B, xt_img_MQB, ARRAYLEN(xt_img_MQB), 0x3FF0008B, 0x00000000 },
+};
+
+// Which nonce a given power-up delay produces is not quite repeatable: the window the chip takes
+// drifts a bit either way, so some nonces sit on a wide plateau and some are only hit now and then.
+// The search tries each nonce that reaches far enough, in order, and runs at the first one it lands
+// on; that ordering is the only thing separating them, since a built session is not tied to the
+// nonce the VVDI happened to record it at.
 static const xt57_ks_t xt57_ks_CDB9AE8C = {
-    0xCDB9AE8C, 0x1BA796D1, 182, 181, xt57_ksC_k0, xt57_ksC_K, 119500, 400, 2
+    0xCDB9AE8C, 0x1BA796D1, 182, 181, xt57_ksC_k0, xt57_ksC_K, 45000, 0, 119500, 400, 2
 };
 static const xt57_ks_t xt57_ks_6DCD7463 = {
-    0x6DCD7463, 0x519F0319, 21, 21, xt57_ks6_k0, xt57_ks6_K, 119500, 400, 2
+    0x6DCD7463, 0x519F0319, 21, 21, xt57_ks6_k0, xt57_ks6_K, 45000, 0, 119500, 400, 2
 };
 static const xt57_ks_t *const xt57_ks_all[] = { &xt57_ks_CDB9AE8C, &xt57_ks_6DCD7463 };
+
+// XT37 keystream.  Measured on one chip but valid for the family: K is a function of (nonce, index)
+// alone, and k0 additionally of the select payload, which is the same `C0 "XT37" 123456789ABCDEF0`
+// on every XT37.  Only the power-up delay that reaches a nonce is per-tag (docs/xt37.md SS4a), which
+// is what the search below is for.  `sel_auto` is 1 so the family bytes come from the chip itself.
+static const xt57_ks_t xt37_ks_AD4BD054 = {
+    0xAD4BD054, 0x80DC1109, 178, 178, xt37_ks_AD4BD054_k0, xt37_ks_AD4BD054_K, 200000, 1, 119684, 900, 2
+};
+static const xt57_ks_t xt37_ks_D4BD0543 = {
+    0xD4BD0543, 0x1A14D3D0, 170, 170, xt37_ks_D4BD0543_k0, xt37_ks_D4BD0543_K, 200000, 1, 119652, 900, 2
+};
+// Deepest first: a long image write wants the longest keystream, and both reach any one chip.
+static const xt57_ks_t *const xt37_ks_all[] = { &xt37_ks_AD4BD054, &xt37_ks_D4BD0543 };
 
 // one plaintext exchange of a session
 typedef struct {
@@ -1815,6 +2144,85 @@ static uint32_t xt57_7935_fill(uint8_t addr, uint8_t slot) {
 //
 // The image block and the channel-A bank 0 hold the same pages in the same order, so the page
 // values and the write order are the ones xh_recipe() uses in armsrc/xhorse.c.
+// Build a session from an image decoded out of the tool's own set capture: every page it wrote, in
+// order, then the config block - page 5 first where the capture wrote one, then page 4, because the
+// type byte is what makes the chip emulate and must land last (xt57b-fullread.md SS12.7).  'X' marks
+// a chunk boundary: run_session turns each chunk into its own session, which is what keeps a
+// 170-exchange image inside the 64 responses and 560 script bytes one reply can carry.
+#define XT57_IMG_CHUNK   24
+#define XT_ARG_CONFIG    0x7F       // segment 3, block 0x1F - the config block (docs/xt37.md SS5o)
+
+static int xt57_build_steps_image(const xt_image_t *im, xt57_step_t *out, int maxn, int *arm_at) {
+    int n = 0, in_chunk = 0;
+    uint8_t cur = 0xFF;
+    *arm_at = 0;
+    for (int i = 0; i < im->n; i++) {
+        if (n + 4 > maxn) {
+            return -1;
+        }
+        if (in_chunk >= XT57_IMG_CHUNK) {
+            out[n++] = (xt57_step_t) { 'X', 0, 0 };
+            in_chunk = 0;
+            cur = 0xFF;
+        }
+        if (im->pages[i].arg != cur) {
+            out[n++] = (xt57_step_t) { 'S', im->pages[i].arg, 0 };
+            cur = im->pages[i].arg;
+        }
+        out[n++] = (xt57_step_t) { 'W', im->pages[i].page, im->pages[i].val };
+        out[n++] = (xt57_step_t) { 'R', im->pages[i].page, 0 };
+        in_chunk++;
+    }
+    if (n + 7 > maxn) {
+        return -1;
+    }
+    out[n++] = (xt57_step_t) { 'X', 0, 0 };
+    out[n++] = (xt57_step_t) { 'S', XT_ARG_CONFIG, 0 };
+    if (im->cfg5 != 0) {
+        out[n++] = (xt57_step_t) { 'W', 5, im->cfg5 };
+        out[n++] = (xt57_step_t) { 'R', 5, 0 };
+    }
+    out[n++] = (xt57_step_t) { 'W', 4, im->cfg4 };
+    // `arm_at` means "this write makes the chip talk first and go deaf to XMICRO", which only the
+    // broadcast types do: the EM4102-style family (type byte 0x8C - ID11/ID12/ID13/ID8C) and a
+    // blanked PCF7935 (0x35).  Marking it for every type would warn about a reader-talk-first chip
+    // like 7936 that stays perfectly reachable.
+    if (im->type == 0x8C || im->type == 0x35) {
+        *arm_at = n;
+    }
+    out[n++] = (xt57_step_t) { 'R', 4, 0 };
+    return n;
+}
+
+// The VVDI's own reset, frame for frame from `xhorse-XT37b-reset-from-ID48.pm3` decrypted at nonce
+// C1CBFC8C (docs/xt37.md SS5u).  The order is the reverse of a set: **the config word goes in first**,
+// then the image.  A set must finish the image before the type byte, because the type byte is what
+// makes the chip emulate (xt57b-fullread.md SS12.7); a reset is coming back *from* an emulated type,
+// so it puts the chip on a reachable one immediately and only then rewrites the image - which also
+// means a session that dies halfway leaves a chip that still answers.
+static int xt57_build_steps_reset(const uint8_t *uid, xt57_step_t *out, int maxn, int *arm_at) {
+    if (maxn < 14) {
+        return -1;
+    }
+    int n = 0;
+    *arm_at = 0;
+    out[n++] = (xt57_step_t) { 'S', XT_ARG_CONFIG, 0 };
+    out[n++] = (xt57_step_t) { 'R', 7, 0 };                  // the VVDI reads page 7 first
+    out[n++] = (xt57_step_t) { 'W', 4, 0x01F00036 };         // ID7936/ID46, the factory personality
+    out[n++] = (xt57_step_t) { 'R', 4, 0 };
+    out[n++] = (xt57_step_t) { 'S', 0x00, 0 };
+    out[n++] = (xt57_step_t) { 'W', 0, xt57_be32(uid) };
+    out[n++] = (xt57_step_t) { 'R', 0, 0 };
+    out[n++] = (xt57_step_t) { 'W', 1, 0x4D494B52 };         // "MIKR"
+    out[n++] = (xt57_step_t) { 'R', 1, 0 };
+    out[n++] = (xt57_step_t) { 'W', 2, 0x00004F4E };         // "\0\0ON"
+    out[n++] = (xt57_step_t) { 'R', 2, 0 };
+    out[n++] = (xt57_step_t) { 'W', 3, 0x06AA4854 };         // HITAG2 config page
+    out[n++] = (xt57_step_t) { 'R', 3, 0 };
+    out[n++] = (xt57_step_t) { 'E', 0, 0 };
+    return n;
+}
+
 static int xt57_build_steps(const xh_type_t *t, const uint8_t *uid,
                             xt57_step_t *out, int maxn, int *arm_at) {
     uint32_t img[5] = {0};
@@ -1954,9 +2362,13 @@ static int32_t xt57_find_nonce(const xt57_ks_t *ks, int32_t lo, int32_t hi) {
     p.sweep = XT57_SWEEP_POWERUP;
     p.answer_mode = XT57_ANS_NONE;
     p.step = ks->step;
-    p.off_us = XT57_SESS_OFF_US;
+    p.off_us = (uint32_t)ks->off_us;
     p.selbits = XHORSE_XT57_SELLEN * 8;
     memcpy(p.select, xt57_sel_default, XHORSE_XT57_SELLEN);
+    // An XT57 table replays a keystream recorded under an "XT57" select, so that frame must go out
+    // exactly as recorded; an XT37 table wants the chip's own family bytes instead, which `sel_auto`
+    // asks the firmware for.  A select carrying the wrong family is simply refused (docs/xt37.md SS5).
+    p.sel_auto = ks->sel_auto;
 
     for (int32_t base = lo; base <= hi; base += ks->step * XHORSE_XT57_MAXSESS) {
         p.base = base;
@@ -2005,9 +2417,13 @@ static int xt57_run_chunk(const xt57_ks_t *ks, int32_t at, const xt57_step_t *st
     p.want = ks->nonce;
     p.base = at;
     p.step = 0;
-    p.off_us = XT57_SESS_OFF_US;
+    p.off_us = (uint32_t)ks->off_us;
     p.selbits = XHORSE_XT57_SELLEN * 8;
     memcpy(p.select, xt57_sel_default, XHORSE_XT57_SELLEN);
+    // An XT57 table replays a keystream recorded under an "XT57" select, so that frame must go out
+    // exactly as recorded; an XT37 table wants the chip's own family bytes instead, which `sel_auto`
+    // asks the firmware for.  A select carrying the wrong family is simply refused (docs/xt37.md SS5).
+    p.sel_auto = ks->sel_auto;
     p.npost = (uint8_t)nst;
     p.rfirst = 1;
     int packed = xt57_pack_script(frames, nst, p.script, sizeof(p.script));
@@ -2096,12 +2512,35 @@ static int xt57_run_session(const xt57_step_t *st, int nst, int arm_at,
         }
     }
 
-    for (size_t i = 0; i < ARRAYLEN(xt57_ks_all) && at < 0; i++) {
-        if (longest > xt57_ks_all[i]->nex) {
+    // Which family is on the coil decides which keystream applies - the answer that opens a session
+    // is family-specific (docs/xt37.md SS5a) - so ask the chip before choosing a table.
+    lf_xhorse_rdopt_t popt;
+    memset(&popt, 0, sizeof(popt));
+    lf_xhorse_info_t pnfo;
+    bool is37 = false;
+    if (xh_request_info(CMD_LF_XHORSE_INFO, (uint8_t *)&popt, sizeof(popt), &pnfo) == PM3_SUCCESS) {
+        is37 = (pnfo.bchip && pnfo.bchip_type_len >= 4
+                && pnfo.bchip_type[2] == '3' && pnfo.bchip_type[3] == '7');
+    }
+    const xt57_ks_t *const *tbl = is37 ? xt37_ks_all : xt57_ks_all;
+    size_t ntbl = is37 ? ARRAYLEN(xt37_ks_all) : ARRAYLEN(xt57_ks_all);
+    if (is37) {
+        PrintAndLogEx(INFO, "chip family " _YELLOW_("XT37") " - using its keystream");
+    }
+
+    for (size_t i = 0; i < ntbl && at < 0; i++) {
+        if (longest > tbl[i]->nex) {
             continue;                               // keystream too short for this session
         }
         usable++;
-        ks = xt57_ks_all[i];
+        ks = tbl[i];
+        // Steer first - read where the stream is and compute the delay - and only sweep if that
+        // cannot be done (docs/xt37.md SS5r).
+        int32_t want = 0;
+        if (xt_steer(ks, ks->centre, &want, true) == PM3_SUCCESS) {
+            at = want;
+            break;
+        }
         PrintAndLogEx(INFO, "searching for nonce " _YELLOW_("%08X") " between %d and %d us",
                       ks->nonce, centre - span, centre + span);
         at = xt57_find_nonce(ks, centre - span, centre + span);
@@ -2164,7 +2603,21 @@ static int xt57_run_session(const xt57_step_t *st, int nst, int arm_at,
 
 // Types with an XMICRO recipe: an image that fits block 0x00 and a session short enough for the
 // keystream.  Everything else needs either pages outside that block or a longer session.
+// An image decoded from the tool's own set session (SS5p), used for the types that have no built
+// recipe.  Verbatim: whatever the capture wrote, including fields a user might want to choose.
+static const xt_image_t *xt57_decoded_image(const xh_type_t *t) {
+    for (size_t i = 0; i < ARRAYLEN(xt_images); i++) {
+        if (xt_images[i].type == t->typebyte) {
+            return &xt_images[i];
+        }
+    }
+    return NULL;
+}
+
 static bool xt57_type_supported(const xh_type_t *t) {
+    if (xt57_decoded_image(t) != NULL) {
+        return true;                 // a decoded image covers it even without a built recipe
+    }
     switch (t->recipe) {   // plain uint8_t: only the recipes with an XMICRO image are listed
         case XHORSE_R_HITAG2:
         case XHORSE_R_ID11:
@@ -2245,6 +2698,23 @@ static int CmdLFXhorseXt57Set(const char *Cmd) {
         PrintAndLogEx(HINT, "run `" _YELLOW_("lf xhorse types") "` for the names");
         return PM3_EINVARG;
     }
+    // Which image to write depends on the family, so ask the chip first.  On an XT37 the decoded
+    // capture wins even where a built recipe exists: the built ones carry the XT57's config pages
+    // (page 5 = 0x49, page 6 = 0xC900), and an XT37's own sets write page 4 and nothing else
+    // (docs/xt37.md SS5p).  On an XT57 the built recipes win, because those are the ones a caller can
+    // put their own UID into.
+    lf_xhorse_rdopt_t sopt;
+    memset(&sopt, 0, sizeof(sopt));
+    lf_xhorse_info_t snfo;
+    bool set_is37 = false;
+    if (xh_request_info(CMD_LF_XHORSE_INFO, (uint8_t *)&sopt, sizeof(sopt), &snfo) == PM3_SUCCESS) {
+        set_is37 = (snfo.bchip && snfo.bchip_type_len >= 4
+                    && snfo.bchip_type[2] == '3' && snfo.bchip_type[3] == '7');
+    }
+    const bool built = (t->recipe == XHORSE_R_HITAG2 || t->recipe == XHORSE_R_ID11
+                        || t->recipe == XHORSE_R_ID12 || t->recipe == XHORSE_R_ID13
+                        || t->recipe == XHORSE_R_7935);
+    const xt_image_t *dimg = (built && set_is37 == false) ? NULL : xt57_decoded_image(t);
     if (xt57_type_supported(t) == false) {
         PrintAndLogEx(FAILED, "%s has no XT57B recipe yet", t->canon);
         PrintAndLogEx(INFO, "its session is longer than the 181 exchanges of keystream recovered");
@@ -2253,7 +2723,17 @@ static int CmdLFXhorseXt57Set(const char *Cmd) {
         return PM3_EINVARG;
     }
 
-    const int want = (t->uid == UID_NONE) ? 0
+    // Page 0 of block 00 is the emulated UID for the ID46 family - proved by writing one and
+    // watching `lf search` follow it (§5r) - so that one stays choosable even from a decoded image.
+    const bool dimg_uid = (dimg != NULL && t->recipe == XHORSE_R_HITAG2);
+    if (dimg != NULL && dimg_uid == false && uidlen != 0) {
+        PrintAndLogEx(WARNING, "%s is written from the captured set session, so --uid is ignored: "
+                      "where that type keeps a UID is not established (docs/xt37.md SS5r)", t->canon);
+        uidlen = 0;
+    }
+    const int want = (dimg != NULL && dimg_uid == false) ? 0
+                     : (dimg_uid) ? 4
+                     : (t->uid == UID_NONE) ? 0
                      : (t->uid == UID_REQ8) ? 8
                      : (t->uid == UID_REQ5) ? 5 : 4;
     if (uidlen != want) {
@@ -2262,6 +2742,25 @@ static int CmdLFXhorseXt57Set(const char *Cmd) {
         } else {
             PrintAndLogEx(FAILED, "%s takes a UID of %d bytes (got %d)", t->canon, want, uidlen);
         }
+        return PM3_EINVARG;
+    }
+
+    // Types the chip goes deaf on.  `lf xhorse info`'s own hint lists them: an EM type (ID11/ID12/
+    // ID13, type byte 0x8C), ID48, ID8E and ID8A "never answer" the identify, and a blanked PCF7935
+    // (0x35) broadcasts and stops answering too.  Once set, the chip cannot be reached over channel B
+    // again - and on an XT37 nothing in this client brought one back: `xt57 reset` was tried with
+    // every word including `megamos`, with a widened burst sweep, and `lf xhorse reset` as well
+    // (docs/xt37.md SS5s).  Only the Xhorse programmer re-typed it.
+    const bool goes_deaf = (t->typebyte == 0x8C || t->typebyte == 0x35 || t->typebyte == 0x48
+                            || t->typebyte == 0x8E || t->typebyte == 0x8A);
+    if (goes_deaf && wipe_ok == false) {
+        PrintAndLogEx(FAILED, "%s makes the chip stop answering channel B", t->canon);
+        PrintAndLogEx(INFO, "from the next power-up it emulates and no longer answers the XMICRO");
+        PrintAndLogEx(INFO, "identify, so this client cannot read, re-set or restore it afterwards");
+        PrintAndLogEx(INFO, "`lf xhorse xt57 reset` is meant for this and did NOT recover an XT37 set");
+        PrintAndLogEx(INFO, "to ID48 - not with any --word, not with a widened sweep (docs/xt37.md SS5s)");
+        PrintAndLogEx(INFO, "recovering it needed the Xhorse programmer");
+        PrintAndLogEx(HINT, "pass `" _YELLOW_("--wipe") "` to do it anyway");
         return PM3_EINVARG;
     }
 
@@ -2290,7 +2789,25 @@ static int CmdLFXhorseXt57Set(const char *Cmd) {
 
     xt57_step_t steps[XT57_MAXSTEPS];
     int arm_at = 0;
-    int nst = xt57_build_steps(t, uid, steps, XT57_MAXSTEPS, &arm_at);
+    xt_imgpage_t dpages[XT57_MAXSTEPS];
+    xt_image_t dcopy;
+    if (dimg_uid) {                     // substitute the chosen UID into the decoded image
+        dcopy = *dimg;
+        memcpy(dpages, dimg->pages, sizeof(xt_imgpage_t) * dimg->n);
+        for (int ip = 0; ip < dimg->n; ip++) {
+            if (dpages[ip].arg == 0x00 && dpages[ip].page == 0) {
+                dpages[ip].val = xt57_be32(uid);
+            }
+        }
+        dcopy.pages = dpages;
+        dimg = &dcopy;
+    }
+    int nst = (dimg != NULL) ? xt57_build_steps_image(dimg, steps, XT57_MAXSTEPS, &arm_at)
+                             : xt57_build_steps(t, uid, steps, XT57_MAXSTEPS, &arm_at);
+    if (dimg != NULL) {
+        PrintAndLogEx(INFO, "decoded %s image: %d pages, config word %08X",
+                      dimg->name, dimg->n, dimg->cfg4);
+    }
     if (nst < 0) {
         PrintAndLogEx(FAILED, "could not build a session for %s", t->canon);
         return PM3_EINVARG;
@@ -2365,7 +2882,21 @@ static int CmdLFXhorseXt57Restore(const char *Cmd) {
     }
     xt57_step_t steps[XT57_MAXSTEPS];
     int arm_at = 0;
-    int nst = xt57_build_steps(t, uid, steps, XT57_MAXSTEPS, &arm_at);
+    // On an XT37 use the order the tool itself uses for a reset - config word first, then the image
+    // (docs/xt37.md SS5u).  The XT57 path keeps the recipe built from its own reset capture.
+    lf_xhorse_rdopt_t ropt;
+    memset(&ropt, 0, sizeof(ropt));
+    lf_xhorse_info_t rnfo;
+    bool rst_is37 = false;
+    if (xh_request_info(CMD_LF_XHORSE_INFO, (uint8_t *)&ropt, sizeof(ropt), &rnfo) == PM3_SUCCESS) {
+        rst_is37 = (rnfo.bchip && rnfo.bchip_type_len >= 4
+                    && rnfo.bchip_type[2] == '3' && rnfo.bchip_type[3] == '7');
+    }
+    int nst = rst_is37 ? xt57_build_steps_reset(uid, steps, XT57_MAXSTEPS, &arm_at)
+                       : xt57_build_steps(t, uid, steps, XT57_MAXSTEPS, &arm_at);
+    if (rst_is37) {
+        PrintAndLogEx(INFO, "XT37: config word first, then the image - the tool's own reset order");
+    }
     if (nst < 0) {
         return PM3_ESOFT;
     }
@@ -2380,9 +2911,583 @@ static int CmdLFXhorseXt57Restore(const char *Cmd) {
 }
 
 static int CmdHelpXt57(const char *Cmd);
+// Which blocks an XT37 is known to use (docs/xt37.md SS5l).  `arg` is the select operand:
+// segment in the top 3 bits, block in the low 5 - so s3 b1F is 0x7F, the same operand the XT57B's
+// config block has.
+static const struct { uint8_t arg; const char *what; } xt_blocks[] = {
+    { 0x00, "emulation image" },
+    { 0x01, "per-type config" },
+    { 0x0C, "image area" },
+    { 0x0D, "image area" },
+    { 0x10, "image area" },
+    { 0x12, "image area" },
+    { 0x7E, "identity block" },
+    { 0x7F, "config block (page 4 = type byte)" },
+};
+
+// Read the eight pages of one block in a single authenticated session: select, then eight
+// triggers.  Reads are decrypted with the data keystream (docs/xt37.md SS5k).
+static int xt_read_block(const xt57_ks_t *ks, int32_t at, uint8_t arg,
+                         uint32_t *out, bool *got) {
+    xt57_step_t st[9];
+    st[0] = (xt57_step_t) { 'S', arg, 0 };
+    for (int i = 0; i < 8; i++) {
+        st[i + 1] = (xt57_step_t) { 'R', (uint8_t)i, 0 };
+    }
+    xt57_frame_t frames[9];
+    if (xt57_build_session(st, 9, ks, frames) == false) {
+        PrintAndLogEx(FAILED, "the keystream at nonce %08X does not reach 9 exchanges", ks->nonce);
+        return PM3_EINVARG;
+    }
+
+    lf_xhorse_xt57_t p;
+    memset(&p, 0, sizeof(p));
+    p.sweep = XT57_SWEEP_POWERUP;
+    p.answer_mode = XT57_ANS_FIXED;
+    p.answer = ks->answer;
+    p.want = ks->nonce;
+    p.base = at;
+    p.off_us = (uint32_t)ks->off_us;
+    p.selbits = XHORSE_XT57_SELLEN * 8;
+    memcpy(p.select, xt57_sel_default, XHORSE_XT57_SELLEN);
+    p.sel_auto = ks->sel_auto;
+    p.npost = 9;
+    p.rfirst = 1;
+    int packed = xt57_pack_script(frames, 9, p.script, sizeof(p.script));
+    if (packed < 0) {
+        return PM3_EINVARG;
+    }
+    p.scriptlen = (uint16_t)packed;
+    // Sessions per attempt, sweeping 2 us (one clock) apart from `base` below.  The phase drifts
+    // between runs by more than the plateau is wide, so this has to cover tens of microseconds, not
+    // a handful: 16 sessions missed often enough to fail a write that then succeeded by hand.
+    p.count = 30;
+
+    // The delay that reaches a nonce sits on a narrow, drifting plateau (docs/xt37.md SS4a), so
+    // hammering one delay wastes most sessions.  Sweep the plateau *inside* the call instead -
+    // base-6 .. base+8 at the stream's own 2 us per clock - and the wanted nonce turns up within a
+    // few sessions.  Two passes cover the case where the plateau has drifted further.
+    p.step = 2;
+    PacketResponseNG resp;
+    bool ran = false;
+    for (int t = 0; t < 3 && ran == false; t++) {
+        p.base = at - 20;
+        clearCommandBuffer();
+        SendCommandNG(CMD_LF_XHORSE_XT57_NONCE, (uint8_t *)&p, sizeof(p));
+        if (WaitForResponseTimeout(CMD_LF_XHORSE_XT57_NONCE, &resp, 120000) == false) {
+            PrintAndLogEx(WARNING, "timeout while waiting for reply");
+            SendCommandNG(CMD_BREAK_LOOP, NULL, 0);
+            return PM3_ETIMEOUT;
+        }
+        ran = (resp.length >= sizeof(lf_xhorse_xt57_post_reply_t)
+               - sizeof(xt57_presp_t) * XHORSE_XT57_MAXPOST);
+        if (ran == false && t + 1 < 3) {
+            // Closed loop: ask the chip where the stream is now and recompute, rather than widening
+            // a blind search.  The phase drifts between runs, so a fresh reading is worth more than
+            // more sessions at a stale delay.
+            int32_t fresh = 0;
+            if (xt_steer(ks, at, &fresh, false) == PM3_SUCCESS) {
+                at = fresh;
+            }
+        }
+    }
+    if (ran == false) {
+        PrintAndLogEx(FAILED, "nonce %08X did not come up near %d us", ks->nonce, at);
+        return PM3_ESOFT;
+    }
+    const lf_xhorse_xt57_post_reply_t *q = (const lf_xhorse_xt57_post_reply_t *)resp.data.asBytes;
+    for (int i = 0; i < 8; i++) {
+        got[i] = false;
+        out[i] = 0;
+        int idx = i + 1;                       // exchange 1 is the select; reads are 2..9
+        if (idx >= q->npost) {
+            continue;
+        }
+        const xt57_presp_t *r = &q->presp[idx];
+        if (r->bits < 40) {
+            continue;
+        }
+        uint32_t ct = ((uint32_t)r->data[0] << 24) | ((uint32_t)r->data[1] << 16)
+                      | ((uint32_t)r->data[2] << 8) | r->data[3];
+        out[i] = ct ^ ks->K[idx + 1];          // the read sits at exchange idx+1
+        got[i] = true;
+    }
+    return PM3_SUCCESS;
+}
+
+// Emulated-type byte -> what the tool calls it (mem-layout.md "type byte" table, every entry
+// confirmed against a decoded set session in docs/xt37.md SS5p).
+static const char *xt_type_name(uint8_t t) {
+    switch (t) {
+        case 0x35: return "ID7935 (ID33/40/42/43/44)";
+        case 0x36: return "ID7936 / ID46";
+        case 0x37: return "ID7937";
+        case 0x39: return "ID7939 / ID49";
+        case 0x46: return "ID7946";
+        case 0x47: return "ID7938 / ID47";
+        case 0x48: return "ID48";
+        case 0x4A: return "ID4A";
+        case 0x4C: return "ID4C";
+        case 0x4D: return "ID4D (ID60/63)";
+        case 0x64: return "ID4E (ID64)";
+        case 0x80: return "4D(80) (ID70/83/G)";
+        case 0x8A: return "ID8A (H)";
+        case 0x8B: return "MQB";
+        case 0x8C: return "ID11 / ID12 / ID13 / ID8C";
+        case 0x8E: return "ID8E";
+        default:   return "unknown";
+    }
+}
+
+// The nonce register: a 32-bit LFSR clocked once per carrier cycle, taps 2/11/15/21/28/30/32
+// (docs/xt37.md SS4b, data/traces/xt57b/nonce-captures/steer_to_known_nonce.py).
+static const int xt_lfsr_taps[] = { 2, 11, 15, 21, 28, 30, 32 };
+
+static uint32_t xt_lfsr_fwd(uint32_t v) {
+    uint32_t nb = 0;
+    for (size_t i = 0; i < ARRAYLEN(xt_lfsr_taps); i++) {
+        nb ^= (v >> (xt_lfsr_taps[i] - 1)) & 1;
+    }
+    return (v << 1) | nb;
+}
+
+// Read the nonce the chip produces at one power-up delay.  No answer is sent: the nonce comes back
+// in the clear, so this costs a handful of sessions and tells us where on the stream we are.
+static int xt_observe_nonce(const xt57_ks_t *ks, int32_t at, uint32_t *nonce) {
+    lf_xhorse_xt57_t p;
+    memset(&p, 0, sizeof(p));
+    p.sweep = XT57_SWEEP_POWERUP;
+    p.answer_mode = XT57_ANS_NONE;
+    p.base = at;
+    p.step = 0;
+    p.count = 6;
+    p.off_us = (uint32_t)ks->off_us;
+    p.selbits = XHORSE_XT57_SELLEN * 8;
+    memcpy(p.select, xt57_sel_default, XHORSE_XT57_SELLEN);
+    p.sel_auto = ks->sel_auto;
+
+    clearCommandBuffer();
+    SendCommandNG(CMD_LF_XHORSE_XT57_NONCE, (uint8_t *)&p, sizeof(p));
+    PacketResponseNG resp;
+    if (WaitForResponseTimeout(CMD_LF_XHORSE_XT57_NONCE, &resp, 60000) == false) {
+        SendCommandNG(CMD_BREAK_LOOP, NULL, 0);
+        return PM3_ETIMEOUT;
+    }
+    const lf_xhorse_xt57_reply_t *r = (const lf_xhorse_xt57_reply_t *)resp.data.asBytes;
+    // Take the value seen most often: the window drifts a clock either way between sessions.
+    uint32_t best = 0;
+    int bestn = 0;
+    for (int i = 0; i < r->count; i++) {
+        if (r->rec[i].nonce_bits != 32) {
+            continue;
+        }
+        uint32_t n = ((uint32_t)r->rec[i].nonce[0] << 24) | ((uint32_t)r->rec[i].nonce[1] << 16)
+                     | ((uint32_t)r->rec[i].nonce[2] << 8) | r->rec[i].nonce[3];
+        int c = 0;
+        for (int j = 0; j < r->count; j++) {
+            uint32_t m = ((uint32_t)r->rec[j].nonce[0] << 24) | ((uint32_t)r->rec[j].nonce[1] << 16)
+                         | ((uint32_t)r->rec[j].nonce[2] << 8) | r->rec[j].nonce[3];
+            if (r->rec[j].nonce_bits == 32 && m == n) {
+                c++;
+            }
+        }
+        if (c > bestn) {
+            bestn = c;
+            best = n;
+        }
+    }
+    if (bestn == 0) {
+        return PM3_ESOFT;
+    }
+    *nonce = best;
+    return PM3_SUCCESS;
+}
+
+// Steer to a wanted nonce the way the hitager tool does: read where the stream is, step the LFSR to
+// work out how far the target is, and convert that to a delay.  A *later* delay walks the nonce
+// *backwards*, so a target `d` clocks forward of what we just read sits at `at - d * 8` us
+// (docs/xt57-auth.md SS10.3 - the sign is the opposite of what SS5a's wording suggests).  Two
+// sessions instead of the hundreds a blind sweep costs.
+#define XT_STEER_LIM   200000       // clocks to search either way: 1.6 s of delay, far beyond the
+//                                     XMICRO listening window, so a miss here means "not on this
+//                                     stretch of stream" rather than "search harder"
+static int xt_steer(const xt57_ks_t *ks, int32_t from, int32_t *at, bool verbose) {
+    uint32_t here = 0;
+    if (xt_observe_nonce(ks, from, &here) != PM3_SUCCESS) {
+        return PM3_ESOFT;
+    }
+    // The target may lie either side of where the chip is: walking forward from `here` finds a
+    // target ahead of us, and walking forward from the target finds one behind.  Only searching
+    // forward would make a target that is a few clocks behind look like most of a 715M-state orbit
+    // away - which is exactly how an XT57 behaves against these tables.
+    int32_t ahead = -1, behind = -1;
+    uint32_t wf = here, wb = ks->nonce;
+    for (int32_t d = 0; d < XT_STEER_LIM && ahead < 0 && behind < 0; d++) {
+        if (wf == ks->nonce) {
+            ahead = d;
+            break;
+        }
+        if (wb == here) {
+            behind = d;
+            break;
+        }
+        wf = xt_lfsr_fwd(wf);
+        wb = xt_lfsr_fwd(wb);
+    }
+    {
+        int32_t d = (ahead >= 0) ? ahead : behind;
+        if (d >= 0) {
+            // A later delay walks the nonce backwards, so a target ahead of us sits at an earlier
+            // delay and one behind us at a later delay (docs/xt57-auth.md SS10.3).
+            int32_t want = (ahead >= 0) ? (from - d * 8) : (from + d * 8);
+            if (verbose) {
+                PrintAndLogEx(INFO, "at %d us the chip is at %08X, %d clocks %s %08X -> %d us",
+                              from, here, d, (ahead >= 0) ? "before" : "after", ks->nonce, want);
+            }
+            if (want < 20000 || want > 400000) {
+                PrintAndLogEx(WARNING, "%08X would need a %d us power-up, outside the listening window",
+                              ks->nonce, want);
+                return PM3_ESOFT;
+            }
+            *at = want;
+            return PM3_SUCCESS;
+        }
+    }
+    return PM3_ESOFT;
+}
+
+// Pick the keystream table for the family on the coil and find a power-up delay that reaches one of
+// its nonces.  A nonce sits on a narrow plateau that drifts, so one sweep can miss a nonce that is
+// perfectly reachable (docs/xt37.md SS4a) - hence the passes.
+static const xt57_ks_t *xt_pick_ks(bool is37, int at, int32_t *found, bool verbose) {
+    const xt57_ks_t *const *tbl = is37 ? xt37_ks_all : xt57_ks_all;
+    size_t ntbl = is37 ? ARRAYLEN(xt37_ks_all) : ARRAYLEN(xt57_ks_all);
+    // Widen progressively instead of sweeping the whole span every pass: the recorded centre is
+    // usually within a few tens of us on the tag it was measured from, and sweeping +-900 us at a
+    // 2 us step costs minutes - too slow to sit inside `lf xhorse info`.  A narrow pass that usually
+    // hits is tried first, and only a failure pays for the wide one.
+    // First ask the chip where the stream is and compute the delay (xt_steer).  Only if that fails
+    // - a mis-read nonce, or a target too far along the stream - fall back to sweeping.
+    for (size_t i = 0; i < ntbl && at <= 0; i++) {
+        int32_t want = 0;
+        if (xt_steer(tbl[i], tbl[i]->centre, &want, verbose) == PM3_SUCCESS) {
+            // Trust the arithmetic: the caller's session sweeps a few clocks around this itself, so
+            // confirming with a separate search would just pay for the same sessions twice.
+            *found = want;
+            return tbl[i];
+        }
+    }
+
+    static const int32_t spans[] = { 60, 300, 900 };
+    for (size_t sp = 0; sp < ARRAYLEN(spans); sp++) {
+        for (size_t i = 0; i < ntbl; i++) {
+            int32_t span = (spans[sp] < tbl[i]->span) ? spans[sp] : tbl[i]->span;
+            int32_t lo = (at > 0) ? at : tbl[i]->centre - span;
+            int32_t hi = (at > 0) ? at : tbl[i]->centre + span;
+            if (verbose) {
+                PrintAndLogEx(INFO, "searching for nonce %08X between %d and %d us...",
+                              tbl[i]->nonce, lo, hi);
+            }
+            int32_t a = xt57_find_nonce(tbl[i], lo, hi);
+            if (a >= 0) {
+                *found = a;
+                return tbl[i];
+            }
+            if (at > 0) {
+                return NULL;               // an explicit --at names one delay; do not widen it
+            }
+        }
+    }
+    return NULL;
+}
+
+// Read the emulated type byte: config block, page 4 (docs/xt37.md SS5o).  Returns the whole word,
+// whose low byte is the type; the upper half varies by type and is not understood (SS5p).
+static int xt_read_typeword(bool is37, uint32_t *word) {
+    int32_t at = 0;
+    const xt57_ks_t *ks = xt_pick_ks(is37, 0, &at, false);
+    if (ks == NULL) {
+        return PM3_ESOFT;
+    }
+    uint32_t v[8];
+    bool got[8];
+    if (xt_read_block(ks, at, XT_ARG_CONFIG, v, got) != PM3_SUCCESS) {
+        return PM3_ESOFT;
+    }
+    if (got[4] == false) {
+        return PM3_ESOFT;
+    }
+    *word = v[4];
+    return PM3_SUCCESS;
+}
+
+// Write one page: select, write, read it back.  The read-back is the whole point - a write is only
+// reported good if the chip returns what went in (docs/xt37.md SS5n, where 354 of 358 recorded
+// writes verified this way).
+static int xt_write_page(const xt57_ks_t *ks, int32_t at, uint8_t arg, uint8_t page,
+                         uint32_t value, uint32_t *readback) {
+    xt57_step_t st[3] = {
+        { 'S', arg, 0 },
+        { 'W', page, value },
+        { 'R', page, 0 },
+    };
+    xt57_frame_t frames[3];
+    if (xt57_build_session(st, 3, ks, frames) == false) {
+        return PM3_EINVARG;
+    }
+
+    lf_xhorse_xt57_t p;
+    memset(&p, 0, sizeof(p));
+    p.sweep = XT57_SWEEP_POWERUP;
+    p.answer_mode = XT57_ANS_FIXED;
+    p.answer = ks->answer;
+    p.want = ks->nonce;
+    p.off_us = (uint32_t)ks->off_us;
+    p.selbits = XHORSE_XT57_SELLEN * 8;
+    memcpy(p.select, xt57_sel_default, XHORSE_XT57_SELLEN);
+    p.sel_auto = ks->sel_auto;
+    p.npost = 3;
+    p.rfirst = 1;
+    int packed = xt57_pack_script(frames, 3, p.script, sizeof(p.script));
+    if (packed < 0) {
+        return PM3_EINVARG;
+    }
+    p.scriptlen = (uint16_t)packed;
+    p.count = 30;
+    p.step = 2;
+
+    PacketResponseNG resp;
+    bool ran = false;
+    for (int t = 0; t < 3 && ran == false; t++) {
+        p.base = at - 20;
+        clearCommandBuffer();
+        SendCommandNG(CMD_LF_XHORSE_XT57_NONCE, (uint8_t *)&p, sizeof(p));
+        if (WaitForResponseTimeout(CMD_LF_XHORSE_XT57_NONCE, &resp, 120000) == false) {
+            SendCommandNG(CMD_BREAK_LOOP, NULL, 0);
+            return PM3_ETIMEOUT;
+        }
+        ran = (resp.length >= sizeof(lf_xhorse_xt57_post_reply_t)
+               - sizeof(xt57_presp_t) * XHORSE_XT57_MAXPOST);
+        if (ran == false && t + 1 < 3) {
+            int32_t fresh = 0;
+            if (xt_steer(ks, at, &fresh, false) == PM3_SUCCESS) {
+                at = fresh;
+            }
+        }
+    }
+    if (ran == false) {
+        PrintAndLogEx(FAILED, "nonce %08X did not come up - nothing was written", ks->nonce);
+        return PM3_ESOFT;
+    }
+    const lf_xhorse_xt57_post_reply_t *q = (const lf_xhorse_xt57_post_reply_t *)resp.data.asBytes;
+    if (q->npost < 3 || q->presp[2].bits < 40) {
+        PrintAndLogEx(WARNING, "no read-back came back - the write may or may not have landed");
+        return PM3_ESOFT;
+    }
+    const xt57_presp_t *r = &q->presp[2];
+    uint32_t ct = ((uint32_t)r->data[0] << 24) | ((uint32_t)r->data[1] << 16)
+                  | ((uint32_t)r->data[2] << 8) | r->data[3];
+    *readback = ct ^ ks->K[3];
+    return PM3_SUCCESS;
+}
+
+// Types that share one image, so switching between them is only a type-byte write (set-type.md:
+// "same default ID46 image").  Anything else needs its image written too, which this does not do.
+static bool xt_type_shares_id46_image(uint8_t t) {
+    return (t == 0x36 || t == 0x37 || t == 0x46);
+}
+
+
+// The ID46-family image: a UID then three constants (docs/xt37.md SS5p - every 7936/7937/7946 set and
+// the reset write exactly these four pages of s0 b00, pages 4-7 staying zero).
+#define XT_IMG_MIKR     0x4D494B52      // "MIKR" - HITAG2 key low
+#define XT_IMG_ON       0x00004F4E      // "\0\0ON" - HITAG2 key high
+#define XT_IMG_CFG      0x06AA4854      // HITAG2 config page
+
+static int CmdLFXhorseXt57SetType(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "lf xhorse xt57 settype",
+                  "Write the emulated type byte of an XT37 / XT57: config block, page 4\n"
+                  "(docs/xt37.md SS5o).  This writes to the chip.\n"
+                  "\n"
+                  "It writes the type byte ONLY.  ID7936 (0x36), ID7937 (0x37) and ID7946 (0x46)\n"
+                  "share one emulated image, so switching among those three is complete on its own.\n"
+                  "Any other type also needs its image written, which this command does not do - the\n"
+                  "chip would emulate a type whose image is not there.  --force allows it anyway.",
+                  "lf xhorse xt57 settype -t 37      -> ID7937\n"
+                  "lf xhorse xt57 settype -t 36      -> ID7936 / ID46, the factory personality");
+    void *argtable[] = {
+        arg_param_begin,
+        arg_str1("t", "type", "<hex>", "type byte to write"),
+        arg_lit0(NULL, "force", "write a type whose image this command cannot write"),
+        arg_int0(NULL, "at", "<dec>", "power-up delay to use, us (default: steer to one)"),
+        arg_param_end,
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, false);
+    int tlen = 0;
+    uint8_t tb[2] = {0};
+    CLIGetHexWithReturn(ctx, 1, tb, &tlen);
+    bool force = arg_get_lit(ctx, 2);
+    int at = arg_get_int_def(ctx, 3, 0);
+    CLIParserFree(ctx);
+    if (tlen != 1) {
+        PrintAndLogEx(FAILED, "--type takes one byte");
+        return PM3_EINVARG;
+    }
+    uint8_t type = tb[0];
+
+    if (xt_type_shares_id46_image(type) == false && force == false) {
+        PrintAndLogEx(FAILED, "type %02X (%s) needs its emulated image written too, which this "
+                      "command does not do", type, xt_type_name(type));
+        PrintAndLogEx(INFO, "only %02X, %02X and %02X share one image; --force overrides",
+                      0x36, 0x37, 0x46);
+        return PM3_EINVARG;
+    }
+
+    lf_xhorse_rdopt_t opt;
+    memset(&opt, 0, sizeof(opt));
+    lf_xhorse_info_t nfo;
+    if (xh_request_info(CMD_LF_XHORSE_INFO, (uint8_t *)&opt, sizeof(opt), &nfo) != PM3_SUCCESS) {
+        return PM3_ESOFT;
+    }
+    if (nfo.bchip == 0) {
+        PrintAndLogEx(FAILED, "no channel-B super-chip answered");
+        return PM3_ESOFT;
+    }
+    bool is37 = (nfo.bchip_type_len >= 4 && nfo.bchip_type[2] == '3' && nfo.bchip_type[3] == '7');
+
+    int32_t found = 0;
+    const xt57_ks_t *ks = xt_pick_ks(is37, at, &found, true);
+    if (ks == NULL) {
+        PrintAndLogEx(FAILED, "no recorded nonce came up - nothing was written");
+        return PM3_ESOFT;
+    }
+
+    // Read the word first: the upper half varies by type and is not understood (SS5p), so it is
+    // preserved rather than invented, and the old value is printed in case it has to go back.
+    uint32_t v[8];
+    bool got[8];
+    if (xt_read_block(ks, found, XT_ARG_CONFIG, v, got) != PM3_SUCCESS || got[4] == false) {
+        PrintAndLogEx(FAILED, "could not read the current type word - nothing was written");
+        return PM3_ESOFT;
+    }
+    uint32_t oldw = v[4];
+    // Prefer the whole word the tool wrote for this type: its upper half is not a constant (01F0,
+    // 3FF0, 7FF0 - SS5p), so carrying the chip's current upper half over would write a word no set
+    // session ever produced.  Only a type with no recorded word falls back to patching the low byte.
+    uint32_t neww = (oldw & 0xFFFFFF00) | type;
+    bool recorded = false;
+    for (size_t ic = 0; ic < ARRAYLEN(xt_images); ic++) {
+        if (xt_images[ic].type == type && xt_images[ic].cfg4 != 0) {
+            neww = xt_images[ic].cfg4;
+            recorded = true;
+            break;
+        }
+    }
+    if (recorded == false) {
+        PrintAndLogEx(WARNING, "no recorded config word for type %02X - keeping the current upper "
+                      "half, which may not be what a real set writes", type);
+    }
+    PrintAndLogEx(INFO, "config word.... %08X (%02X, %s)", oldw, (uint8_t)(oldw & 0xFF),
+                  xt_type_name((uint8_t)(oldw & 0xFF)));
+    if (neww == oldw) {
+        PrintAndLogEx(SUCCESS, "already %02X - nothing to do", type);
+        return PM3_SUCCESS;
+    }
+    PrintAndLogEx(INFO, "writing........ %08X (%02X, %s)%s", neww, type, xt_type_name(type),
+                  ((neww & 0xFFFFFF00) != (oldw & 0xFFFFFF00)) ? "  [upper half changes too]" : "");
+
+    uint32_t back = 0;
+    int res = xt_write_page(ks, found, XT_ARG_CONFIG, 4, neww, &back);
+    if (res != PM3_SUCCESS) {
+        return res;
+    }
+    if (back == neww) {
+        PrintAndLogEx(SUCCESS, "read back...... " _GREEN_("%08X") "  type is now %02X (%s)",
+                      back, type, xt_type_name(type));
+        PrintAndLogEx(HINT, "to put it back: `lf xhorse xt57 settype -t %02X`", (uint8_t)(oldw & 0xFF));
+        return PM3_SUCCESS;
+    }
+    PrintAndLogEx(FAILED, "read back...... " _RED_("%08X") ", expected %08X", back, neww);
+    return PM3_ESOFT;
+}
+
+static int CmdLFXhorseXt57Read(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "lf xhorse xt57 read",
+                  "Read channel-B pages of an XT37 or XT57 super-chip.\n"
+                  "Each block is eight 4-byte pages; `--arg` is the select operand, segment in the\n"
+                  "top 3 bits and block in the low 5 (docs/xt37.md SS5k).  With no argument it reads\n"
+                  "every block the family is known to use.",
+                  "lf xhorse xt57 read                 -> every known block\n"
+                  "lf xhorse xt57 read --arg 0x7F      -> the config block, page 4 is the type byte\n"
+                  "lf xhorse xt57 read --arg 0x00      -> the emulation image");
+    void *argtable[] = {
+        arg_param_begin,
+        arg_str0(NULL, "arg", "<hex>", "select operand: segment << 5 | block"),
+        arg_int0(NULL, "at", "<dec>", "power-up delay to use, us (default: search for one)"),
+        arg_param_end,
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, true);
+    int arglen = 0;
+    uint8_t argb[2] = {0};
+    CLIGetHexWithReturn(ctx, 1, argb, &arglen);
+    int at = arg_get_int_def(ctx, 2, 0);
+    CLIParserFree(ctx);
+
+    // Which family is on the coil decides which keystream applies: the answer that opens a session
+    // is family-specific (docs/xt37.md SS5a).
+    lf_xhorse_rdopt_t opt;
+    memset(&opt, 0, sizeof(opt));
+    lf_xhorse_info_t nfo;
+    if (xh_request_info(CMD_LF_XHORSE_INFO, (uint8_t *)&opt, sizeof(opt), &nfo) != PM3_SUCCESS) {
+        return PM3_ESOFT;
+    }
+    if (nfo.bchip == 0) {
+        PrintAndLogEx(FAILED, "no channel-B super-chip answered - this command is for XT37/XT57");
+        return PM3_ESOFT;
+    }
+    bool is37 = (nfo.bchip_type_len >= 4 && nfo.bchip_type[2] == '3' && nfo.bchip_type[3] == '7');
+    PrintAndLogEx(INFO, "chip family... %.4s", (const char *)nfo.bchip_type);
+
+    int32_t found = 0;
+    const xt57_ks_t *ks = xt_pick_ks(is37, at, &found, true);
+    if (ks == NULL) {
+        PrintAndLogEx(FAILED, "none of this family's recorded nonces came up");
+        PrintAndLogEx(HINT, "the delay that reaches a nonce is per-tag; widen it with --at");
+        return PM3_ESOFT;
+    }
+    PrintAndLogEx(SUCCESS, "nonce %08X at %d us", ks->nonce, found);
+
+    PrintAndLogEx(NORMAL, "");
+    PrintAndLogEx(INFO, " seg blk  p0       p1       p2       p3       p4       p5       p6       p7");
+    PrintAndLogEx(INFO, " --- ---  -------- -------- -------- -------- -------- -------- -------- --------");
+    for (size_t b = 0; b < ARRAYLEN(xt_blocks); b++) {
+        uint8_t a = (arglen > 0) ? argb[0] : xt_blocks[b].arg;
+        uint32_t v[8];
+        bool got[8];
+        if (xt_read_block(ks, found, a, v, got) != PM3_SUCCESS) {
+            break;
+        }
+        char line[160] = {0};
+        for (int i = 0; i < 8; i++) {
+            char cell[12];
+            snprintf(cell, sizeof(cell), got[i] ? "%08X " : "   --    ", v[i]);
+            strncat(line, cell, sizeof(line) - strlen(line) - 1);
+        }
+        PrintAndLogEx(INFO, "  %d  %02X  %s", (a >> 5) & 7, a & 0x1F, line);
+        if (arglen > 0) {
+            break;
+        }
+    }
+    return PM3_SUCCESS;
+}
+
 static command_t Xt57CommandTable[] = {
     {"help",  CmdHelpXt57,           AlwaysAvailable, "This help"},
     {"nonce", CmdLFXhorseXt57Nonce,  IfPm3Hitag,      "Collect XT57B nonces over a range of timings"},
+    {"read",  CmdLFXhorseXt57Read,   IfPm3Hitag,      "Read channel-B pages of an XT37 / XT57"},
+    {"settype", CmdLFXhorseXt57SetType, IfPm3Hitag,    "Advanced: write only the config word (use `set` normally)"},
     {"reset", CmdLFXhorseXt57Reset,  IfPm3Hitag,      "Free a chip stuck emulating a broadcast type"},
     {"set",   CmdLFXhorseXt57Set,    IfPm3Hitag,      "Set which transponder the chip emulates"},
     {"restore", CmdLFXhorseXt57Restore, IfPm3Hitag,   "Rewrite the factory ID46 personality"},
