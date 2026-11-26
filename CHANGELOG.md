@@ -5,6 +5,32 @@ This project uses the changelog in accordance with [keepchangelog](http://keepac
 ## [unreleased][unreleased]
 
 ### Added
+ - **`lf xhorse dump` now dumps an XT14D** - its 80 real pages `0x00`-`0x4F`, in one session,
+   annotated with what is known to live where. That is the whole chip: the address map has been
+   measured on hardware (docs/xt14d.md SS7) and the address bus turns out to be 7 bits, so
+   `0x80`-`0xFF` is an exact alias of `0x00`-`0x7F` on read **and** on write, while `0x50`-`0x7F`
+   is not backed by storage at all. The dead region is invisible to a read - it answers with a
+   CRC-valid `00000000`, indistinguishable from real zeroed storage - and only a write tells it
+   apart, by ACKing with `5AA5` and then not retaining the value. So the chip is 80 x 16 bits =
+   160 bytes, and `dump` stops at `0x4F` rather than listing 176 further values that are either a
+   duplicate or a fiction. `tools/fw_harness/` gained a second simulated XT14D that reproduces the
+   measured map, page contents included, alongside the existing stress profile.
+ - **XT14D support in `lf xhorse info`, `read` and `write`** (docs/xt14d.md). A third channel-A
+   super-chip family, decoded from six VVDI captures: it answers `XHORSE` with `4005`+CRC-8 instead
+   of `5AA5`, takes an 8-bit `E7` seed query answered with `[seed16][crc8 ^ 0x6F]`, and uses the
+   same 16-bit Fibonacci LFSR with `seed = bitrev16(reply) ^ 0xA8A4`. Its page I/O is not the
+   XT27A's `op,~op`: it is byte-oriented `4B <addr>` / `5A <addr><data32><crc8>` in 16/40/56-bit
+   frames with a CRC-8 over the **plaintext** that covers the opcode and address, and a session
+   ends with a plaintext `F0`. The keystream engine now runs a bit at a time to carry those frame
+   lengths, producing exactly what it did before for the XT27A and XT136.
+   A page address is a whole byte, so `-p` takes 0..255 on one. `read` marks each page: a value
+   when a read passed its CRC-8, `?` when the chip answered but no read passed, and `-` when it
+   did not answer at all. A page the chip ignores also ends the session, so `read` closes it and
+   opens a fresh one for the next page, over as many sessions as the range needs. `configure` and
+   `reset` refuse an XT14D and touch nothing, before the EM-recovery bursts, whose effect on one
+   is unknown.
+   Exercised offline by `tools/fw_harness/` against a simulated XT14D whose address space is part
+   real, part aliasing and part dead.
  - **A chip blanked to 7935 can be freed again** (docs/xt57b-fullread.md SS12.11). A sniff of the
    VVDI resetting one (`data/traces/xt57b/xhorse-XT57b-reset-from-7935.pm3`) shows it is the same
    kind of back door the EM types have, with a **third word**: 58 gaps over 58.3 ms, cells of one,

@@ -32,6 +32,26 @@
 // An XT136 has pages 0x00..0x0F; a read of a higher address aliases back into them.
 #define XHORSE_XT136_PAGES  16
 
+// An XT14D addresses pages with a whole byte, not the XT27A's 6-bit field, so a command can name
+// 0x00..0xFF.  Measured on hardware (docs/xt14d.md SS7), what is behind those 256 addresses is:
+//
+//   0x00..0x4F   80 pages of real storage - the whole chip, 80 x 16 bits = 160 bytes
+//   0x50..0x7F   nothing.  Reads answer with a CRC-valid 00000000 and writes are ACKed with
+//                5AA5 and then discarded, so this region is invisible to a read-only sweep
+//   0x80..0xFF   an exact alias of 0x00..0x7F: address bit 7 is ignored on read *and* write
+//
+// `read` still reaches all 256, because being able to demonstrate the alias and the dead region
+// is worth keeping; `dump` reads the 80 real ones.
+#define XHORSE_XT14D_PAGES       256   // addressable, alias included
+#define XHORSE_XT14D_REAL_PAGES  80    // 0x00..0x4F, the pages actually backed by storage
+
+// How many pages one read/write reply can carry (lf_xhorse_io_reply_t.data / .ok / .ans).
+#define XHORSE_IO_MAXPAGES  64
+
+// How many pages one info/dump reply can carry (lf_xhorse_info_t.image / .page_ok).  The XT14D's
+// 80 is the largest of the families; an XT27A bank is 64 and an XT136 is 16.
+#define XHORSE_INFO_MAXPAGES  XHORSE_XT14D_REAL_PAGES
+
 //-----------------------------------------------------------------------------
 // Emulated-image encoders
 //-----------------------------------------------------------------------------
@@ -102,10 +122,14 @@ static inline void xh_id13_stream(const uint8_t *uid5, uint8_t out8[8]) {
 }
 
 // Channel-A family that answered (lf_xhorse_info_t.family).  XT136: doc/xhorse_notes.md.
+// XT14D: docs/xt14d.md - same LFSR and same bitrev16 seed rule as the other two, but it answers
+// XHORSE with 4005+CRC-8 instead of 5AA5, takes an 8-bit E7 seed query, and its page I/O is
+// byte-oriented 4B/5A frames with a CRC-8 over the plaintext rather than 16-bit op,~op.
 typedef enum {
     XHORSE_FAM_NONE = 0,
     XHORSE_FAM_XT27A,
     XHORSE_FAM_XT136,
+    XHORSE_FAM_XT14D,
 } xhorse_family_t;
 
 // Per-emulated-type page-write recipe the firmware applies in configure().
@@ -171,8 +195,9 @@ typedef struct {
     uint8_t  typebyte_ok;     // 1 => two consecutive reads of 0x3C agreed
     uint8_t  bank;            // bank image[] was read from (dump: 0 or 1, as requested; info: 0)
     uint8_t  chipid[16];      // 16-byte unique chip ID (bank-1 0x33..0x36; XT27A only)
-    uint8_t  image[64 * 4];   // XT27A: pages 0x00..0x3F of `bank` (dump), bank-0 0x00..0x07 (info);
-                              // XT136: pages 0x00..0x0F, no banks
+    uint8_t  image[XHORSE_INFO_MAXPAGES * 4];   // XT27A: pages 0x00..0x3F of `bank` (dump),
+                              // bank-0 0x00..0x07 (info); XT136: pages 0x00..0x0F, no banks;
+                              // XT14D: pages 0x00..0x4F (dump), 0x00..0x0F (info), no banks
     uint8_t  image_pages;     // how many pages of `bank` are in image[]
     // XMICRO / "channel B" probe (XT57 / XT37-class chips).  An XT27A set to some types (7938)
     // answers XMICRO too, but only a newer, not-yet-supported family names itself ("XT37",
@@ -181,7 +206,8 @@ typedef struct {
     uint8_t  bchip;           // 1 => a B-channel (XMICRO) chip answered the identify probe
     uint8_t  bchip_type_len;  // number of ASCII bytes in bchip_type[]
     uint8_t  bchip_type[8];   // the raw identify reply: 4 ASCII family bytes + CRC (e.g. 5854333726)
-    uint8_t  page_ok[8];      // bit (n % 8) of byte n / 8 set => two consecutive reads of page n agreed
+    uint8_t  page_ok[(XHORSE_INFO_MAXPAGES + 7) / 8];   // bit (n % 8) of byte n / 8 set => two
+                              // consecutive reads of page n agreed (XT14D: the read passed its CRC-8)
     uint8_t  family;          // xhorse_family_t
     uint16_t seed_reply;      // the tag's reply to 7372 (XT27A) / E430 (XT136) that seeds the cipher
     int16_t  em_slip_us;      // `xt57 reset`: how far off the VVDI's nominal burst offset the
@@ -202,7 +228,18 @@ typedef struct {
     uint8_t  count;       // read: pages to read, 1..64; write: unused
     uint8_t  verify;      // write: 1 => read the page back and compare before reporting success
     uint8_t  cfg;         // write: 1 => `page` is a config-word index n, written by ctl 0x30+n
-    uint8_t  rfu[3];
+    // XT14D read only: how many times this call may close the session and open a fresh one after
+    // a page that did not answer.  A page the chip ignores can leave the two keystreams out of
+    // step, and it then ignores everything after it, so a read that crosses an address with no
+    // storage behind it has to start again to stay meaningful (docs/xt14d.md SS6).  0 = never
+    // resync: the read stops at the first such page and the client re-issues from there.
+    uint8_t  resync;
+    // Try this xhorse_family_t's handshake first (0 = probe all, in the usual order).  Finding an
+    // XT14D costs an XT27A probe and an XT136 probe first, about 2.9 s, which a sweep would pay
+    // again on every call; the client passes the family its first call reported so the rest go
+    // straight to it.  A wrong hint only costs one extra handshake: the full probe still follows.
+    uint8_t  family;
+    uint8_t  rfu;
     uint32_t value;       // write: the 32-bit value
 } PACKED lf_xhorse_io_t;
 
@@ -215,8 +252,16 @@ typedef struct {
     uint8_t  page;        // page number of data[0]
     uint8_t  count;       // pages in data[]
     uint8_t  verified;    // write: 1 => a read-back matched the value written
-    uint8_t  rfu[2];
-    uint8_t  ok[8];       // bit (i % 8) of byte i / 8 set => data[i] had two agreeing reads
+    uint8_t  resyncs;     // XT14D read: sessions reopened mid-read.  `count` short of what was
+    //                       asked for means it stopped early; the caller continues from page+count.
+    uint8_t  rfu;
+    uint8_t  ok[8];       // bit (i % 8) of byte i / 8 set => data[i] is trusted: two agreeing reads
+    //                       on an XT27A/XT136, a valid CRC-8 on an XT14D
+    // XT14D only: bit set => the chip answered that read at all.  A page it answers with a bad CRC
+    // and a page it ignores are different findings when sweeping for which addresses are backed by
+    // real storage, and a silent page may also leave the two keystreams out of step, so everything
+    // after it in the same session is suspect (docs/xt14d.md SS6).
+    uint8_t  ans[8];
     uint8_t  data[64 * 4];
 } PACKED lf_xhorse_io_reply_t;
 

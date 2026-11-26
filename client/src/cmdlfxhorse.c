@@ -245,7 +245,7 @@ static int xh_request_info(uint16_t cmd, uint8_t *payload, uint16_t len, lf_xhor
 // info/dump never send the EM-recovery burst or the ID8A probe (both change the chip), so a chip
 // stuck in an EM, ID48, ID8E or ID8A emulation simply doesn't answer them.  Say so.
 static void xh_print_not_found(void) {
-    PrintAndLogEx(FAILED, "No XT27A or XT136 answered the " _YELLOW_("XHORSE") " handshake");
+    PrintAndLogEx(FAILED, "No XT27A, XT136 or XT14D answered the " _YELLOW_("XHORSE") " handshake");
     PrintAndLogEx(HINT, "An XT27A emulating an EM type (ID11/12/13), ID48, ID8E or ID8A never answers it;");
     PrintAndLogEx(HINT, "`" _YELLOW_("lf xhorse reset") "` or `" _YELLOW_("lf xhorse configure") "` can recover it.");
     PrintAndLogEx(HINT, "For an ID8A chip, `" _YELLOW_("--probe b") "` reads it without a rewrite, at the cost of its type byte.");
@@ -447,6 +447,191 @@ static void xh136_print(const lf_xhorse_info_t *nfo, const char *title, bool wit
     PrintAndLogEx(NORMAL, "");
 }
 
+// XT14D: one flat page space addressed by a whole byte, so 256 addresses - and which of them are
+// backed by real storage is not known.  The VVDI only ever touches 0x00-0x19, 0x3C, 0x3D, 0x40-0x49
+// and 0x4D-0x4F, so this prints the low block it shares with the other families plus the two pages
+// the reset treats as configuration, and points at `read` for the rest (docs/xt14d.md).
+// Page 0x3C's low byte selects the sub-mode; its high byte is 0x46 on every XT14D seen so far,
+// whatever type the chip is set to, so it is not the emulated type (docs/xt14d.md SS7.3).
+static const char *xh14d_mode_name(uint32_t pg3c) {
+    switch (pg3c & 0xFF) {
+        case 0x00:
+            return "normal";
+        case 0x08:
+            return _YELLOW_("DST80") " / \"4D+\"";
+        default:
+            return "unknown";
+    }
+}
+
+static void xh14d_print(const lf_xhorse_info_t *nfo, const char *title) {
+    uint8_t npg = (nfo->image_pages < XHORSE_XT136_PAGES) ? nfo->image_pages : XHORSE_XT136_PAGES;
+    PrintAndLogEx(NORMAL, "");
+    xh_print_title(title);
+    PrintAndLogEx(INFO, "Chip type...... " _YELLOW_("XT14D") "  (answers " _YELLOW_("XHORSE") " with 4005+CRC)");
+    PrintAndLogEx(INFO, "Chip ID........ (none: an XT14D has no chip-ID pages)");
+    PrintAndLogEx(INFO, "Seed reply..... %04X  (seed = bitrev16(%04X) ^ A8A4)",
+                  nfo->seed_reply, nfo->seed_reply);
+    if (npg > 0) {
+        const uint8_t *d = nfo->image;
+        PrintAndLogEx(INFO, "Page 0x00...... " _GREEN_("%02X%02X%02X%02X") "%s",
+                      d[0], d[1], d[2], d[3], xh_page_mark_eol(nfo, 0));
+    }
+    PrintAndLogEx(INFO, "Emulated type.. " _YELLOW_("0x%02X") " = %s%s",
+                  nfo->typebyte, typebyte_name(nfo->typebyte),
+                  (nfo->cfgword_ok & 2) ? "" : " " _RED_("?"));
+    PrintAndLogEx(INFO, "Page 0x3C...... %08X%s  (46 + mode: %s)",
+                  nfo->cfgword[0], (nfo->cfgword_ok & 1) ? "" : " " _RED_("?"),
+                  xh14d_mode_name(nfo->cfgword[0]));
+    PrintAndLogEx(INFO, "Page 0x3D...... %08X%s  (05 + the emulated type byte)",
+                  nfo->cfgword[1], (nfo->cfgword_ok & 2) ? "" : " " _RED_("?"));
+    PrintAndLogEx(INFO, "");
+    PrintAndLogEx(INFO, "  page | data");
+    PrintAndLogEx(INFO, "-------+-----------");
+    for (uint8_t pg = 0; pg < npg; pg++) {
+        PrintAndLogEx(INFO, "  0x%02X | %s%s", pg, sprint_hex_inrow(&nfo->image[pg * 4], 4), xh_page_mark(nfo, pg));
+    }
+    if (npg > 0) {
+        int bad = 0;
+        for (uint8_t pg = 0; pg < npg; pg++) {
+            bad += xh_page_ok(nfo, pg) ? 0 : 1;
+        }
+        if (bad) {
+            PrintAndLogEx(WARNING, "%d page(s) marked " _RED_("?") ": no read of them passed its CRC-8, so they may be wrong", bad);
+        }
+    }
+    PrintAndLogEx(INFO, "");
+    PrintAndLogEx(HINT, "An XT14D's real storage is pages 0x00..0x4F - 80 x 16 bits = 160 bytes.  Read all of");
+    PrintAndLogEx(HINT, "it with `" _YELLOW_("lf xhorse dump") "`.  (0x50..0x7F is not backed by storage even though it");
+    PrintAndLogEx(HINT, "reads as zeroes, and 0x80..0xFF mirrors 0x00..0x7F.)");
+    PrintAndLogEx(NORMAL, "");
+}
+
+// What is known to live where in an XT14D's 80 real pages, for the dump's right-hand column.
+// Everything here comes from watching a VVDI reset one (docs/xt14d.md SS5.3) except the "not
+// touched by the VVDI" ranges, which are named as unknown precisely because it never reads them.
+static const char *xh14d_region_note(uint8_t pg) {
+    if (pg <= 0x19) {
+        switch (pg) {
+            case 0x0E:
+                return "emulated-tag image (always 5678 - a constant, not touched by a reset)";
+            case 0x11:
+                return _GREEN_("password") " (1 byte)";
+            case 0x12:
+                return _GREEN_("user byte");
+            case 0x13:
+            case 0x14:
+                return _GREEN_("emulated UID") ", 32-bit (0x13 = bytes 0,1; 0x14 = bytes 2,3)";
+            case 0x15:
+            case 0x16:
+            case 0x17:
+            case 0x18:
+            case 0x19:
+                // Byte order differs per mode in the VVDI's own display: an ID4D key reads
+                // forwards out of this field, a DST80 key reads backwards.  See docs SS7.2.
+                return _GREEN_("crypto key") ", 10 bytes (DST40 uses 5; DST80 all 10, reversed)";
+            default:
+                return "emulated-tag image (reset zeroes it)";
+        }
+    }
+    // DST+ (DST80) page data.  The VVDI shows these as "p6".."p12" etc; each is 5 bytes held in
+    // 3 pages, low byte of each page first and then byte-reversed, with the 3rd page's high byte
+    // unused.  p6..p12 and P29 are confirmed against a VVDI readout; p13..p15 follow the same
+    // grid but have not been seen in the UI (docs/xt14d.md SS7.2).
+    if (pg <= 0x37) {
+        static char b[96];
+        snprintf(b, sizeof(b), _GREEN_("DST+ page data") " p%u (5 bytes over 3 pages)",
+                 (unsigned)(6 + (pg - 0x1A) / 3));
+        return b;
+    }
+    if (pg == 0x38) {
+        return "unclaimed - no VVDI field maps here";
+    }
+    if (pg <= 0x3B) {
+        return _GREEN_("DST+ page data") " P29 (5 bytes over 3 pages)";
+    }
+    switch (pg) {
+        case 0x3C:
+            // High byte = the emulated type (0x46).  Low byte = the mode: 00 = plain ID4D,
+            // 08 = 4D+ / DST80.  The VVDI shows this same word as "P30".
+            return "always 46 (hi) + " _YELLOW_("mode") " (lo: 00=normal, 08=DST80); VVDI \"P30\"";
+        case 0x3D:
+            return "always 05 (hi) + the " _YELLOW_("emulated type byte") " (lo: 4D=ID4D, 64=ID4E)";
+        case 0x3E:
+            return "always 0062 - a constant, not touched by a reset";
+        case 0x3F:
+            return "always 1234 - a constant, not touched by a reset";
+        case 0x40:
+        case 0x41:
+        case 0x42:
+        case 0x43:
+            return "written last by a reset - looks like a commit/enable marker";
+        case 0x44:
+        case 0x45:
+        case 0x46:
+            return _YELLOW_("48-bit key") " (changes on a reset, but repeats - see docs SS7.1)";
+        case 0x47:
+        case 0x48:
+        case 0x49:
+            return _YELLOW_("48-bit key") ", backup copy of 0x44-0x46";
+        case 0x4A:
+        case 0x4B:
+        case 0x4C:
+            return "not touched by the VVDI - purpose unknown";
+        default:
+            return _YELLOW_("key re-encoded") " (k2-k5 of 0x44-0x46, scrambled)";   // 0x4D-0x4F
+    }
+}
+
+// `lf xhorse dump` for an XT14D: its 80 real pages, 0x00..0x4F.
+static void xh14d_print_dump(const lf_xhorse_info_t *nfo) {
+    uint8_t npg = (nfo->image_pages < XHORSE_XT14D_REAL_PAGES) ? nfo->image_pages
+                  : XHORSE_XT14D_REAL_PAGES;
+    PrintAndLogEx(NORMAL, "");
+    xh_print_title("Xhorse XT14D dump");
+    PrintAndLogEx(INFO, "Chip type...... " _YELLOW_("XT14D") "  (answers " _YELLOW_("XHORSE") " with 4005+CRC)");
+    PrintAndLogEx(INFO, "Chip ID........ (none: an XT14D has no chip-ID pages)");
+    PrintAndLogEx(INFO, "Seed reply..... %04X  (seed = bitrev16(%04X) ^ A8A4)",
+                  nfo->seed_reply, nfo->seed_reply);
+    PrintAndLogEx(INFO, "Storage........ 80 pages x 16 bits = " _GREEN_("160 bytes") "  (0x00..0x4F)");
+    PrintAndLogEx(INFO, "Emulated type.. " _YELLOW_("0x%02X") " = %s%s",
+                  nfo->typebyte, typebyte_name(nfo->typebyte),
+                  (nfo->cfgword_ok & 2) ? "" : " " _RED_("?"));
+    PrintAndLogEx(INFO, "Page 0x3C...... %08X%s  (46 + mode: %s)",
+                  nfo->cfgword[0], (nfo->cfgword_ok & 1) ? "" : " " _RED_("?"),
+                  xh14d_mode_name(nfo->cfgword[0]));
+    PrintAndLogEx(INFO, "Page 0x3D...... %08X%s  (05 + the emulated type byte)",
+                  nfo->cfgword[1], (nfo->cfgword_ok & 2) ? "" : " " _RED_("?"));
+    PrintAndLogEx(INFO, "");
+    PrintAndLogEx(INFO, "  page | data       | what is known to live there");
+    PrintAndLogEx(INFO, "-------+------------+--------------------------------------------------");
+    for (uint8_t pg = 0; pg < npg; pg++) {
+        PrintAndLogEx(INFO, "  0x%02X | %s%s | %s", pg, sprint_hex_inrow(&nfo->image[pg * 4], 4),
+                      xh_page_mark(nfo, pg), xh14d_region_note(pg));
+    }
+    // Not xh_print_unconfirmed(): that one talks about banks and about two reads disagreeing,
+    // neither of which is how an XT14D works.  Here the mark means the read failed its CRC-8 or
+    // went unanswered.
+    {
+        int bad = 0;
+        for (uint8_t pg = 0; pg < npg; pg++) {
+            bad += xh_page_ok(nfo, pg) ? 0 : 1;
+        }
+        if (bad) {
+            PrintAndLogEx(WARNING, "%d page(s) marked " _RED_("?") ": no read of them passed its CRC-8, so they may be wrong", bad);
+            PrintAndLogEx(HINT, "A page the chip does not answer leaves the keystream out of step and everything");
+            PrintAndLogEx(HINT, "after it reads as dead too, so a long run of " _RED_("?") " is likely one bad page and not many.");
+            PrintAndLogEx(HINT, "Re-run it; if the same page fails every time, that page is the real finding.");
+        }
+    }
+    PrintAndLogEx(INFO, "");
+    PrintAndLogEx(HINT, "That is the whole chip.  Its address is a whole byte, but bit 7 is ignored - 0x80..0xFF");
+    PrintAndLogEx(HINT, "mirrors 0x00..0x7F on read " _YELLOW_("and") " write - and 0x50..0x7F is not backed by storage: it");
+    PrintAndLogEx(HINT, "answers reads with a valid 00000000 and silently discards writes.  To see that for");
+    PrintAndLogEx(HINT, "yourself, `" _YELLOW_("lf xhorse read -p 0 -n 256") "` shows the mirror.");
+    PrintAndLogEx(NORMAL, "");
+}
+
 // The four ASCII family bytes of a channel-B identify reply, as a printable string.  `is37` says
 // whether this is the XT37 family, which is what decides the keystream (docs/xt37.md SS5a).
 static void xh_bchip_type_str(const lf_xhorse_info_t *nfo, char *out, size_t outlen, bool *is37) {
@@ -516,7 +701,8 @@ static int CmdLFXhorseInfo(const char *Cmd) {
                   "newer families (XT57 / XT37-class) answer it and are reported as unsupported.\n"
                   "Otherwise reads the XT27A over channel A: unique chip ID, emulated type byte,\n"
                   "and the first 8 emulated-image pages.  If no XT27A answers, tries the XT136\n"
-                  "handshake and reads its pages 0x00..0x0F.\n"
+                  "handshake and reads its pages 0x00..0x0F, then the XT14D one - which answers\n"
+                  _YELLOW_("XHORSE") " with 4005+CRC - and reads its pages 0x00..0x0F plus 0x3C and 0x3D.\n"
                   "A chip set to ID8A answers nothing until the VVDI's ID8A probe is replayed:\n"
                   "--probe sends it, at the cost of the chip's emulated type byte (word b).",
                   "lf xhorse info\n"
@@ -568,6 +754,11 @@ static int CmdLFXhorseInfo(const char *Cmd) {
         return PM3_SUCCESS;
     }
 
+    if (nfo.family == XHORSE_FAM_XT14D) {
+        xh14d_print(&nfo, "Xhorse XT14D");
+        return PM3_SUCCESS;
+    }
+
     // What the chip is, not what is in it: `lf xhorse dump` prints this same header and the memory
     // under it.
     PrintAndLogEx(NORMAL, "");
@@ -589,6 +780,9 @@ static int CmdLFXhorseDump(const char *Cmd) {
                   "both banks - bank 0 (the emulated-tag image) and bank 1 (configuration and\n"
                   "identity).  Each bank is read in its own session.\n"
                   "XT136: no banks and only pages 0x00..0x0F, read in one session.\n"
+                  "XT14D: no banks; pages 0x00..0x4F, read in one session.  That is all of it -\n"
+                  "the address is a whole byte but bit 7 is ignored, so 0x80..0xFF mirrors\n"
+                  "0x00..0x7F, and 0x50..0x7F is not backed by storage.\n"
                   "XT37 / XT57 (channel B): every block the family is known to use, read over an\n"
                   "authenticated session - the chip ID is the identity block, and the emulated type\n"
                   "and UID come out of the same pass.  Which power-up delay reaches a usable nonce\n"
@@ -650,6 +844,12 @@ static int CmdLFXhorseDump(const char *Cmd) {
             xh136_print(&nfo[bank], "Xhorse XT136 dump", true);
             return PM3_SUCCESS;
         }
+        if (nfo[bank].family == XHORSE_FAM_XT14D) {
+            // An XT14D has no banks and all 80 of its real pages fit one reply, so bank 0 is the
+            // whole dump and the second session is never opened.
+            xh14d_print_dump(&nfo[bank]);
+            return PM3_SUCCESS;
+        }
     }
 
     PrintAndLogEx(NORMAL, "");
@@ -709,18 +909,68 @@ static int xh_io_send(uint16_t cmd, const lf_xhorse_io_t *p, lf_xhorse_io_reply_
     return PM3_SUCCESS;
 }
 
-// Always two visible characters, like xh_page_mark, so a following column stays aligned.
-static const char *xh_io_mark(const lf_xhorse_io_reply_t *r, uint8_t i) {
-    return ((r->ok[i / 8] >> (i % 8)) & 1) ? "  " : " " _RED_("?");
+// How many times one `lf xhorse read` call may reopen the session after a page that did not
+// answer.  Each reopen is a power cycle and a handshake (~0.35 s on an XT14D), and the device
+// reply has to come back inside xh_io_send's timeout, so the budget is small and the client
+// simply issues another call when it runs out.
+#define XH_READ_RESYNC  8
+
+// 2 = trusted, 1 = answered but never trusted, 0 = no answer.  Over the accumulated bitmaps of a
+// sweep, which may be longer than one reply.
+static int xh_sweep_state(const uint8_t *ok, const uint8_t *ans, int i) {
+    if ((ok[i / 8] >> (i % 8)) & 1) {
+        return 2;
+    }
+    return ((ans[i / 8] >> (i % 8)) & 1) ? 1 : 0;
 }
 
-// An XT136 has one flat page space: say so when a bank was asked for, so -b is never silently lost.
+static const char *xh_sweep_mark(const uint8_t *ok, const uint8_t *ans, int i) {
+    switch (xh_sweep_state(ok, ans, i)) {
+        case 2:
+            return "  ";
+        case 1:
+            return " " _RED_("?");
+        default:
+            return " " _YELLOW_("-");
+    }
+}
+
+static bool xh_io_ok(const lf_xhorse_io_reply_t *r, uint8_t i) {
+    return ((r->ok[i / 8] >> (i % 8)) & 1) != 0;
+}
+
+// Did the chip answer that read at all?  Only an XT14D distinguishes the two; the other families
+// always report answered, so the mark below degrades to the old "?" for them.
+static bool xh_io_answered(const lf_xhorse_io_reply_t *r, uint8_t i) {
+    return ((r->ans[i / 8] >> (i % 8)) & 1) != 0;
+}
+
+// Always two visible characters, like xh_page_mark, so a following column stays aligned.
+// "?" = answered but not trusted; "-" = the chip said nothing at all, which on an XT14D is the
+// interesting case when sweeping for which addresses exist.
+static const char *xh_io_mark(const lf_xhorse_io_reply_t *r, uint8_t i) {
+    if (xh_io_ok(r, i)) {
+        return "  ";
+    }
+    return xh_io_answered(r, i) ? " " _RED_("?") : " " _YELLOW_("-");
+}
+
+// An XT136 or XT14D has one flat page space: say so when a bank was asked for, so -b is never
+// silently lost.
 static void xh_io_note_family(const lf_xhorse_io_reply_t *r, int bank, bool bank_given) {
+    const char *name = NULL;
     if (r->family == XHORSE_FAM_XT136) {
-        PrintAndLogEx(INFO, "Family.... " _GREEN_("XT136") " (no banks: one flat page space)");
-        if (bank_given && bank != 0) {
-            PrintAndLogEx(WARNING, "-b %d ignored: an XT136 has no banks", bank);
-        }
+        name = "XT136";
+    } else if (r->family == XHORSE_FAM_XT14D) {
+        name = "XT14D";
+    }
+    if (name == NULL) {
+        return;
+    }
+    PrintAndLogEx(INFO, "Family.... " _GREEN_("%s") " (no banks: one flat page space%s)", name,
+                  (r->family == XHORSE_FAM_XT14D) ? ", 0x00..0xFF" : "");
+    if (bank_given && bank != 0) {
+        PrintAndLogEx(WARNING, "-b %d ignored: an %s has no banks", bank, name);
     }
 }
 
@@ -729,22 +979,41 @@ static int CmdLFXhorseRead(const char *Cmd) {
     CLIParserInit(&ctx, "lf xhorse read",
                   "Read raw channel-A pages from an Xhorse super-chip.\n"
                   "\n"
-                  "A page address is 6 bits, so 0x00..0x3F is the whole of a bank and there is no\n"
-                  "page above it.  An XT27A has two banks, selected with -b: bank 0 is the emulated\n"
+                  "On an XT27A or XT136 a page address is 6 bits, so 0x00..0x3F is the whole of a\n"
+                  "bank.  An XT27A has two banks, selected with -b: bank 0 is the emulated\n"
                   "transponder's image, bank 1 is configuration and identity (chip ID 0x33..0x36,\n"
                   "emulated type byte 0x3C, config words 0x3D..0x3E).  An XT136 has no banks and -b\n"
                   "is ignored on one.\n"
                   "\n"
-                  "Every page is read until two reads agree; one marked " _RED_("?") " never did and may be wrong.",
+                  "An " _YELLOW_("XT14D") " addresses a page with a whole byte, so " _YELLOW_("0x00..0xFF") ", and has no banks.\n"
+                  "Which of those 256 addresses are backed by real storage is " _YELLOW_("not known yet") ": the\n"
+                  "VVDI only ever touches 0x00-0x19, 0x3C, 0x3D, 0x40-0x49 and 0x4D-0x4F.  Sweeping\n"
+                  "the space with this command is how the rest gets mapped, which is what `dump`\n"
+                  "is waiting for.\n"
+                  "\n"
+                  "Marks after a page.  On an XT27A or XT136 a page is read until two reads agree,\n"
+                  "and " _RED_("?") " means none ever did.  An XT14D's reply carries a CRC-8 over the opcode,\n"
+                  "the address and the data, so a single good read is conclusive: " _RED_("?") " means the chip\n"
+                  "answered but no read passed its CRC, and " _YELLOW_("-") " means it did not answer at all.\n"
+                  "\n"
+                  "A page an XT14D ignores also ends the session: the keystream advances per frame,\n"
+                  "and a frame the chip never sent leaves it unclear whether the chip advanced its\n"
+                  "own - in practice it does not, so every later command decrypts to nonsense on\n"
+                  "the chip.  This handles that for you: a page that fails closes the session and\n"
+                  "the next one is read in a fresh one, over as many sessions as the range needs.\n"
+                  "A sweep across dead addresses is therefore slow but correct, and a " _YELLOW_("-") " really\n"
+                  "does mean that one address did not answer.",
                   "lf xhorse read -p 0                      -> bank-0 page 0x00\n"
                   "lf xhorse read -b 1 -p 0x3C              -> the emulated type byte\n"
                   "lf xhorse read -b 1 -p 0x33 -n 4         -> the 16-byte chip ID\n"
-                  "lf xhorse read -p 0 -n 64                -> all of bank 0");
+                  "lf xhorse read -p 0 -n 64                -> all of bank 0\n"
+                  "lf xhorse read -p 0x40 -n 16             -> XT14D: the 0x40..0x4F block\n"
+                  "lf xhorse read -p 0 -n 256               -> XT14D: sweep the whole address space");
     void *argtable[] = {
         arg_param_begin,
-        arg_int0("b", "bank",  "<dec>", "bank to read, 0..63 (def 0); ignored on an XT136"),
-        arg_int1("p", "page",  "<dec>", "first page, 0..63"),
-        arg_int0("n", "count", "<dec>", "pages to read (def 1)"),
+        arg_int0("b", "bank",  "<dec>", "bank to read, 0..63 (def 0); ignored on an XT136 or XT14D"),
+        arg_int1("p", "page",  "<dec>", "first page: 0..63 on an XT27A/XT136, 0..255 on an XT14D"),
+        arg_int0("n", "count", "<dec>", "pages to read, 1..256 (def 1); read over as many sessions as it takes"),
         arg_param_end
     };
     // false: a bare `lf xhorse read` prints the help rather than quietly reading bank 0 page 0.
@@ -759,16 +1028,19 @@ static int CmdLFXhorseRead(const char *Cmd) {
         PrintAndLogEx(FAILED, "bank must be 0..63 (the sel operand is 6 bits)");
         return PM3_EINVARG;
     }
-    if (page < 0 || page > 63) {
-        PrintAndLogEx(FAILED, "page must be 0..63 (the address field is 6 bits)");
+    // 0..255 is the XT14D's range; the firmware clamps to 0x3F for the families whose address
+    // field is 6 bits, and the reply says what it actually read.  Which family is on the antenna
+    // is not known until the handshake, so it cannot be checked here.
+    if (page < 0 || page > 255) {
+        PrintAndLogEx(FAILED, "page must be 0..255 (0..63 on an XT27A or XT136)");
         return PM3_EINVARG;
     }
-    if (count < 1 || count > 64) {
-        PrintAndLogEx(FAILED, "-n must be 1..64");
+    if (count < 1 || count > 256) {
+        PrintAndLogEx(FAILED, "-n must be 1..256");
         return PM3_EINVARG;
     }
-    if (page + count > 64) {
-        PrintAndLogEx(FAILED, "page 0x%02X + %d pages runs past 0x3F, the last page of a bank", page, count);
+    if (page + count > 256) {
+        PrintAndLogEx(FAILED, "page 0x%02X + %d pages runs past 0xFF, the last address there is", page, count);
         return PM3_EINVARG;
     }
 
@@ -777,34 +1049,125 @@ static int CmdLFXhorseRead(const char *Cmd) {
     p.bank = (uint8_t)bank;
     p.page = (uint8_t)page;
     p.count = (uint8_t)count;
+    p.resync = XH_READ_RESYNC;
 
+    // An XT14D read stops early when it has spent its resync budget on pages that did not answer,
+    // so the range is covered over as many calls as it takes.  Each call opens its own session, so
+    // a short reply always means progress is still possible; a reply of zero pages means it is not.
+    // The other families answer in one call and the loop runs once.
+    // One reply carries at most XHORSE_IO_MAXPAGES pages, and an XT14D read also stops early when
+    // it has spent its resync budget on pages that did not answer, so the range is covered over as
+    // many calls as it takes.  Each call opens its own session, so a short reply still means
+    // progress; a reply of no pages means there is none to be had.
     lf_xhorse_io_reply_t r;
-    int status = PM3_SUCCESS;
-    int res = xh_io_send(CMD_LF_XHORSE_READ, &p, &r, &status);
-    if (res != PM3_SUCCESS) {
-        return res;
+    static uint8_t data[256 * 4];
+    static uint8_t okbits[32], ansbits[32];
+    memset(data, 0, sizeof(data));
+    memset(okbits, 0, sizeof(okbits));
+    memset(ansbits, 0, sizeof(ansbits));
+    int got = 0, calls = 0, resyncs = 0, status = PM3_SUCCESS;
+    uint8_t family = XHORSE_FAM_NONE;
+    while (got < count) {
+        int want = count - got;
+        p.page = (uint8_t)(page + got);
+        p.count = (uint8_t)((want > XHORSE_IO_MAXPAGES) ? XHORSE_IO_MAXPAGES : want);
+        int res = xh_io_send(CMD_LF_XHORSE_READ, &p, &r, &status);
+        if (res != PM3_SUCCESS) {
+            return res;
+        }
+        calls++;
+        family = r.family;
+        if (status != PM3_SUCCESS || r.count == 0) {
+            break;
+        }
+        for (uint8_t i = 0; i < r.count && (got + i) < count; i++) {
+            int d = got + i;
+            memcpy(&data[d * 4], &r.data[i * 4], 4);
+            if ((r.ok[i / 8] >> (i % 8)) & 1) {
+                okbits[d / 8] |= (uint8_t)(1 << (d % 8));
+            }
+            if ((r.ans[i / 8] >> (i % 8)) & 1) {
+                ansbits[d / 8] |= (uint8_t)(1 << (d % 8));
+            }
+        }
+        got += r.count;
+        resyncs += r.resyncs;
+        if (r.family != XHORSE_FAM_XT14D) {
+            break;                       // only an XT14D ever answers short
+        }
+        p.family = r.family;             // the rest of the sweep skips the other families' probes
     }
+    r.family = family;
 
     PrintAndLogEx(NORMAL, "");
     xh_io_note_family(&r, bank, bank_given);
+    if (status == PM3_EINVARG) {
+        PrintAndLogEx(FAILED, "page 0x%02X is past 0x3F, the last page of a bank on that family", page);
+        return PM3_ESOFT;
+    }
     if (status != PM3_SUCCESS) {
         PrintAndLogEx(FAILED, "sel bank %d was not echoed: the chip has no such bank, or the session faltered", bank);
         return PM3_ESOFT;
+    }
+    if (got < count) {
+        PrintAndLogEx(WARNING, "asked for %d pages, read %d: the rest is past the end of this chip's",
+                      count, got);
+        PrintAndLogEx(WARNING, "address space, or the chip stopped answering - re-run from 0x%02X to find out",
+                      page + got);
+    }
+    if (resyncs) {
+        PrintAndLogEx(INFO, "Resynced %d time(s) across %d session(s): a page that does not answer ends a",
+                      resyncs, calls);
+        PrintAndLogEx(INFO, "session, so each one after it was read in a fresh one.");
     }
     if (r.family == XHORSE_FAM_XT27A) {
         PrintAndLogEx(INFO, "bank %d", bank);
     }
     PrintAndLogEx(INFO, "  page | data");
     PrintAndLogEx(INFO, "-------+-----------");
-    for (uint8_t i = 0; i < r.count; i++) {
-        PrintAndLogEx(INFO, "  0x%02X | %s%s", (unsigned)(r.page + i), sprint_hex_inrow(&r.data[i * 4], 4), xh_io_mark(&r, i));
+    for (int i = 0; i < got; i++) {
+        PrintAndLogEx(INFO, "  0x%02X | %s%s", (unsigned)(page + i), sprint_hex_inrow(&data[i * 4], 4),
+                      xh_sweep_mark(okbits, ansbits, i));
     }
-    int bad = 0;
-    for (uint8_t i = 0; i < r.count; i++) {
-        bad += ((r.ok[i / 8] >> (i % 8)) & 1) ? 0 : 1;
+    int bad = 0, silent = 0, first_silent = -1;
+    for (int i = 0; i < got; i++) {
+        if ((okbits[i / 8] >> (i % 8)) & 1) {
+            continue;
+        }
+        if ((ansbits[i / 8] >> (i % 8)) & 1) {
+            bad++;
+        } else {
+            silent++;
+            if (first_silent < 0) {
+                first_silent = page + i;
+            }
+        }
+    }
+    // A sweep is read for its shape, not its 256 rows: collapse it into runs of one outcome.
+    if (got >= 16) {
+        PrintAndLogEx(INFO, "");
+        PrintAndLogEx(INFO, "address map");
+        PrintAndLogEx(INFO, "  range     | outcome");
+        PrintAndLogEx(INFO, "------------+---------------------------");
+        int run = 0;
+        for (int i = 0; i < got; i = run) {
+            int st = xh_sweep_state(okbits, ansbits, i);
+            for (run = i; run < got && xh_sweep_state(okbits, ansbits, run) == st; run++) { }
+            PrintAndLogEx(INFO, "  0x%02X-0x%02X | %s", page + i, page + run - 1,
+                          (st == 2) ? _GREEN_("read ok (CRC valid)")
+                          : (st == 1) ? _RED_("answered, CRC never valid")
+                          : _YELLOW_("no answer"));
+        }
     }
     if (bad) {
-        PrintAndLogEx(WARNING, "%d page(s) marked " _RED_("?") " unconfirmed: no two reads agreed, so they may be wrong; try again", bad);
+        PrintAndLogEx(WARNING, "%d page(s) marked " _RED_("?") ": %s, so they may be wrong; try again", bad,
+                      (r.family == XHORSE_FAM_XT14D) ? "no read passed its CRC-8" : "no two reads agreed");
+    }
+    if (silent) {
+        PrintAndLogEx(WARNING, "%d page(s) marked " _YELLOW_("-") ": the chip did not answer at all (first 0x%02X).",
+                      silent, first_silent);
+        PrintAndLogEx(HINT, "Each was read in a session of its own, so that is the address answering nothing,");
+        PrintAndLogEx(HINT, "not a knock-on effect of the one before it.");
     }
     PrintAndLogEx(NORMAL, "");
     return PM3_SUCCESS;
@@ -829,6 +1192,18 @@ static int CmdLFXhorseWrite(const char *Cmd) {
                   "\n"
                   "An XT136 has no banks and -b is ignored on one.\n"
                   "\n"
+                  "An " _YELLOW_("XT14D") " has no banks either, and addresses a page with a whole byte, so\n"
+                  _YELLOW_("0x00..0xFF") ".  It has no ctl config words, so -c is refused on one: its configuration\n"
+                  "pages are written like any other page.  " _RED_("Writing one is not reversible") " - there is\n"
+                  "no reset recipe for an XT14D yet.  The pages a VVDI reset writes are 0x00-0x19,\n"
+                  "0x3C (probably the emulated type), 0x3D, 0x40-0x49 and 0x4D-0x4F; 0x44-0x49 look\n"
+                  "like a 48-bit key stored twice.  Read a page and keep the value before writing it.\n"
+                  "\n"
+                  "A write is acknowledged with a 5AA5 the chip sends back, and the read-back is\n"
+                  "checked against the frame's own CRC-8, so a reported success is a real one.\n"
+                  "Writing is also how to tell real storage from an alias or a dead address: write\n"
+                  "a page, read it back, then read the addresses it might alias.\n"
+                  "\n"
                   _RED_("-c writes a config word, which can change what the chip emulates.") "  On an XT27A\n"
                   "`lf xhorse reset` can recover that; " _RED_("on an XT136 there is no reset recipe") ", and\n"
                   "config word 1's high byte is the suspected type field.  Read the word first and\n"
@@ -836,11 +1211,12 @@ static int CmdLFXhorseWrite(const char *Cmd) {
                   "lf xhorse write -p 0 -d 11223344             -> bank-0 page 0x00 (emulated UID)\n"
                   "lf xhorse write -b 1 -p 0x3C -d 00000036     -> set the emulated type to ID46\n"
                   "lf xhorse write -p 0x05 -d A5A5A5A5 --nv     -> write without the read-back verify\n"
-                  "lf xhorse write -c 0 -d 0000000F             -> config word 0 via ctl 0x30");
+                  "lf xhorse write -c 0 -d 0000000F             -> config word 0 via ctl 0x30\n"
+                  "lf xhorse write -p 0x44 -d 000040AE          -> XT14D: a page of the 48-bit key block");
     void *argtable[] = {
         arg_param_begin,
-        arg_int0("b", "bank", "<dec>", "bank to write, 0..63 (def 0); ignored on an XT136"),
-        arg_int0("p", "page", "<dec>", "page to write, 0..63"),
+        arg_int0("b", "bank", "<dec>", "bank to write, 0..63 (def 0); ignored on an XT136 or XT14D"),
+        arg_int0("p", "page", "<dec>", "page to write: 0..63 on an XT27A/XT136, 0..255 on an XT14D"),
         arg_int0("c", "cfg",  "<dec>", "config word n to write via ctl 0x30+n, 0..2 (instead of -p)"),
         arg_str1("d", "data", "<hex>", "4 byte value to write"),
         arg_lit0(NULL, "nv",  "skip the read-back verify (the page is still read back and shown)"),
@@ -875,8 +1251,10 @@ static int CmdLFXhorseWrite(const char *Cmd) {
         PrintAndLogEx(FAILED, "config word must be 0..2 (ctl 0x30..0x32)");
         return PM3_EINVARG;
     }
-    if (page != -1 && (page < 0 || page > 63)) {
-        PrintAndLogEx(FAILED, "page must be 0..63 (the address field is 6 bits)");
+    // 0..255 is the XT14D's range; the firmware refuses anything past 0x3F on the families whose
+    // address field is 6 bits, since which one is on the antenna is not known until the handshake.
+    if (page != -1 && (page < 0 || page > 255)) {
+        PrintAndLogEx(FAILED, "page must be 0..255 (0..63 on an XT27A or XT136)");
         return PM3_EINVARG;
     }
 
@@ -886,6 +1264,7 @@ static int CmdLFXhorseWrite(const char *Cmd) {
     p.cfg = (cfg != -1) ? 1 : 0;
     p.page = (uint8_t)((cfg != -1) ? cfg : page);
     p.verify = nv ? 0 : 1;
+    p.resync = 0;                        // a write is one page: nothing to resync across
     p.value = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) | ((uint32_t)data[2] << 8) | data[3];
 
     lf_xhorse_io_reply_t r;
@@ -897,6 +1276,16 @@ static int CmdLFXhorseWrite(const char *Cmd) {
 
     PrintAndLogEx(NORMAL, "");
     xh_io_note_family(&r, bank, bank_given);
+    if (status == PM3_EINVARG) {
+        // The firmware refused the request outright and wrote nothing: either a page past 0x3F on
+        // a family whose address field is 6 bits, or -c on an XT14D, which has no ctl words.
+        if (r.family == XHORSE_FAM_XT14D) {
+            PrintAndLogEx(FAILED, "an XT14D has no ctl config words; write the page itself with -p");
+        } else {
+            PrintAndLogEx(FAILED, "page 0x%02X is past 0x3F, the last page of a bank on that family", page);
+        }
+        return PM3_ESOFT;
+    }
     if (r.count == 0) {
         PrintAndLogEx(FAILED, "sel bank %d was not echoed; nothing was written", bank);
         return PM3_ESOFT;
@@ -906,7 +1295,7 @@ static int CmdLFXhorseWrite(const char *Cmd) {
         // r.page is where the word reads back from: 0x0D+n on an XT136, bank-1 0x3D+n on an XT27A.
         PrintAndLogEx(INFO, "wrote config word %d (ctl 0x%02X) = %s", cfg, 0x30 + cfg, sprint_hex_inrow(data, 4));
         PrintAndLogEx(INFO, "page 0x%02X reads back %s%s", r.page, sprint_hex_inrow(&r.data[0], 4), xh_io_mark(&r, 0));
-    } else if (r.family == XHORSE_FAM_XT136) {
+    } else if (r.family == XHORSE_FAM_XT136 || r.family == XHORSE_FAM_XT14D) {
         PrintAndLogEx(INFO, "wrote page 0x%02X = %s", page, sprint_hex_inrow(data, 4));
         PrintAndLogEx(INFO, "reads back      %s%s", sprint_hex_inrow(&r.data[0], 4), xh_io_mark(&r, 0));
     } else {
@@ -921,8 +1310,18 @@ static int CmdLFXhorseWrite(const char *Cmd) {
         // page changed again.  Report it rather than claiming success.
         PrintAndLogEx(WARNING, "verify passed on-chip but the read-back differs; try reading the page again");
     } else {
-        PrintAndLogEx(FAILED, "write " _RED_("did not take") " - the page still reads %s", sprint_hex_inrow(&r.data[0], 4));
-        if (cfg == -1) {
+        PrintAndLogEx(FAILED, "write " _RED_("did not take") " - the page still reads %s%s",
+                      sprint_hex_inrow(&r.data[0], 4), xh_io_mark(&r, 0));
+        if (r.family == XHORSE_FAM_XT14D) {
+            // On an XT14D a failed write is itself a finding: an address that acknowledges but
+            // does not keep what was written is not backed by storage.
+            if (xh_io_answered(&r, 0) == false) {
+                PrintAndLogEx(HINT, "the read-back went unanswered: that address may not exist at all");
+            } else {
+                PrintAndLogEx(HINT, "the chip answered but kept its old value: that address may be read-only,");
+                PrintAndLogEx(HINT, "or not backed by real storage.  Worth recording for the page map.");
+            }
+        } else if (cfg == -1) {
             PrintAndLogEx(HINT, "config words ignore a WRITE; write them with -c (ctl 0x30+n)");
         }
         return PM3_ESOFT;

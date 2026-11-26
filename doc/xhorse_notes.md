@@ -19,6 +19,9 @@
   - [Evidence](#evidence)
   - [How it was found](#how-it-was-found)
 - [XT136](#xt136)
+- [XT14D](#xt14d)
+  - [What is supported, and what the address sweep is for](#what-is-supported-and-what-the-address-sweep-is-for)
+    - [The measured map (hardware, 2026-11-26)](#the-measured-map-hardware-2026-11-26)
 - [Config words (ctl 0x30+n)](#config-words-ctl-0x30n)
 - [Channel B identify (XT27B / XT57B)](#channel-b-identify-xt27b--xt57b)
 - [Open questions](#open-questions)
@@ -47,11 +50,11 @@ unsupported.
 
 | Command | Purpose |
 |---|---|
-| `lf xhorse info` | Identify the chip: channel-B family, or XT27A chip ID, emulated type byte and the first 8 emulated pages, or XT136 pages `0x00`-`0x0F` |
-| `lf xhorse dump` | Read the XT27A chip ID, type byte and all 64 pages of bank 0 and of bank 1, one session per bank; on an XT136, its pages `0x00`-`0x0F` in one session |
+| `lf xhorse info` | Identify the chip: channel-B family, or XT27A chip ID, emulated type byte and the first 8 emulated pages, or XT136 pages `0x00`-`0x0F`, or XT14D pages `0x00`-`0x0F` plus `0x3C`/`0x3D` |
+| `lf xhorse dump` | Read the XT27A chip ID, type byte and all 64 pages of bank 0 and of bank 1, one session per bank; on an XT136, its pages `0x00`-`0x0F` in one session; on an XT14D, its 80 real pages `0x00`-`0x4F` in one session, annotated with what is known to live where |
 | `lf xhorse configure -t <type> [-u <uid>]` | Set the emulated transponder type, and its UID: `-u` is required for every type that takes one |
 | `lf xhorse reset` | Restore the factory-default ID46/HITAG2 personality; also recovers a chip stuck in an EM emulation |
-| `lf xhorse read -p <page> [-b <bank>] [-n <count>]` | Read raw channel-A pages: `-b` picks the bank on an XT27A and is ignored on an XT136 |
+| `lf xhorse read -p <page> [-b <bank>] [-n <count>]` | Read raw channel-A pages: `-b` picks the bank on an XT27A and is ignored on an XT136 or XT14D. `-p` is 0-63, or **0-255 on an XT14D** |
 | `lf xhorse write -p <page> -d <hex> [-b <bank>]` | Write one raw channel-A page and read it back. See "Dangerous pages" first |
 | `lf xhorse types` | List the `-t` type tokens |
 
@@ -59,8 +62,8 @@ unsupported.
 type does not answer them; use `reset` or `configure`.
 
 `read` and `write` are the raw page primitives: no recipe, no interpretation, one page at a time.
-They identify the family themselves, so an XT136 is read and written with the same commands - it has
-no banks, and `-b` is reported as ignored rather than silently dropped. Neither sends the EM burst
+They identify the family themselves, so an XT136 or XT14D is read and written with the same commands
+- neither has banks, and `-b` is reported as ignored rather than silently dropped. Neither sends the EM burst
 or the ID8A probe, so like `info`/`dump` they cannot reach a chip stuck in an EM emulation, and
 unlike `configure` they never change anything you did not name. A `write` on an XT27A takes the
 VVDI's two-session path (capability read, `ctl`, re-handshake, then the write), which is the only
@@ -71,6 +74,11 @@ The chip's replies are weak, and a reply that loses an edge can decode to a wron
 error. So `info` and `dump` read the type byte and each page until two reads in a row agree
 (up to four reads). A type byte that never agrees gets a warning; a page that never agrees is marked
 with a red `?`.
+
+An XT14D needs none of that: every reply carries a CRC-8 over the opcode, the address and the data,
+so a single read that passes is conclusive and one that fails is known to have failed. There `?`
+means the chip answered but no read passed its CRC, and `-` means it did not answer at all - see
+[XT14D](#xt14d) for why the two are worth telling apart.
 
 # Timing conventions
 ^[Top](#top)
@@ -482,6 +490,133 @@ The VVDI's reset image, pages `0x00`-`0x0C` written with `WRITE`, `0x0D`-`0x0F` 
 `configure` and `reset` stop with "not supported" on an XT136 before anything is written, and before
 the XT27A EM-recovery bursts, whose effect on an XT136 is unknown.
 
+# XT14D
+^[Top](#top)
+
+Decoded from VVDI captures (`docs/xt14d.md` in the project folder), and verified there: all 278
+encrypted data frames of four reset captures decrypt to plaintext with a correct CRC-8. A third
+channel-A family - the same LFSR and the same `bitrev16` seed rule, but almost nothing else:
+
+| | XT27A | XT136 | XT14D |
+|---|---|---|---|
+| answer to `XHORSE` | `5AA5` | `5AA5` | **`4005` + CRC-8** |
+| signature query | `072F` -> `C8F6B638` | `E20E` -> `604A027E` | **none** |
+| seed query | `7372` (16 bit) | `E430` (16 bit) | **`E7` (8 bit)** |
+| seed reply | 16 bit | 16 bit | **24 bit: `[seed16][crc8 ^ 0x6F]`** |
+| seed | `bitrev16(reply) ^ 0xE12E` | `^ 0x8C07` | **`^ 0xA8A4`** |
+| page command | 16-bit `op,~op` | 16-bit `op,~op` | **`[4B][addr]` / `[5A][addr][d32][crc8]`** |
+| page address | 6 bits (0x00-0x3F) | 6 bits | **8 bits (0x00-0xFF)** |
+| banks | 2 | none | **none** |
+| integrity | none | none | **CRC-8 over the plaintext** |
+| end of session | `ctl 0x3F` | `ctl 0x3F` | **`F0`, sent in the clear** |
+
+On air:
+
+```
+  XHORSE (48b)            -> 24b  [4005][crc8]              family ACK
+  E7     (8b)             -> 24b  [seed16][crc8 ^ 0x6F]     keystream starts after this
+  --- XORed with the keystream, which advances by each frame's exact bit count ---
+  4B <addr>        (16b)  -> 40b  [data32][crc8]            READ
+  5A <addr><d32><crc8>    -> 16b  5AA5                      WRITE
+  F0     (8b)                                               end of session (NOT encrypted)
+```
+
+The CRC-8 is the one channel B already uses (poly `0x07`, init 0, no reflection, no final xor) but
+over the **plaintext**, and it covers the opcode and the address byte. A read reply therefore carries
+a check that binds it to the address that was asked for - far stronger than the "two reads agree"
+rule the other families need, so one CRC-valid read is conclusive.
+
+Because an XT14D frame is 16, 40 or 56 bits, the keystream engine works a bit at a time; for the
+other two families, whose frames are always 16 or 32, it produces exactly what the old 16-bit-at-a-
+time version did.
+
+Power-up, in every capture: field off 229 ms, on, `XHORSE` 120.2 ms later; the ack answers 194 T0
+later, `E7` goes out 161 T0 after it, the seed reply comes 194 T0 after that, and the first encrypted
+command 162 T0 after that. Between commands the VVDI paces itself at a flat ~20.7 ms, reads and
+writes alike - a write's EEPROM cycle is absorbed by it, since the `5AA5` comes back after the usual
+194 T0.
+
+**`E7` is not self-identifying.** On the XT57B/XT37B drill channel `E7` is an ordinary raw READ
+opcode. So an 8-bit `E7` only means "seed query" once the tag has answered `XHORSE` with `4005`, and
+both the firmware and the trace decoder gate on that.
+
+## What is supported, and what the address sweep is for
+
+`info`, `read`, `write` and `dump` work on an XT14D. `configure` and `reset` refuse it and touch
+nothing - they refuse *before* the EM-recovery bursts, whose effect on an XT14D is unknown, which
+is why `xh_open_any` probes for this family at all.
+
+`dump` reads pages `0x00`-`0x4F` in one session, which is the whole chip, and annotates each page
+with what is known to live there. It deliberately stops at `0x4F`: reading further would add 176
+values that are either a duplicate of a page already shown or a fiction.
+
+### The measured map (hardware, 2026-11-26)
+
+The sweep has now been run on a real XT14D, and the answer is:
+
+| Range | Slots | Backed? |
+|---|---|---|
+| `0x00`-`0x4F` | 80 | yes |
+| `0x50`-`0x7F` | 48 | **no** - reads `0000`, ACKs writes, never retains |
+| `0x80`-`0xFF` | - | alias of `0x00`-`0x7F`; bit 7 is ignored on read **and** write |
+
+So the chip is 80 pages x 16 bits = **160 bytes**, and a `dump` should cover `0x00`-`0x4F`.
+
+Two things that were not obvious beforehand:
+
+* **The dead region is invisible to a read.** Pages `0x50`-`0x7F` answer every read with a
+  CRC-valid `00000000`, so the three-way read classification below cannot see them - they look
+  exactly like real zeroed storage. Only a write tells them apart: the chip ACKs with `5AA5` and
+  then still reads back `0000`. The map above came from write probes at `0x50`, `0x51`, `0x58`,
+  `0x60`, `0x70`, `0x7E`, `0x7F`, with `0x19` as a positive control in the same sessions.
+* **Writes alias too.** Writing to `0x99` modifies `0x19`. `-p` above 127 is accepted and silently
+  hits a different page than the one asked for.
+
+Also settled: there is no write protection of any kind - no unlock, no password, no auth past
+`XHORSE`.
+
+Still not established by hardware: that `0x4F` is the last real page (it holds key material and was
+deliberately not written to - it is inferred from the reset writing `0x4D`-`0x4F`), and whether the
+fixed non-zero pages in `0x1A`-`0x3B` are writable storage or hardwired constants.
+
+### What the sweep reports
+
+`lf xhorse read` reports, per page,
+
+* a value, when a read passed its CRC-8,
+* `?` when the chip answered but no read passed,
+* `-` when the chip did not answer at all.
+
+**A page that does not answer ends the session.** The keystream advances per frame, and a frame the
+chip never sent leaves it unclear whether the chip advanced its own; in practice it does not, so
+every later command decrypts to nonsense on the chip and it answers nothing either - one dead
+address followed by 63 reads that only look dead. So a page that fails closes the session and the
+next page is read in a fresh one. `lf_xhorse_io_t.resync` bounds how many times one firmware call
+may do that (the client asks for 8); when the budget runs out the read stops early and reports how
+far it got, and the client issues another call from there until the range is covered.
+
+That behaviour is modelled in `tools/fw_harness/`, which runs the real `armsrc/xhorse.c` against a
+simulated XT14D whose address space is deliberately part real, part aliasing and part dead.
+
+The values a VVDI reset writes, for reference (`docs/xt14d.md` SS5.3) - every page is 16 bits in a
+32-bit field:
+
+| Page | Value | Meaning |
+|---|---|---|
+| `0x00`-`0x19` | `0000` | bulk-zeroed, except those below |
+| `0x11` / `0x13` | `0003` / `5C03` | fixed |
+| `0x14` | random | 16 fresh bits per reset |
+| `0x3C` | `4600` | probably the emulated type (`0x46` = ID46), unconfirmed |
+| `0x3D` | `054D` | read first and written straight back |
+| `0x44`-`0x46` | random | a fresh 48-bit value per reset - very likely the emulated tag's key |
+| `0x47`-`0x49` | = `0x44`-`0x46` | an exact duplicate |
+| `0x4D`-`0x4F` | derived | the same key's low 32 bits, reordered, with `00`/`80` filler |
+| `0x40`-`0x43` | `AAAA 0000 0000 AAAA` | written last; looks like a commit marker |
+
+No write protection is visible anywhere in the captures: no unlock, no password, no authentication
+before the first write. The tag never challenges the reader - it hands out a counter-derived seed
+and accepts whatever follows.
+
 # Config words (ctl 0x30+n)
 ^[Top](#top)
 
@@ -616,6 +751,15 @@ now prints in full.
   two values mean (docs/xt136.md SS5b).
 * XT136: what pages `0x08`-`0x0C` hold, what word 0's low nibble selects, whether pages
   above `0x0F` exist, and whether the XT136 needs the XT27A's EM recovery when set to an EM type.
+* XT14D: *(the address map is now measured - see above. 80 real pages at `0x00`-`0x4F`, `0x50`-`0x7F`
+  dead, `0x80`-`0xFF` aliasing.)* What remains open: whether `0x1A`-`0x3B`'s fixed non-zero values
+  are writable storage or hardwired constants, and whether `0x4F` really is the last real page.
+  Also open: whether a page the chip ignores really leaves the keystream out of step (the firmware
+  assumes so and reopens the session), what the `0x6F` offset on the seed reply's CRC is for,
+  whether `0x3C`'s high byte really is the emulated type, where the emulated UID lives (`0x14` is only 16 random
+  bits and `0x00`-`0x10` come back zero), and why `0x4D`-`0x4F` hold the key's low 32 bits in that
+  particular order. No `configure`/`reset` recipe exists until a post-reset read capture says what
+  the chip becomes.
 * Where the top nibble of the 7935 config word 1 (`F370CA18` / `0370CA18`) comes from. It is freely
   writable either way (measured 2026-11-10) and neither value affected a 7936 chip's emulation, so
   it is not a lock or a checksum over the rest of the word; whether it matters to a 7935-configured

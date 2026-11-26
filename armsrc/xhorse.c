@@ -249,6 +249,40 @@ static char xh_id8a_probe_custom[XHORSE_ID8A_SYMS + 1];
 #define XH136_TRIES          3        // per timing (VVDI's, then the XT27A's short one)
 
 //-----------------------------------------------------------------------------
+// XT14D (docs/xt14d.md) - the third channel-A family.
+//
+// Same 16-bit Fibonacci LFSR and the same seed = bitrev16(reply) ^ const rule as the XT27A and
+// XT136, but everything around it differs:
+//
+//   XHORSE (48b)  -> 24b  [4005][crc8]                 family ACK; the other two answer 5AA5
+//   E7     (8b)   -> 24b  [seed16][crc8 ^ 0x6F]        seed query; keystream starts after it
+//   --- from here XORed with the keystream, which advances by each frame's exact bit count ---
+//   4B <addr>        (16b) -> 40b [data32][crc8]       READ page
+//   5A <addr> <d32> <crc8> (56b) -> 16b 5AA5           WRITE page
+//   F0     (8b)                                        end of session, sent in the CLEAR
+//
+// The CRC-8 is the same one channel B uses (xh_crc8: poly 0x07, init 0) but over the PLAINTEXT,
+// and it covers the opcode and address byte - so a read reply's CRC binds it to the address that
+// was asked for, which is a far better check than two agreeing reads.
+#define XH14D_SEED           0xA8A4   // seed = bitrev16(E7 reply) ^ this
+#define XH14D_ACK            0x4005   // answer to XHORSE, followed by its CRC-8
+#define XH14D_Q_SEED         0xE7     // 8-bit seed query (the XT27A's 7372 / the XT136's E430)
+#define XH14D_END            0xF0     // 8-bit plaintext session end
+#define XH14D_NONCE_XOR      0x6F     // the seed reply's CRC-8 carries this constant offset
+#define XH14D_OP_READ        0x4B
+#define XH14D_OP_WRITE       0x5A
+#define XH14D_WR_ACK         0x5AA5   // the 16-bit write acknowledgement, after decryption
+// Power-up, measured in every reset capture: field off 229 ms, on, XHORSE 120.2 ms later.
+#define XH14D_T_OFF_US       229000
+#define XH14D_T_ON_US        120200
+#define XH14D_T_ACK_Q_T0     161      // XHORSE ACK -> E7
+#define XH14D_T_FIRST_T0     162      // seed reply -> first encrypted command
+// Between commands the VVDI paces itself at a flat ~20.7 ms, reads and writes alike - the write's
+// EEPROM cycle is absorbed by it, since the 5AA5 ack comes back after the usual 194 T0.
+#define XH14D_T_CMD_US        20730
+#define XH14D_TRIES          3        // per timing (the VVDI's, then the short XT27A one)
+
+//-----------------------------------------------------------------------------
 // Keystream engine (incremental; frames are always 16/32 bits so pos stays a
 // multiple of 16 and no frame straddles the seed boundary).
 //-----------------------------------------------------------------------------
@@ -266,6 +300,21 @@ static inline uint8_t xh_parity16(uint16_t x) {
     return x & 1;
 }
 
+// CRC-8: poly 0x07, init 0, no reflection, no final xor.  Used by both channels: on channel B over
+// the on-air bytes including the reader command that provoked the reply (docs/xt57-auth.md SS7.1),
+// and on an XT14D's channel A over the plaintext of a page frame, opcode and address included
+// (docs/xt14d.md SS3).
+static uint8_t xh_crc8(const uint8_t *d, size_t n) {
+    uint8_t c = 0;
+    for (size_t i = 0; i < n; i++) {
+        c ^= d[i];
+        for (int b = 0; b < 8; b++) {
+            c = (c & 0x80) ? (uint8_t)((c << 1) ^ 0x07) : (uint8_t)(c << 1);
+        }
+    }
+    return c;
+}
+
 static uint16_t xh_rev16(uint16_t x) {
     uint16_t r = 0;
     for (int i = 0; i < 16; i++) {
@@ -277,32 +326,38 @@ static uint16_t xh_rev16(uint16_t x) {
 
 static void xh_ks_init(xh_ks_t *k, uint16_t reply, uint16_t seed_const) {
     k->seed = xh_rev16(reply) ^ seed_const;
-    k->win = 0;
+    k->win = k->seed;        // the first 16 keystream bits ARE the seed; the LFSR clocks from it
     k->pos = 0;
 }
 
-// Next 16 keystream bits, MSB-first.  The first call returns the seed itself.
-static uint16_t xh_ks_next16(xh_ks_t *k) {
-    uint16_t out;
-    if (k->pos == 0) {
-        out = k->seed;
-        k->win = k->seed;
-    } else {
-        out = 0;
-        for (int i = 0; i < 16; i++) {
-            uint16_t nb = xh_parity16(k->win & 0xA011);
-            out = (uint16_t)((out << 1) | nb);
-            k->win = (uint16_t)((k->win << 1) | nb);
+// Next n keystream bits (n <= 64), MSB-first.  The first 16 bits of a session are the seed itself
+// and the LFSR clocks only after them.
+//
+// This works a bit at a time because an XT14D frame is 16, 40 or 56 bits: the XT27A and XT136 only
+// ever consume 16 or 32, so `pos` used to be guaranteed a multiple of 16, and it no longer is.
+// For those two families the output is bit-for-bit what the old 16-bit-at-a-time version produced.
+static uint64_t xh_ks_nextn(xh_ks_t *k, int n) {
+    uint64_t out = 0;
+    for (int i = 0; i < n; i++) {
+        uint8_t b;
+        if (k->pos < 16) {
+            b = (uint8_t)((k->seed >> (15 - k->pos)) & 1);
+        } else {
+            b = xh_parity16(k->win & 0xA011);
+            k->win = (uint16_t)((k->win << 1) | b);
         }
+        out = (out << 1) | b;
+        k->pos++;
     }
-    k->pos += 16;
     return out;
 }
 
+static uint16_t xh_ks_next16(xh_ks_t *k) {
+    return (uint16_t)xh_ks_nextn(k, 16);
+}
+
 static uint32_t xh_ks_next32(xh_ks_t *k) {
-    uint32_t hi = xh_ks_next16(k);
-    uint32_t lo = xh_ks_next16(k);
-    return (hi << 16) | lo;
+    return (uint32_t)xh_ks_nextn(k, 32);
 }
 
 //-----------------------------------------------------------------------------
@@ -315,8 +370,18 @@ typedef struct {
     bool    em_mode;    // freed from EM emulation this run: later sessions reopen with the EM off/settle timing
     uint8_t probe;       // xhorse_probe_t: which ID8A probe word timing 3 may send (0 = none)
     uint8_t family;      // xhorse_family_t of the open session
-    uint16_t seed_reply; // the tag's reply to 7372 / E430, which seeds the keystream
+    uint16_t seed_reply; // the tag's reply to 7372 / E430 / E7, which seeds the keystream
+    bool    t14_first;   // XT14D: the next command is the first of the session (162 T0, not 20.7 ms)
 } xh_sess_t;
+
+// Big-endian value of the first nbits (a multiple of 8, up to 64) of a received frame.
+static uint64_t xh_bits_to_u64(const uint8_t *rx, int nbits) {
+    uint64_t v = 0;
+    for (int i = 0; i < nbits / 8; i++) {
+        v = (v << 8) | rx[i];
+    }
+    return v;
+}
 
 static uint32_t xh_bits_to_u32(const uint8_t *rx, int nbits) {
     uint32_t v = 0;
@@ -606,6 +671,208 @@ static int xh_handshake_xt136(xh_sess_t *s) {
     return PM3_SUCCESS;
 }
 
+//-----------------------------------------------------------------------------
+// XT14D channel A (docs/xt14d.md)
+//-----------------------------------------------------------------------------
+
+// Space the next reader frame.  The first command of a session follows the seed reply by 162 T0;
+// after that the VVDI paces itself at a flat ~20.7 ms, which xh_delay_us has to do because
+// hitag_reader_transfer's t_wait spins a 16-bit counter that would wrap at that length.
+// Returns the t_wait to hand the transfer: the short gap, or 0 when we have already waited.
+static int xh14d_pace(xh_sess_t *s) {
+    if (s->t14_first) {
+        s->t14_first = false;
+        return XH14D_T_FIRST_T0;
+    }
+    xh_delay_us(XH14D_T_CMD_US);
+    return 0;
+}
+
+// Handshake: XHORSE -> 4005+crc, E7 -> seed+crc.  Both CRCs are required.  That is this family's
+// equivalent of the XT27A's 4R check: a chip broadcasting an emulation can be demodulated as a
+// "reply", and accepting one would seed the cipher with noise and make every later page garbage.
+static int xh_handshake_xt14d(xh_sess_t *s) {
+    static const uint8_t magic[6] = { 'X', 'H', 'O', 'R', 'S', 'E' };
+    static const uint8_t qseed[1] = { XH14D_Q_SEED };
+
+    uint8_t rx[32];
+    size_t rxlen;
+
+    // The XT27A and XT136 answer XHORSE with a bare 16-bit 5AA5 and this family with a 16-bit word
+    // plus a CRC-8 over it, so this reply alone says which family is on the antenna.
+    rxlen = xh_xfer_clear(s, magic, 48, rx, sizeof(rx), 0);
+    if (rxlen < 24) {
+        if (g_dbglevel >= DBG_DEBUG) {
+            Dbprintf("xhorse: no XT14D XHORSE ack (rxlen=%u)", (unsigned)rxlen);
+        }
+        return PM3_EFAILED;
+    }
+    uint16_t ack = (uint16_t)((rx[0] << 8) | rx[1]);
+    if ((ack != XH14D_ACK) || (xh_crc8(rx, 2) != rx[2])) {
+        if (g_dbglevel >= DBG_DEBUG) {
+            Dbprintf("xhorse: XHORSE ack %04x crc %02x - not an XT14D", ack, rx[2]);
+        }
+        return PM3_EFAILED;
+    }
+
+    // E7 -> [seed16][crc8 ^ 0x6F].  Only the top 16 bits feed the cipher; the trailing byte is the
+    // same CRC-8 with a constant offset that is not yet explained (docs/xt14d.md SS3).
+    rxlen = xh_xfer_clear(s, qseed, 8, rx, sizeof(rx), XH14D_T_ACK_Q_T0);
+    if (rxlen < 24) {
+        if (g_dbglevel >= DBG_DEBUG) {
+            Dbprintf("xhorse: no XT14D seed reply (rxlen=%u)", (unsigned)rxlen);
+        }
+        return PM3_EFAILED;
+    }
+    uint16_t reply = (uint16_t)((rx[0] << 8) | rx[1]);
+    if ((uint8_t)(xh_crc8(rx, 2) ^ XH14D_NONCE_XOR) != rx[2]) {
+        if (g_dbglevel >= DBG_DEBUG) {
+            Dbprintf("xhorse: XT14D seed reply %04x crc %02x bad - misread, retrying", reply, rx[2]);
+        }
+        return PM3_EFAILED;
+    }
+
+    s->seed_reply = reply;
+    if (g_dbglevel >= DBG_EXTENDED) {
+        Dbprintf("xhorse: E7 reply=%04x  seed=%04x", reply, xh_rev16(reply) ^ XH14D_SEED);
+    }
+    xh_ks_init(&s->ks, reply, XH14D_SEED);
+    s->cur_bank = -1;          // an XT14D has no banks; nothing ever sel's on one
+    s->family = XHORSE_FAM_XT14D;
+    s->t14_first = true;
+    return PM3_SUCCESS;
+}
+
+// End an XT14D session: an 8-bit F0, sent in the clear - it is outside the keystream, which is why
+// the keystream is not advanced for it.  The XT27A/XT136 equivalent is xh_ctl(s, XH_PG_PAD).
+static void xh14d_end(xh_sess_t *s) {
+    static const uint8_t fin[1] = { XH14D_END };
+    // xh_send_clear has no t_wait, so the short gap xh14d_pace hands back is spent here instead.
+    // It only comes up when the session ends without a command, which is what an identify does.
+    int t0 = xh14d_pace(s);
+    if (t0 > 0) {
+        xh_delay_us((uint32_t)t0 * 8);
+    }
+    xh_send_clear(fin, 8, s->led);
+}
+
+// Close whichever session is open, the way that family does it.
+static void xh_session_end(xh_sess_t *s) {
+    if (s->family == XHORSE_FAM_XT14D) {
+        xh14d_end(s);
+    } else {
+        xh_ctl(s, XH_PG_PAD);
+    }
+}
+
+// READ one page: 16-bit [4B][addr], answered with 40 bits of [data32][crc8].
+//
+// `answered` reports whether the chip said anything at all, which is a different finding from a
+// bad CRC when sweeping for which addresses exist.  The keystream is advanced for the reply either
+// way, because the chip advances its own for every frame it sends - but if it sent nothing we
+// cannot know whether it advanced, so a silent page may leave the two out of step and the caller
+// is told so it can warn.
+static int xh14d_read(xh_sess_t *s, uint8_t page, uint32_t *val, bool *answered) {
+    const uint16_t pt = (uint16_t)((XH14D_OP_READ << 8) | page);
+    const uint16_t ct = pt ^ xh_ks_next16(&s->ks);
+    uint8_t tx[2] = { (uint8_t)(ct >> 8), (uint8_t)ct };
+
+    uint8_t rx[32];
+    size_t rxlen = 0;
+    memset(rx, 0, sizeof(rx));
+    int t_wait = xh14d_pace(s);
+    hitag_reader_transfer(tx, 16, rx, sizeof(rx), &rxlen, t_wait, s->led, XH_MOD, XH_SOF_BITS, XH_SEND_SOF);
+
+    const uint64_t plain = xh_bits_to_u64(rx, 40) ^ xh_ks_nextn(&s->ks, 40);
+    const uint32_t data = (uint32_t)(plain >> 8);
+    const uint8_t crc = (uint8_t)plain;
+
+    if (val) {
+        *val = data;
+    }
+    if (answered) {
+        *answered = (rxlen >= 40);
+    }
+    if (rxlen < 40) {
+        return PM3_EFAILED;
+    }
+    // The CRC covers the opcode and the address, neither of which comes back on the wire, so it
+    // also proves the reply belongs to the page that was asked for.
+    const uint8_t over[6] = {
+        XH14D_OP_READ, page,
+        (uint8_t)(data >> 24), (uint8_t)(data >> 16), (uint8_t)(data >> 8), (uint8_t)data
+    };
+    return (xh_crc8(over, sizeof(over)) == crc) ? PM3_SUCCESS : PM3_EFAILED;
+}
+
+// READ a page until one read comes back with a valid CRC.  Unlike the XT27A's "two reads agree"
+// this is a real check on a single read, so one good answer is enough.
+// Returns true on a CRC-valid read; *answered is set if the chip ever replied at all.
+static bool xh14d_read_checked(xh_sess_t *s, uint8_t page, uint32_t *val, bool *answered) {
+    bool ever = false;
+    for (int i = 0; i < XH_VERIFY_READS; i++) {
+        bool got = false;
+        int res = xh14d_read(s, page, val, &got);
+        ever |= got;
+        if (res == PM3_SUCCESS) {
+            if (answered) {
+                *answered = true;
+            }
+            return true;
+        }
+    }
+    if (answered) {
+        *answered = ever;
+    }
+    return false;
+}
+
+// WRITE one page: 56-bit [5A][addr][data32][crc8], answered with a 16-bit 5AA5.
+// The chip acknowledges straight away; its EEPROM cycle is covered by the pacing before the next
+// command, which is why there is no separate program wait here.
+static int xh14d_write(xh_sess_t *s, uint8_t page, uint32_t data, bool verify) {
+    uint8_t fr[7] = {
+        XH14D_OP_WRITE, page,
+        (uint8_t)(data >> 24), (uint8_t)(data >> 16), (uint8_t)(data >> 8), (uint8_t)data, 0
+    };
+    fr[6] = xh_crc8(fr, 6);
+
+    uint64_t pt = 0;
+    for (int i = 0; i < 7; i++) {
+        pt = (pt << 8) | fr[i];
+    }
+    const uint64_t ct = pt ^ xh_ks_nextn(&s->ks, 56);
+    uint8_t tx[7];
+    for (int i = 0; i < 7; i++) {
+        tx[i] = (uint8_t)(ct >> (8 * (6 - i)));
+    }
+
+    uint8_t rx[32];
+    size_t rxlen = 0;
+    memset(rx, 0, sizeof(rx));
+    int t_wait = xh14d_pace(s);
+    hitag_reader_transfer(tx, 56, rx, sizeof(rx), &rxlen, t_wait, s->led, XH_MOD, XH_SOF_BITS, XH_SEND_SOF);
+
+    const uint16_t ack = (uint16_t)(xh_bits_to_u32(rx, 16) ^ xh_ks_next16(&s->ks));
+    if ((rxlen < 16) || (ack != XH14D_WR_ACK)) {
+        if (g_dbglevel >= DBG_ERROR) {
+            Dbprintf("xhorse: XT14D write 0x%02X not acked (rxlen=%u, %04x)", page, (unsigned)rxlen, ack);
+        }
+        return PM3_EFAILED;
+    }
+    if (verify == false) {
+        return PM3_SUCCESS;
+    }
+    uint32_t rb = 0;
+    if (xh14d_read_checked(s, page, &rb, NULL) && (rb == data)) {
+        return PM3_SUCCESS;
+    }
+    if (g_dbglevel >= DBG_ERROR) {
+        Dbprintf("xhorse: XT14D verify failed, page 0x%02X (read %08x)", page, rb);
+    }
+    return PM3_EFAILED;
+}
+
 static void xh_setup(xh_sess_t *s, bool ledcontrol) {
     memset(s, 0, sizeof(*s));
     s->led = ledcontrol;
@@ -737,6 +1004,28 @@ static int xh_open_session_xt136(xh_sess_t *s) {
         if (xh_handshake_xt136(s) == PM3_SUCCESS) {
             if (g_dbglevel >= DBG_EXTENDED) {
                 Dbprintf("xhorse: XT136 session open on attempt %d", attempt);
+            }
+            return PM3_SUCCESS;
+        }
+    }
+    return PM3_EFAILED;
+}
+
+// Open an XT14D session: alternate the VVDI's power-up (229 ms off, XHORSE 120.2 ms on) and the
+// short XT27A one.  Only the VVDI's is confirmed on air.
+static int xh_open_session_xt14d(xh_sess_t *s) {
+    for (int attempt = 0; attempt < 2 * XH14D_TRIES; attempt++) {
+        if ((attempt % 2) == 0) {
+            Gpio_SSC_DOUT_High();
+            xh_delay_us(XH14D_T_OFF_US);
+            Gpio_SSC_DOUT_Low();
+            xh_delay_us(XH14D_T_ON_US);
+        } else {
+            xh_field_reset();
+        }
+        if (xh_handshake_xt14d(s) == PM3_SUCCESS) {
+            if (g_dbglevel >= DBG_EXTENDED) {
+                Dbprintf("xhorse: XT14D session open on attempt %d", attempt);
             }
             return PM3_SUCCESS;
         }
@@ -977,6 +1266,14 @@ static int xh_open_any(xh_sess_t *s) {
     }
     if (xh_open_session_xt136(s) == PM3_SUCCESS) {
         xh_ctl(s, XH_PG_PAD);
+        return PM3_ENOTIMPL;
+    }
+    // An XT14D answers XHORSE even while it is emulating a 4D, so it is found here rather than
+    // mistaken for a chip stuck in an EM emulation.  That matters: the next step is the EM
+    // "erase" burst, and what that does to an XT14D is unknown.  It has no write recipes either,
+    // so it gets the same PM3_ENOTIMPL as an XT136.
+    if (xh_open_session_xt14d(s) == PM3_SUCCESS) {
+        xh14d_end(s);
         return PM3_ENOTIMPL;
     }
     if (g_dbglevel >= DBG_INFO) {
@@ -1285,18 +1582,8 @@ static int xh_recipe(xh_sess_t *s, const lf_xhorse_data_t *p) {
 //   reader -> XMICRO (48b)          tag -> 0x5AA5 ACK
 //   reader -> 0b0011 (4b identify)  tag -> ASCII family string, e.g. "XT37"
 // On success fills type[] with the ASCII the chip reported and returns PM3_SUCCESS.
-// CRC-8 of the channel-B frame format: poly 0x07, init 0, no reflection, no final xor, over the
-// on-air bytes including the reader command that provoked the reply (docs/xt57-auth.md SS7.1).
-static uint8_t xh_crc8(const uint8_t *d, size_t n) {
-    uint8_t c = 0;
-    for (size_t i = 0; i < n; i++) {
-        c ^= d[i];
-        for (int b = 0; b < 8; b++) {
-            c = (c & 0x80) ? (uint8_t)((c << 1) ^ 0x07) : (uint8_t)(c << 1);
-        }
-    }
-    return c;
-}
+// xh_crc8 is defined with the other small helpers above: the XT14D's channel-A frames use the
+// same CRC-8, so it is no longer channel-B-only.
 
 // The identify reply is four family bytes plus that CRC, taken over the 0011 command byte and the
 // family (docs/xt57-auth.md SS4): "XT57" -> 0x58, which is why it was long read as the string
@@ -1374,6 +1661,102 @@ static int xh_xmicro_identify_off(xh_sess_t *s, uint32_t off_us,
 
 // Read pages 0..pages-1 of the current bank into out->image, each until two reads agree
 // (xh_read_agreed), and mark the pages that did in out->page_ok.
+// `info` for an XT14D: pages 0x00..0x0F of its flat space, plus the two the VVDI's reset treats
+// as configuration - 0x3C, which it sets to 0x00004600, and 0x3D, which it reads and writes
+// straight back unchanged (docs/xt14d.md SS5.3).  They go in cfgword[] rather than image[]
+// because image[] is indexed by page number and reaching 0x3D through it would mean reading
+// everything below it too.  Which pages are real is still unknown, so this reads no more than it
+// can say something about; `lf xhorse read` sweeps the rest.
+#define XH14D_PG_TYPE  0x3C
+#define XH14D_PG_CFG   0x3D
+
+static void xh14d_read_info(xh_sess_t *s, lf_xhorse_info_t *out) {
+    out->image_pages = XHORSE_XT136_PAGES;          // 16, the same low block the XT136 shows
+    for (uint8_t pg = 0; pg < XHORSE_XT136_PAGES; pg++) {
+        uint32_t w = 0;
+        if (xh14d_read_checked(s, pg, &w, NULL)) {
+            out->page_ok[pg / 8] |= (uint8_t)(1 << (pg % 8));
+        }
+        out->image[pg * 4 + 0] = (uint8_t)(w >> 24);
+        out->image[pg * 4 + 1] = (uint8_t)(w >> 16);
+        out->image[pg * 4 + 2] = (uint8_t)(w >> 8);
+        out->image[pg * 4 + 3] = (uint8_t)(w);
+    }
+    uint32_t t = 0, c = 0;
+    bool tok = xh14d_read_checked(s, XH14D_PG_TYPE, &t, NULL);
+    bool cok = xh14d_read_checked(s, XH14D_PG_CFG, &c, NULL);
+    out->cfgword[0] = t;
+    out->cfgword[1] = c;
+    out->cfgword_ok = (uint8_t)((tok ? 1 : 0) | (cok ? 2 : 0));
+    // The emulated type is the LOW byte of 0x3D, in the same encoding as the XT27A's type byte
+    // (0x4D = ID4D, 0x64 = ID4E).  Confirmed by programming the chip as each in turn and reading
+    // it back: 0x3C stayed 4600 across both, so its high byte is not the type (docs/xt14d.md
+    // SS7.3).  0x3C's low byte is a mode flag instead: 08 = DST80 ("4D+"), 00 otherwise.
+    out->typebyte = (uint8_t)(c & 0xFF);
+    out->typebyte_ok = cok ? 1 : 0;
+}
+
+// How many times one XT14D dump may close the session and open a fresh one after a page that did
+// not answer.  Matches what the client allows `lf xhorse read` (XH_READ_RESYNC).
+#define XH14D_DUMP_RESYNC  8
+
+static bool xh14d_pg_ok(const lf_xhorse_info_t *out, uint8_t pg) {
+    return (out->page_ok[pg / 8] & (1 << (pg % 8))) != 0;
+}
+
+// `dump` for an XT14D: pages 0x00..0x4F, the whole of its real storage, in one session.
+//
+// That range is the whole chip.  The address bus is 7 bits, so 0x80..0xFF is an alias of
+// 0x00..0x7F, and 0x50..0x7F is not backed by anything - it answers every read with a CRC-valid
+// 00000000, which is why the dead region had to be found by writing to it rather than by reading
+// (docs/xt14d.md SS7).  Reading past 0x4F would therefore add 176 values that are either a
+// duplicate or a fiction, so it stops at 80.
+//
+// Pages 0x3C and 0x3D are inside the range, so the header's config words are taken from the image
+// rather than read again.
+//
+// A failed page resyncs for the same reason Xhorse_Read does: a page the chip ignores can leave
+// the two keystreams out of step, and everything after it then reads as dead.  All 80 answer on
+// the chip this was measured on, so this should never fire - it is here so that a chip which
+// differs reports which page differs instead of a run of false zeroes.
+static void xh14d_read_dump(xh_sess_t *s, lf_xhorse_info_t *out) {
+    out->image_pages = XHORSE_XT14D_REAL_PAGES;
+    uint8_t used = 0;
+    for (uint8_t pg = 0; pg < XHORSE_XT14D_REAL_PAGES; pg++) {
+        uint32_t w = 0;
+        bool crc_ok = xh14d_read_checked(s, pg, &w, NULL);
+        if (crc_ok) {
+            out->page_ok[pg / 8] |= (uint8_t)(1 << (pg % 8));
+        }
+        out->image[pg * 4 + 0] = (uint8_t)(w >> 24);
+        out->image[pg * 4 + 1] = (uint8_t)(w >> 16);
+        out->image[pg * 4 + 2] = (uint8_t)(w >> 8);
+        out->image[pg * 4 + 3] = (uint8_t)(w);
+
+        if (crc_ok || ((pg + 1) >= XHORSE_XT14D_REAL_PAGES) || (used >= XH14D_DUMP_RESYNC)) {
+            continue;
+        }
+        xh14d_end(s);
+        if (xh_open_session_xt14d(s) != PM3_SUCCESS) {
+            if (g_dbglevel >= DBG_ERROR) {
+                Dbprintf("xhorse: XT14D dump resync failed after page 0x%02X", pg);
+            }
+            break;      // the rest stay zero and unconfirmed, and the client marks them
+        }
+        used++;
+    }
+
+    const uint8_t *t = &out->image[XH14D_PG_TYPE * 4];
+    const uint8_t *c = &out->image[XH14D_PG_CFG * 4];
+    out->cfgword[0] = ((uint32_t)t[0] << 24) | ((uint32_t)t[1] << 16) | ((uint32_t)t[2] << 8) | t[3];
+    out->cfgword[1] = ((uint32_t)c[0] << 24) | ((uint32_t)c[1] << 16) | ((uint32_t)c[2] << 8) | c[3];
+    out->cfgword_ok = (uint8_t)((xh14d_pg_ok(out, XH14D_PG_TYPE) ? 1 : 0) |
+                                (xh14d_pg_ok(out, XH14D_PG_CFG) ? 2 : 0));
+    // The type is 0x3D's low byte, not 0x3C's high byte - see xh14d_read_info.
+    out->typebyte = (uint8_t)(out->cfgword[1] & 0xFF);
+    out->typebyte_ok = (uint8_t)((out->cfgword_ok & 2) ? 1 : 0);
+}
+
 static void xh_read_image(xh_sess_t *s, lf_xhorse_info_t *out, uint8_t pages) {
     out->image_pages = pages;
     for (uint8_t pg = 0; pg < pages; pg++) {
@@ -1618,6 +2001,12 @@ void Xhorse_Info(const lf_xhorse_rdopt_t *opt, bool ledcontrol) {
             out.seed_reply = s.seed_reply;
             xh_read_image(&s, &out, XHORSE_XT136_PAGES);     // flat page space, no sel
             xh_ctl(&s, XH_PG_PAD);
+        } else if (xh_open_session_xt14d(&s) == PM3_SUCCESS) {
+            out.found = 1;
+            out.family = XHORSE_FAM_XT14D;
+            out.seed_reply = s.seed_reply;
+            xh14d_read_info(&s, &out);
+            xh14d_end(&s);
         }
         hitag_cleanup(ledcontrol);
         reply_ng(CMD_LF_XHORSE_INFO, PM3_SUCCESS, (uint8_t *)&out, sizeof(out));
@@ -1655,9 +2044,10 @@ void Xhorse_Info(const lf_xhorse_rdopt_t *opt, bool ledcontrol) {
     reply_ng(CMD_LF_XHORSE_INFO, PM3_SUCCESS, (uint8_t *)&out, sizeof(out));
 }
 
-// Dumps one bank (0 = emulated image, 1 = config/identity) per call: both would not fit in one reply.
-// An XT136 has no banks: bank 0 returns its pages 0x00..0x0F, and a bank-1 request only reports the
-// family.
+// Dumps one XT27A bank (0 = emulated image, 1 = config/identity) per call: both would not fit in
+// one reply.  Neither of the other two families has banks, and both fit entirely in bank 0's
+// reply - an XT136 returns its pages 0x00..0x0F and an XT14D its 80 real pages 0x00..0x4F - so for
+// those a bank-1 request only reports the family, and the client does not make one.
 void Xhorse_Dump(uint8_t bank, const lf_xhorse_rdopt_t *opt, bool ledcontrol) {
     xh_sess_t s;
     lf_xhorse_info_t out;
@@ -1672,6 +2062,16 @@ void Xhorse_Dump(uint8_t bank, const lf_xhorse_rdopt_t *opt, bool ledcontrol) {
                 xh_read_image(&s, &out, XHORSE_XT136_PAGES);
             }
             xh_ctl(&s, XH_PG_PAD);
+        } else if (xh_open_session_xt14d(&s) == PM3_SUCCESS) {
+            out.found = 1;
+            out.family = XHORSE_FAM_XT14D;
+            out.seed_reply = s.seed_reply;
+            // No banks, and one reply holds all 80 real pages, so only bank 0 reads anything; a
+            // bank-1 request just names the family.  The client never asks for one.
+            if (bank == 0) {
+                xh14d_read_dump(&s, &out);
+            }
+            xh14d_end(&s);
         }
         hitag_cleanup(ledcontrol);
         reply_ng(CMD_LF_XHORSE_DUMP, PM3_SUCCESS, (uint8_t *)&out, sizeof(out));
@@ -1830,6 +2230,16 @@ static bool xh136_type_ok(const lf_xhorse_data_t *p) {
 static void xh_configure_run(const lf_xhorse_data_t *p, uint16_t cmd, bool ledcontrol) {
     xh_sess_t s;
     int open = xh_begin_any(&s, ledcontrol);
+    if ((open == PM3_ENOTIMPL) && (s.family == XHORSE_FAM_XT14D)) {
+        // An XT14D answered and xh_open_any has already closed its session.  There is no write
+        // recipe for one - what its pages mean is still being mapped - so say so and touch nothing.
+        if (g_dbglevel >= DBG_ERROR) {
+            Dbprintf("xhorse: an XT14D answered; no configure/reset recipe for this family");
+        }
+        hitag_cleanup(ledcontrol);
+        reply_ng(cmd, PM3_ENOTIMPL, NULL, 0);
+        return;
+    }
     if (open == PM3_ENOTIMPL) {
         // An XT136 answered, and xh_open_any has already closed its identify session with a ctl.
         // Refuse an unsupported type before opening a session, so nothing is disturbed.
@@ -1905,9 +2315,25 @@ void Xhorse_Reset(bool ledcontrol) {
 // Open a session for either primitive, trying the XT27A handshake then the XT136 one, and record
 // which family answered.  Neither primitive sends the EM-recovery burst or the ID8A probe: both
 // rewrite the chip, which a raw read or a single-page write must not do.
-static int xh_io_open(xh_sess_t *s, lf_xhorse_io_reply_t *out, bool ledcontrol) {
+static int xh_io_open(xh_sess_t *s, lf_xhorse_io_reply_t *out, uint8_t hint, bool ledcontrol) {
     xh_setup(s, ledcontrol);
-    if (xh_open_session(s) != PM3_SUCCESS && xh_open_session_xt136(s) != PM3_SUCCESS) {
+    // A caller that already knows the family says so, and is not made to pay for the probes that
+    // would have come first.  A wrong hint just means one wasted handshake.
+    bool opened = false;
+    switch (hint) {
+        case XHORSE_FAM_XT136:
+            opened = (xh_open_session_xt136(s) == PM3_SUCCESS);
+            break;
+        case XHORSE_FAM_XT14D:
+            opened = (xh_open_session_xt14d(s) == PM3_SUCCESS);
+            break;
+        default:
+            break;
+    }
+    if (opened == false &&
+            xh_open_session(s) != PM3_SUCCESS &&
+            xh_open_session_xt136(s) != PM3_SUCCESS &&
+            xh_open_session_xt14d(s) != PM3_SUCCESS) {
         return PM3_EFAILED;
     }
     out->found = 1;
@@ -1915,9 +2341,9 @@ static int xh_io_open(xh_sess_t *s, lf_xhorse_io_reply_t *out, bool ledcontrol) 
     return PM3_SUCCESS;
 }
 
-// Select a bank, except on an XT136: it has one flat page space and never sees a `sel`.
+// Select a bank, except on an XT136 or XT14D: both have one flat page space and never see a `sel`.
 static int xh_io_bank(xh_sess_t *s, uint8_t bank) {
-    if (s->family == XHORSE_FAM_XT136) {
+    if (s->family == XHORSE_FAM_XT136 || s->family == XHORSE_FAM_XT14D) {
         return PM3_SUCCESS;
     }
     return xh_bank(s, bank);
@@ -1927,6 +2353,7 @@ static void xh_io_store(lf_xhorse_io_reply_t *out, uint8_t i, uint32_t w, bool a
     if (agreed) {
         out->ok[i / 8] |= (uint8_t)(1 << (i % 8));
     }
+
     out->data[i * 4 + 0] = (uint8_t)(w >> 24);
     out->data[i * 4 + 1] = (uint8_t)(w >> 16);
     out->data[i * 4 + 2] = (uint8_t)(w >> 8);
@@ -1945,31 +2372,81 @@ void Xhorse_Read(const lf_xhorse_io_t *p, bool ledcontrol) {
     if (count == 0) {
         count = 1;
     }
-    if (count > 64) {
-        count = 64;
+    if (count > XHORSE_IO_MAXPAGES) {
+        count = XHORSE_IO_MAXPAGES;              // one reply carries this many pages
     }
-    if ((uint16_t)p->page + count > 64) {
-        count = (uint8_t)(64 - p->page);         // the address field is 6 bits; never wrap
-    }
-    out.count = count;
 
-    if (xh_io_open(&s, &out, ledcontrol) != PM3_SUCCESS) {
+    // The page limit is per family, and the family is only known once a session is open, so the
+    // range is clamped after the handshake rather than before it.
+    if (xh_io_open(&s, &out, p->family, ledcontrol) != PM3_SUCCESS) {
+        out.count = 0;
         hitag_cleanup(ledcontrol);
         reply_ng(CMD_LF_XHORSE_READ, PM3_SUCCESS, (uint8_t *)&out, sizeof(out));   // found == 0
         return;
     }
 
+    // An XT14D addresses a page with a whole byte; the other two use a 6-bit field, so 0x3F is
+    // their last page and a request past it reads nothing rather than wrapping.
+    const uint16_t npages = (s.family == XHORSE_FAM_XT14D) ? XHORSE_XT14D_PAGES : 64;
+    if (p->page >= npages) {
+        count = 0;
+    } else if ((uint16_t)p->page + count > npages) {
+        count = (uint8_t)(npages - p->page);
+    }
+    out.count = count;
+
     int res = PM3_SUCCESS;
-    if (xh_io_bank(&s, p->bank) != PM3_SUCCESS) {
+    if (count == 0) {
+        res = PM3_EINVARG;                       // page past the end of this family's address space
+    } else if (xh_io_bank(&s, p->bank) != PM3_SUCCESS) {
         res = PM3_EFAILED;                       // sel refused: no bank is selected, so don't read
+    } else if (s.family == XHORSE_FAM_XT14D) {
+        // A page the chip ignores is the thing this sweep is looking for, but it also ends the
+        // session's usefulness: the keystream advances per frame, and a frame the chip never sent
+        // leaves it unclear whether the chip advanced its own.  In practice it does not, so every
+        // later command decrypts to nonsense on the chip and it answers nothing at all - a whole
+        // run of "no storage here" that is really one dead address and 63 desynced reads.
+        //
+        // So a page that fails ends the session, and a fresh one is opened for the next page.
+        // `resync` bounds how many times that may happen in one call; when it runs out the read
+        // stops and reports how far it got, and the client continues from there.
+        uint8_t used = 0;
+        uint8_t done = 0;
+        for (uint8_t i = 0; i < count; i++) {
+            uint32_t w = 0;
+            bool answered = false;
+            bool crc_ok = xh14d_read_checked(&s, (uint8_t)(p->page + i), &w, &answered);
+            xh_io_store(&out, i, w, crc_ok);
+            if (answered) {
+                out.ans[i / 8] |= (uint8_t)(1 << (i % 8));
+            }
+            done = (uint8_t)(i + 1);
+            if (crc_ok || (done >= count)) {
+                continue;                        // trusted, or there is nothing after it
+            }
+            if (used >= p->resync) {
+                break;                           // budget spent: the caller re-issues from here
+            }
+            xh14d_end(&s);
+            if (xh_open_session_xt14d(&s) != PM3_SUCCESS) {
+                if (g_dbglevel >= DBG_ERROR) {
+                    Dbprintf("xhorse: XT14D resync failed after page 0x%02X", p->page + i);
+                }
+                break;
+            }
+            used++;
+        }
+        out.count = done;
+        out.resyncs = used;
     } else {
         for (uint8_t i = 0; i < count; i++) {
             uint32_t w = 0;
             bool agreed = xh_read_agreed(&s, (uint8_t)(p->page + i), &w);
             xh_io_store(&out, i, w, agreed);
+            out.ans[i / 8] |= (uint8_t)(1 << (i % 8));   // no per-read "answered" signal here
         }
     }
-    xh_ctl(&s, XH_PG_PAD);
+    xh_session_end(&s);
 
     hitag_cleanup(ledcontrol);
     reply_ng(CMD_LF_XHORSE_READ, res, (uint8_t *)&out, sizeof(out));
@@ -1985,9 +2462,67 @@ void Xhorse_Write(const lf_xhorse_io_t *p, bool ledcontrol) {
     out.bank = p->bank;
     out.page = p->page;
 
-    if (xh_io_open(&s, &out, ledcontrol) != PM3_SUCCESS) {
+    if (xh_io_open(&s, &out, p->family, ledcontrol) != PM3_SUCCESS) {
         hitag_cleanup(ledcontrol);
         reply_ng(CMD_LF_XHORSE_WRITE, PM3_SUCCESS, (uint8_t *)&out, sizeof(out));  // found == 0
+        return;
+    }
+
+    // An XT14D's address is a whole byte, so every page is reachable; the other two stop at 0x3F.
+    if ((s.family != XHORSE_FAM_XT14D) && (p->page > 0x3F) && (p->cfg == 0)) {
+        if (g_dbglevel >= DBG_ERROR) {
+            Dbprintf("xhorse: page 0x%02X is past 0x3F, the last page of a bank", p->page);
+        }
+        xh_session_end(&s);
+        hitag_cleanup(ledcontrol);
+        reply_ng(CMD_LF_XHORSE_WRITE, PM3_EINVARG, (uint8_t *)&out, sizeof(out));
+        return;
+    }
+
+    // An XT14D has no ctl config-word path: its words are ordinary pages written with 5A, so -c
+    // means nothing on one and is refused rather than silently writing somewhere else.
+    if ((s.family == XHORSE_FAM_XT14D) && p->cfg) {
+        if (g_dbglevel >= DBG_ERROR) {
+            Dbprintf("xhorse: an XT14D has no ctl config words; write the page directly");
+        }
+        xh14d_end(&s);
+        hitag_cleanup(ledcontrol);
+        reply_ng(CMD_LF_XHORSE_WRITE, PM3_EINVARG, (uint8_t *)&out, sizeof(out));
+        return;
+    }
+
+    // An XT14D is written in the session just opened, as the VVDI does: its reset reads page 0x3D,
+    // writes it straight back and carries on in the same session (docs/xt14d.md SS5.2).
+    if (s.family == XHORSE_FAM_XT14D) {
+        int wres = xh14d_write(&s, p->page, p->value, p->verify);
+        out.verified = (p->verify && (wres == PM3_SUCCESS)) ? 1 : 0;
+
+        // Read the page back in a session the write cannot have damaged.  A write the chip did not
+        // acknowledge may have left the keystream out of step, and a read-back taken in that
+        // session would say "no answer" about the session rather than about the address - which is
+        // exactly the distinction a write-then-read-back test is being used to make.
+        if (wres != PM3_SUCCESS) {
+            xh14d_end(&s);
+            if (xh_open_session_xt14d(&s) != PM3_SUCCESS) {
+                if (g_dbglevel >= DBG_ERROR) {
+                    Dbprintf("xhorse: no session to read page 0x%02X back in", p->page);
+                }
+                hitag_cleanup(ledcontrol);
+                reply_ng(CMD_LF_XHORSE_WRITE, wres, (uint8_t *)&out, sizeof(out));   // count == 0
+                return;
+            }
+        }
+        uint32_t rb = 0;
+        bool answered = false;
+        bool crc_ok = xh14d_read_checked(&s, p->page, &rb, &answered);
+        xh_io_store(&out, 0, rb, crc_ok);
+        if (answered) {
+            out.ans[0] |= 1;
+        }
+        out.count = 1;
+        xh14d_end(&s);
+        hitag_cleanup(ledcontrol);
+        reply_ng(CMD_LF_XHORSE_WRITE, wres, (uint8_t *)&out, sizeof(out));
         return;
     }
 
@@ -2030,9 +2565,10 @@ void Xhorse_Write(const lf_xhorse_io_t *p, bool ledcontrol) {
         uint32_t rb = 0;
         bool agreed = xh_read_agreed(&s, pg, &rb);
         xh_io_store(&out, 0, rb, agreed);
+        out.ans[0] |= 1;                     // no per-read "answered" signal on these families
         out.count = 1;
     }
-    xh_ctl(&s, XH_PG_PAD);
+    xh_session_end(&s);
 
     hitag_cleanup(ledcontrol);
     reply_ng(CMD_LF_XHORSE_WRITE, res, (uint8_t *)&out, sizeof(out));
