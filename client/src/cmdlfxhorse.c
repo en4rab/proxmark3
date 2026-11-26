@@ -42,7 +42,13 @@ static uint8_t xt57_crc8(const uint8_t *d, size_t n);
 // Channel-B helpers, defined with the xt57 code below; `info` uses them to read an XT37/XT57's
 // emulated type byte out of its config block (docs/xt37.md SS5o).
 static const char *xt_type_name(uint8_t t);
-static int xt_read_typeword(bool is37, uint32_t *word);
+// The channel-B header and block table, defined below with the block-reading code
+// (docs/xt37.md SS5r).  `full` reads every block and prints the table under the header, which is
+// what makes it `dump` rather than `info`.
+static int xt_print_bchip(const lf_xhorse_info_t *nfo, bool full);
+// `dump`'s entry point: identifies the chip itself, and returns PM3_ENODATA when nothing on channel
+// B answered, so the caller can fall through to its own not-found message.
+static int xt_dump_bchip(void);
 typedef struct xt57_ks_s xt57_ks_t_fwd;
 static int xt_steer(const struct xt57_ks_s *ks, int32_t from, int32_t *at, bool verbose);
 
@@ -335,6 +341,12 @@ static const char *xh_page_mark(const lf_xhorse_info_t *nfo, uint8_t pg) {
     return xh_page_ok(nfo, pg) ? "  " : " " _RED_("?");
 }
 
+// The same mark at the end of a line, where nothing follows it to keep aligned: a confirmed page
+// adds nothing rather than trailing blanks.
+static const char *xh_page_mark_eol(const lf_xhorse_info_t *nfo, uint8_t pg) {
+    return xh_page_ok(nfo, pg) ? "" : " " _RED_("?");
+}
+
 // `pages` is how many of image_pages were shown, so the count matches what was printed.
 static void xh_print_unconfirmed(const lf_xhorse_info_t *nfo, uint8_t pages) {
     int bad = 0;
@@ -376,31 +388,119 @@ static const char *xh136_page_label(uint8_t pg) {
 }
 
 // XT136: one flat page space, no chip ID or type page.
-static void xh136_print(const lf_xhorse_info_t *nfo, const char *title) {
+// "--- <title> ---...": the rule is padded so every family's banner comes out the same width,
+// whatever the name's length.  44 is what the longest of them ("Xhorse XT27A dump") already was.
+#define XH_TITLE_WIDTH 44
+
+static void xh_print_title(const char *title) {
+    char rule[XH_TITLE_WIDTH + 1];
+    int used = 4 + (int)strlen(title) + 1;          // "--- " + title + " "
+    int dashes = XH_TITLE_WIDTH - used;
+    if (dashes < 3) {
+        dashes = 3;
+    }
+    if (dashes > XH_TITLE_WIDTH) {
+        dashes = XH_TITLE_WIDTH;
+    }
+    memset(rule, '-', (size_t)dashes);
+    rule[dashes] = '\0';
+    PrintAndLogEx(INFO, "--- " _CYAN_("%s") " %s", title, rule);
+}
+
+// An XT136 has no banks, no chip-ID pages and no 0x3C type byte: its config words are pages 0x0D
+// and 0x0E of the one flat space, and whether 0x0E's high byte really is the type byte is still a
+// guess (docs/xt136.md SS5).  So its header says less than an XT27A's, and says which parts are
+// uncertain.  `pages` => print the page table too, which is what makes this `dump` rather than `info`.
+static void xh136_print(const lf_xhorse_info_t *nfo, const char *title, bool with_pages) {
+    uint8_t npg = (nfo->image_pages < XHORSE_XT136_PAGES) ? nfo->image_pages : XHORSE_XT136_PAGES;
     PrintAndLogEx(NORMAL, "");
-    PrintAndLogEx(INFO, "--- " _CYAN_("%s") " ---------------------------", title);
-    PrintAndLogEx(INFO, "Family.... " _GREEN_("XT136") " (channel A, E20E signature 604A027E)");
-    // The E430 reply wanders over 9BF2..9BF7 across sessions and chips - a timing counter, not a
-    // per-chip value (docs/xt136.md SS2).  Shown because it is what seeds the cipher.
-    PrintAndLogEx(INFO, "Seed...... E430 reply 0x%04X", nfo->seed_reply);
+    xh_print_title(title);
+    PrintAndLogEx(INFO, "Chip type...... " _YELLOW_("XT136"));
+    PrintAndLogEx(INFO, "Chip ID........ (none: an XT136 has no chip-ID pages)");
+    if (npg > 0) {
+        const uint8_t *d = nfo->image;
+        PrintAndLogEx(INFO, "Emulated UID... " _GREEN_("%02X%02X%02X%02X") "%s",
+                      d[0], d[1], d[2], d[3], xh_page_mark_eol(nfo, 0));
+    }
+    if (npg > 0x0E) {
+        // Not an address but a caveat: which byte of the config words is the type byte, if any of
+        // them is, has never been confirmed on an XT136 (docs/xt136.md SS5).
+        PrintAndLogEx(INFO, "Emulated type.. " _YELLOW_("0x%02X") " (%s)  (if that is the type byte)",
+                      nfo->image[0x0E * 4], typebyte_name(nfo->image[0x0E * 4]));
+        PrintAndLogEx(INFO, "Config word.... %s %s",
+                      sprint_hex_inrow(&nfo->image[0x0D * 4], 4),
+                      sprint_hex_inrow(&nfo->image[0x0E * 4], 4));
+    }
+    if (with_pages == false) {
+        xh_print_unconfirmed(nfo, npg);
+        PrintAndLogEx(NORMAL, "");
+        return;
+    }
+    PrintAndLogEx(INFO, "");
     PrintAndLogEx(INFO, "  page | data");
     PrintAndLogEx(INFO, "-------+-----------");
     // Firmware may still return pages above 0x0F; they only alias 0x00..0x0F, so never show them.
-    uint8_t pages = (nfo->image_pages < XHORSE_XT136_PAGES) ? nfo->image_pages : XHORSE_XT136_PAGES;
-    for (uint8_t pg = 0; pg < pages; pg++) {
+    for (uint8_t pg = 0; pg < npg; pg++) {
         PrintAndLogEx(INFO, "  0x%02X | %s%s %s", pg, sprint_hex_inrow(&nfo->image[pg * 4], 4), xh_page_mark(nfo, pg), xh136_page_label(pg));
     }
-    xh_print_unconfirmed(nfo, pages);
-    if (pages >= 0x0F) {
-        PrintAndLogEx(INFO, "Config word 1 high byte " _YELLOW_("0x%02X") " (%s, if it is the type byte)", nfo->image[0x0E * 4], typebyte_name(nfo->image[0x0E * 4]));
-    }
+    xh_print_unconfirmed(nfo, npg);
     PrintAndLogEx(NORMAL, "");
 }
 
+// The four ASCII family bytes of a channel-B identify reply, as a printable string.  `is37` says
+// whether this is the XT37 family, which is what decides the keystream (docs/xt37.md SS5a).
+static void xh_bchip_type_str(const lf_xhorse_info_t *nfo, char *out, size_t outlen, bool *is37) {
+    size_t n = (nfo->bchip_type_len < 4) ? nfo->bchip_type_len : 4;
+    size_t j = 0;
+    for (size_t i = 0; i < n && j + 1 < outlen; i++) {
+        uint8_t c = nfo->bchip_type[i];
+        out[j++] = (c >= 0x20 && c < 0x7F) ? (char)c : '.';
+    }
+    out[j] = 0;
+    if (j == 0) {
+        snprintf(out, outlen, "(unknown)");
+    }
+    if (is37 != NULL) {
+        *is37 = (n >= 4 && nfo->bchip_type[2] == '3' && nfo->bchip_type[3] == '7');
+    }
+}
+
+// The identify reply with its CRC checked.  The trailing byte is the CRC-8 of SS7.1 over the 0011
+// command byte and the four family bytes, not a fifth character of a name: "XT57" -> 0x58, which is
+// why it once read as "XT57X", and "XT37" -> 0x26 (docs/xt57-auth.md SS4).
+static void xh_print_bchip_identify(const lf_xhorse_info_t *nfo, const char *type_str) {
+    if (nfo->bchip_type_len >= 5) {
+        const uint8_t over[5] = { 0x03, nfo->bchip_type[0], nfo->bchip_type[1],
+                                  nfo->bchip_type[2], nfo->bchip_type[3] };
+        uint8_t want = xt57_crc8(over, sizeof(over));
+        PrintAndLogEx(INFO, "Identify reply. %s  (%s + CRC %02X %s)",
+                      sprint_hex_inrow(nfo->bchip_type, nfo->bchip_type_len), type_str,
+                      nfo->bchip_type[4],
+                      (want == nfo->bchip_type[4]) ? _GREEN_("ok") : _RED_("BAD"));
+    } else {
+        PrintAndLogEx(INFO, "Identify reply. %s  (%d bytes, no CRC byte)",
+                      sprint_hex_inrow(nfo->bchip_type, nfo->bchip_type_len), nfo->bchip_type_len);
+    }
+}
+
+// The header both `info` and `dump` print for a channel-A XT27A: what the chip is, rather than what
+// is in it.  `dump` prints the pages underneath, `info` stops here.  The emulated UID is page 0 of
+// the image - for a HITAG2-family type that is the UID a reader sees, and for the others it is
+// simply the image's first word, which is why the page it came from is named.
 static void xh_print_header(const lf_xhorse_info_t *nfo) {
-    PrintAndLogEx(INFO, "Chip ID... " _GREEN_("%s"), sprint_hex_inrow(nfo->chipid, 16));
-    PrintAndLogEx(INFO, "Seed...... 7372 reply 0x%04X", nfo->seed_reply);
-    PrintAndLogEx(INFO, "Type byte. " _YELLOW_("0x%02X") " (%s)", nfo->typebyte, typebyte_name(nfo->typebyte));
+    PrintAndLogEx(INFO, "Chip type...... " _YELLOW_("XT27A"));
+    PrintAndLogEx(INFO, "Chip ID........ " _GREEN_("%s"), sprint_hex_inrow(nfo->chipid, 16));
+    if (nfo->bank == 0 && nfo->image_pages > 0) {
+        const uint8_t *d = nfo->image;
+        PrintAndLogEx(INFO, "Emulated UID... " _GREEN_("%02X%02X%02X%02X") "%s",
+                      d[0], d[1], d[2], d[3], xh_page_mark_eol(nfo, 0));
+    }
+    PrintAndLogEx(INFO, "Emulated type.. " _YELLOW_("0x%02X") " (%s)",
+                  nfo->typebyte, typebyte_name(nfo->typebyte));
+    PrintAndLogEx(INFO, "Config word.... %08X %08X%s%s",
+                  nfo->cfgword[0], nfo->cfgword[1],
+                  (nfo->cfgword_ok & 1) ? "" : " " _RED_("?"),
+                  (nfo->cfgword_ok & 2) ? "" : " " _RED_("?"));
     if (nfo->typebyte_ok == 0) {
         PrintAndLogEx(WARNING, "Type byte unconfirmed: no two reads of it agreed, so it may be wrong; try again");
     }
@@ -451,44 +551,11 @@ static int CmdLFXhorseInfo(const char *Cmd) {
         // The reply is 4 ASCII family bytes (e.g. "XT37") followed by a CRC-8 over the 0011
         // command byte and those four - not a 5-character name, and not a seed: "XT57" -> 0x58,
         // which is why it read as "XT57X", and "XT37" -> 0x26 (docs/xt57-auth.md SS4).
-        char type[5] = {0};
-        size_t n = (nfo.bchip_type_len < 4) ? nfo.bchip_type_len : 4;
-        size_t j = 0;
-        for (size_t i = 0; i < n; i++) {
-            uint8_t c = nfo.bchip_type[i];
-            type[j++] = (c >= 0x20 && c < 0x7F) ? (char)c : '.';
-        }
-        const char *type_str = (j == 0) ? "(unknown)" : type;
-        PrintAndLogEx(NORMAL, "");
-        PrintAndLogEx(INFO, "Found an Xhorse " _YELLOW_("channel-B") " (XMICRO) super-chip");
-        PrintAndLogEx(INFO, "Chip type...... " _YELLOW_("%s"), type_str);
-        if (nfo.bchip_type_len >= 5) {
-            const uint8_t over[5] = { 0x03, nfo.bchip_type[0], nfo.bchip_type[1],
-                                      nfo.bchip_type[2], nfo.bchip_type[3] };
-            uint8_t want = xt57_crc8(over, sizeof(over));
-            PrintAndLogEx(INFO, "Identify reply... %s  (%s + CRC %02X %s)",
-                          sprint_hex_inrow(nfo.bchip_type, nfo.bchip_type_len), type_str,
-                          nfo.bchip_type[4],
-                          (want == nfo.bchip_type[4]) ? _GREEN_("ok") : _RED_("BAD"));
-        } else {
-            PrintAndLogEx(INFO, "Identify reply... %s  (%d bytes, no CRC byte)",
-                          sprint_hex_inrow(nfo.bchip_type, nfo.bchip_type_len), nfo.bchip_type_len);
-        }
-        // The emulated type lives in the config block, not in the identify reply, so reading it
-        // means opening an authenticated session - which needs a nonce this chip reaches, and that
-        // is a per-tag power-up delay the search has to hunt for (docs/xt37.md SS4a).
-        bool is37 = (n >= 4 && nfo.bchip_type[2] == '3' && nfo.bchip_type[3] == '7');
-        uint32_t tw = 0;
-        PrintAndLogEx(INFO, "reading the type byte (needs a session; this can take a moment)...");
-        if (xt_read_typeword(is37, &tw) == PM3_SUCCESS) {
-            PrintAndLogEx(SUCCESS, "Emulated type.. " _GREEN_("%02X") " (%s)",
-                          (uint8_t)(tw & 0xFF), xt_type_name((uint8_t)(tw & 0xFF)));
-            PrintAndLogEx(INFO, "config word.... %08X   (segment 3 block 1F page 4)", tw);
-        } else {
-            PrintAndLogEx(WARNING, "could not read the type byte - no recorded nonce came up");
-            PrintAndLogEx(HINT, "the delay that reaches a nonce is per-tag; `lf xhorse xt57 read --at <us>`");
-        }
-        return PM3_SUCCESS;
+        // Everything but the identify reply lives in the chip's own blocks, so reading it means
+        // opening an authenticated session - which needs a nonce this chip reaches, and that is a
+        // per-tag power-up delay the search has to hunt for (docs/xt37.md SS4a).  `info` reads the
+        // three blocks its header needs; `dump` reads them all.
+        return xt_print_bchip(&nfo, false);
     }
 
     if (nfo.found == 0) {
@@ -497,17 +564,15 @@ static int CmdLFXhorseInfo(const char *Cmd) {
     }
 
     if (nfo.family == XHORSE_FAM_XT136) {
-        xh136_print(&nfo, "Xhorse XT136");
+        xh136_print(&nfo, "Xhorse XT136", false);
         return PM3_SUCCESS;
     }
 
+    // What the chip is, not what is in it: `lf xhorse dump` prints this same header and the memory
+    // under it.
     PrintAndLogEx(NORMAL, "");
-    PrintAndLogEx(INFO, "--- " _CYAN_("Xhorse XT27A") " ---------------------------");
+    xh_print_title("Xhorse XT27A");
     xh_print_header(&nfo);
-    for (uint8_t pg = 0; pg < nfo.image_pages; pg++) {
-        PrintAndLogEx(INFO, "  bank0 0x%02X: %s%s", pg, sprint_hex_inrow(&nfo.image[pg * 4], 4), xh_page_mark(&nfo, pg));
-    }
-    xh_print_unconfirmed(&nfo, nfo.image_pages);
     PrintAndLogEx(NORMAL, "");
     return PM3_SUCCESS;
 }
@@ -518,10 +583,16 @@ static int CmdLFXhorseInfo(const char *Cmd) {
 static int CmdLFXhorseDump(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "lf xhorse dump",
-                  "Read all reachable channel-A storage of an Xhorse XT27A: the 16-byte chip ID,\n"
-                  "the type byte, and pages 0x00..0x3F of both banks: bank 0 (the emulated-tag\n"
-                  "image) and bank 1 (configuration and identity).  Each bank is read in its own session.\n"
-                  "An XT136 has no banks and only pages 0x00..0x0F: they are read in one session.",
+                  "Read all reachable storage of whichever Xhorse super-chip is on the antenna.\n"
+                  "\n"
+                  "XT27A (channel A): the 16-byte chip ID, the type byte, and pages 0x00..0x3F of\n"
+                  "both banks - bank 0 (the emulated-tag image) and bank 1 (configuration and\n"
+                  "identity).  Each bank is read in its own session.\n"
+                  "XT136: no banks and only pages 0x00..0x0F, read in one session.\n"
+                  "XT37 / XT57 (channel B): every block the family is known to use, read over an\n"
+                  "authenticated session - the chip ID is the identity block, and the emulated type\n"
+                  "and UID come out of the same pass.  Which power-up delay reaches a usable nonce\n"
+                  "is per-tag, so this takes a few seconds while it is found.",
                   "lf xhorse dump\n"
                   "lf xhorse dump --probe b    -> dump an ID8A chip; reverts its type byte to 0x36\n"
                   "lf xhorse dump --probe a    -> the VVDI's other word; zeroes the type byte instead");
@@ -557,6 +628,13 @@ static int CmdLFXhorseDump(const char *Cmd) {
         }
         if (nfo[bank].found == 0) {
             if (bank == 0) {
+                // An XT37/XT57 answers the XMICRO identify, never the channel-A handshake, so
+                // nothing above reaches one.  Try channel B before concluding there is no chip -
+                // which costs an XT27A nothing, since it never gets here (docs/xt37.md SS5r).
+                int bres = xt_dump_bchip();
+                if (bres != PM3_ENODATA) {
+                    return bres;
+                }
                 xh_print_not_found();
                 return PM3_ESOFT;
             }
@@ -569,13 +647,13 @@ static int CmdLFXhorseDump(const char *Cmd) {
         }
         got++;
         if (nfo[bank].family == XHORSE_FAM_XT136) {
-            xh136_print(&nfo[bank], "Xhorse XT136 dump");
+            xh136_print(&nfo[bank], "Xhorse XT136 dump", true);
             return PM3_SUCCESS;
         }
     }
 
     PrintAndLogEx(NORMAL, "");
-    PrintAndLogEx(INFO, "--- " _CYAN_("Xhorse XT27A dump") " ----------------------");
+    xh_print_title("Xhorse XT27A dump");
     xh_print_header(&nfo[0]);
 
     // The banks side by side, bank 1 starting at column 33.  The unconfirmed mark is padded by hand
@@ -2925,120 +3003,6 @@ static const struct { uint8_t arg; const char *what; } xt_blocks[] = {
     { 0x7F, "config block (page 4 = type byte)" },
 };
 
-// Read the eight pages of one block in a single authenticated session: select, then eight
-// triggers.  Reads are decrypted with the data keystream (docs/xt37.md SS5k).
-static int xt_read_block(const xt57_ks_t *ks, int32_t at, uint8_t arg,
-                         uint32_t *out, bool *got) {
-    xt57_step_t st[9];
-    st[0] = (xt57_step_t) { 'S', arg, 0 };
-    for (int i = 0; i < 8; i++) {
-        st[i + 1] = (xt57_step_t) { 'R', (uint8_t)i, 0 };
-    }
-    xt57_frame_t frames[9];
-    if (xt57_build_session(st, 9, ks, frames) == false) {
-        PrintAndLogEx(FAILED, "the keystream at nonce %08X does not reach 9 exchanges", ks->nonce);
-        return PM3_EINVARG;
-    }
-
-    lf_xhorse_xt57_t p;
-    memset(&p, 0, sizeof(p));
-    p.sweep = XT57_SWEEP_POWERUP;
-    p.answer_mode = XT57_ANS_FIXED;
-    p.answer = ks->answer;
-    p.want = ks->nonce;
-    p.base = at;
-    p.off_us = (uint32_t)ks->off_us;
-    p.selbits = XHORSE_XT57_SELLEN * 8;
-    memcpy(p.select, xt57_sel_default, XHORSE_XT57_SELLEN);
-    p.sel_auto = ks->sel_auto;
-    p.npost = 9;
-    p.rfirst = 1;
-    int packed = xt57_pack_script(frames, 9, p.script, sizeof(p.script));
-    if (packed < 0) {
-        return PM3_EINVARG;
-    }
-    p.scriptlen = (uint16_t)packed;
-    // Sessions per attempt, sweeping 2 us (one clock) apart from `base` below.  The phase drifts
-    // between runs by more than the plateau is wide, so this has to cover tens of microseconds, not
-    // a handful: 16 sessions missed often enough to fail a write that then succeeded by hand.
-    p.count = 30;
-
-    // The delay that reaches a nonce sits on a narrow, drifting plateau (docs/xt37.md SS4a), so
-    // hammering one delay wastes most sessions.  Sweep the plateau *inside* the call instead -
-    // base-6 .. base+8 at the stream's own 2 us per clock - and the wanted nonce turns up within a
-    // few sessions.  Two passes cover the case where the plateau has drifted further.
-    p.step = 2;
-    PacketResponseNG resp;
-    bool ran = false;
-    for (int t = 0; t < 3 && ran == false; t++) {
-        p.base = at - 20;
-        clearCommandBuffer();
-        SendCommandNG(CMD_LF_XHORSE_XT57_NONCE, (uint8_t *)&p, sizeof(p));
-        if (WaitForResponseTimeout(CMD_LF_XHORSE_XT57_NONCE, &resp, 120000) == false) {
-            PrintAndLogEx(WARNING, "timeout while waiting for reply");
-            SendCommandNG(CMD_BREAK_LOOP, NULL, 0);
-            return PM3_ETIMEOUT;
-        }
-        ran = (resp.length >= sizeof(lf_xhorse_xt57_post_reply_t)
-               - sizeof(xt57_presp_t) * XHORSE_XT57_MAXPOST);
-        if (ran == false && t + 1 < 3) {
-            // Closed loop: ask the chip where the stream is now and recompute, rather than widening
-            // a blind search.  The phase drifts between runs, so a fresh reading is worth more than
-            // more sessions at a stale delay.
-            int32_t fresh = 0;
-            if (xt_steer(ks, at, &fresh, false) == PM3_SUCCESS) {
-                at = fresh;
-            }
-        }
-    }
-    if (ran == false) {
-        PrintAndLogEx(FAILED, "nonce %08X did not come up near %d us", ks->nonce, at);
-        return PM3_ESOFT;
-    }
-    const lf_xhorse_xt57_post_reply_t *q = (const lf_xhorse_xt57_post_reply_t *)resp.data.asBytes;
-    for (int i = 0; i < 8; i++) {
-        got[i] = false;
-        out[i] = 0;
-        int idx = i + 1;                       // exchange 1 is the select; reads are 2..9
-        if (idx >= q->npost) {
-            continue;
-        }
-        const xt57_presp_t *r = &q->presp[idx];
-        if (r->bits < 40) {
-            continue;
-        }
-        uint32_t ct = ((uint32_t)r->data[0] << 24) | ((uint32_t)r->data[1] << 16)
-                      | ((uint32_t)r->data[2] << 8) | r->data[3];
-        out[i] = ct ^ ks->K[idx + 1];          // the read sits at exchange idx+1
-        got[i] = true;
-    }
-    return PM3_SUCCESS;
-}
-
-// Emulated-type byte -> what the tool calls it (mem-layout.md "type byte" table, every entry
-// confirmed against a decoded set session in docs/xt37.md SS5p).
-static const char *xt_type_name(uint8_t t) {
-    switch (t) {
-        case 0x35: return "ID7935 (ID33/40/42/43/44)";
-        case 0x36: return "ID7936 / ID46";
-        case 0x37: return "ID7937";
-        case 0x39: return "ID7939 / ID49";
-        case 0x46: return "ID7946";
-        case 0x47: return "ID7938 / ID47";
-        case 0x48: return "ID48";
-        case 0x4A: return "ID4A";
-        case 0x4C: return "ID4C";
-        case 0x4D: return "ID4D (ID60/63)";
-        case 0x64: return "ID4E (ID64)";
-        case 0x80: return "4D(80) (ID70/83/G)";
-        case 0x8A: return "ID8A (H)";
-        case 0x8B: return "MQB";
-        case 0x8C: return "ID11 / ID12 / ID13 / ID8C";
-        case 0x8E: return "ID8E";
-        default:   return "unknown";
-    }
-}
-
 // The nonce register: a 32-bit LFSR clocked once per carrier cycle, taps 2/11/15/21/28/30/32
 // (docs/xt37.md SS4b, data/traces/xt57b/nonce-captures/steer_to_known_nonce.py).
 static const int xt_lfsr_taps[] = { 2, 11, 15, 21, 28, 30, 32 };
@@ -3074,7 +3038,6 @@ static int xt_observe_nonce(const xt57_ks_t *ks, int32_t at, uint32_t *nonce) {
         return PM3_ETIMEOUT;
     }
     const lf_xhorse_xt57_reply_t *r = (const lf_xhorse_xt57_reply_t *)resp.data.asBytes;
-    // Take the value seen most often: the window drifts a clock either way between sessions.
     uint32_t best = 0;
     int bestn = 0;
     for (int i = 0; i < r->count; i++) {
@@ -3104,25 +3067,20 @@ static int xt_observe_nonce(const xt57_ks_t *ks, int32_t at, uint32_t *nonce) {
 }
 
 // Steer to a wanted nonce the way the hitager tool does: read where the stream is, step the LFSR to
-// work out how far the target is, and convert that to a delay.  A *later* delay walks the nonce
-// *backwards*, so a target `d` clocks forward of what we just read sits at `at - d * 8` us
-// (docs/xt57-auth.md SS10.3 - the sign is the opposite of what SS5a's wording suggests).  Two
-// sessions instead of the hundreds a blind sweep costs.
-#define XT_STEER_LIM   200000       // clocks to search either way: 1.6 s of delay, far beyond the
-//                                     XMICRO listening window, so a miss here means "not on this
-//                                     stretch of stream" rather than "search harder"
+// see how far the target is, and convert that to a delay.  A *later* delay walks the nonce
+// *backwards*, so a target `d` clocks ahead sits at `at - d * 8` us and one `d` behind at
+// `at + d * 8` (docs/xt57-auth.md SS10.3).  Both directions have to be searched: walking only forward
+// makes a target a few clocks behind look like most of a 715M-state orbit away, which is exactly how
+// an XT57 presents against these tables.
+#define XT_STEER_LIM   200000
 static int xt_steer(const xt57_ks_t *ks, int32_t from, int32_t *at, bool verbose) {
     uint32_t here = 0;
     if (xt_observe_nonce(ks, from, &here) != PM3_SUCCESS) {
         return PM3_ESOFT;
     }
-    // The target may lie either side of where the chip is: walking forward from `here` finds a
-    // target ahead of us, and walking forward from the target finds one behind.  Only searching
-    // forward would make a target that is a few clocks behind look like most of a 715M-state orbit
-    // away - which is exactly how an XT57 behaves against these tables.
     int32_t ahead = -1, behind = -1;
     uint32_t wf = here, wb = ks->nonce;
-    for (int32_t d = 0; d < XT_STEER_LIM && ahead < 0 && behind < 0; d++) {
+    for (int32_t d = 0; d < XT_STEER_LIM; d++) {
         if (wf == ks->nonce) {
             ahead = d;
             break;
@@ -3134,50 +3092,65 @@ static int xt_steer(const xt57_ks_t *ks, int32_t from, int32_t *at, bool verbose
         wf = xt_lfsr_fwd(wf);
         wb = xt_lfsr_fwd(wb);
     }
-    {
-        int32_t d = (ahead >= 0) ? ahead : behind;
-        if (d >= 0) {
-            // A later delay walks the nonce backwards, so a target ahead of us sits at an earlier
-            // delay and one behind us at a later delay (docs/xt57-auth.md SS10.3).
-            int32_t want = (ahead >= 0) ? (from - d * 8) : (from + d * 8);
-            if (verbose) {
-                PrintAndLogEx(INFO, "at %d us the chip is at %08X, %d clocks %s %08X -> %d us",
-                              from, here, d, (ahead >= 0) ? "before" : "after", ks->nonce, want);
-            }
-            if (want < 20000 || want > 400000) {
-                PrintAndLogEx(WARNING, "%08X would need a %d us power-up, outside the listening window",
-                              ks->nonce, want);
-                return PM3_ESOFT;
-            }
-            *at = want;
-            return PM3_SUCCESS;
-        }
+    int32_t d = (ahead >= 0) ? ahead : behind;
+    if (d < 0) {
+        return PM3_ESOFT;
     }
-    return PM3_ESOFT;
+    int32_t want = (ahead >= 0) ? (from - d * 8) : (from + d * 8);
+    if (verbose) {
+        PrintAndLogEx(INFO, "at %d us the chip is at %08X, %d clocks %s %08X -> %d us",
+                      from, here, d, (ahead >= 0) ? "before" : "after", ks->nonce, want);
+    }
+    if (want < 20000 || want > 400000) {
+        PrintAndLogEx(WARNING, "%08X would need a %d us power-up, outside the listening window",
+                      ks->nonce, want);
+        return PM3_ESOFT;
+    }
+    *at = want;
+    return PM3_SUCCESS;
 }
 
+// Emulated-type byte -> what the tool calls it (mem-layout.md "type byte" table, every entry
+// confirmed against a decoded set session in docs/xt37.md SS5p).
+static const char *xt_type_name(uint8_t t) {
+    switch (t) {
+        case 0x35: return "ID7935 (ID33/40/42/43/44)";
+        case 0x36: return "ID7936 / ID46";
+        case 0x37: return "ID7937";
+        case 0x39: return "ID7939 / ID49";
+        case 0x46: return "ID7946";
+        case 0x47: return "ID7938 / ID47";
+        case 0x48: return "ID48";
+        case 0x4A: return "ID4A";
+        case 0x4C: return "ID4C";
+        case 0x4D: return "ID4D (ID60/63)";
+        case 0x64: return "ID4E (ID64)";
+        case 0x80: return "4D(80) (ID70/83/G)";
+        case 0x8A: return "ID8A (H)";
+        case 0x8B: return "MQB";
+        case 0x8C: return "ID11 / ID12 / ID13 / ID8C";
+        case 0x8E: return "ID8E";
+        default:   return "unknown";
+    }
+}
+
+// The blocks an XT37 is known to use (docs/xt37.md SS5l).  `arg` is the select operand: segment in
+// the top 3 bits, block in the low 5 - so s3 b1F is 0x7F, the config block.
+
 // Pick the keystream table for the family on the coil and find a power-up delay that reaches one of
-// its nonces.  A nonce sits on a narrow plateau that drifts, so one sweep can miss a nonce that is
-// perfectly reachable (docs/xt37.md SS4a) - hence the passes.
+// its nonces: steer first (read where the stream is and compute the delay, docs/xt37.md SS5r) and
+// only sweep if that cannot be done, widening progressively rather than scanning the full span.
 static const xt57_ks_t *xt_pick_ks(bool is37, int at, int32_t *found, bool verbose) {
     const xt57_ks_t *const *tbl = is37 ? xt37_ks_all : xt57_ks_all;
     size_t ntbl = is37 ? ARRAYLEN(xt37_ks_all) : ARRAYLEN(xt57_ks_all);
-    // Widen progressively instead of sweeping the whole span every pass: the recorded centre is
-    // usually within a few tens of us on the tag it was measured from, and sweeping +-900 us at a
-    // 2 us step costs minutes - too slow to sit inside `lf xhorse info`.  A narrow pass that usually
-    // hits is tried first, and only a failure pays for the wide one.
-    // First ask the chip where the stream is and compute the delay (xt_steer).  Only if that fails
-    // - a mis-read nonce, or a target too far along the stream - fall back to sweeping.
+
     for (size_t i = 0; i < ntbl && at <= 0; i++) {
         int32_t want = 0;
         if (xt_steer(tbl[i], tbl[i]->centre, &want, verbose) == PM3_SUCCESS) {
-            // Trust the arithmetic: the caller's session sweeps a few clocks around this itself, so
-            // confirming with a separate search would just pay for the same sessions twice.
             *found = want;
             return tbl[i];
         }
     }
-
     static const int32_t spans[] = { 60, 300, 900 };
     for (size_t sp = 0; sp < ARRAYLEN(spans); sp++) {
         for (size_t i = 0; i < ntbl; i++) {
@@ -3201,29 +3174,258 @@ static const xt57_ks_t *xt_pick_ks(bool is37, int at, int32_t *found, bool verbo
     return NULL;
 }
 
-// Read the emulated type byte: config block, page 4 (docs/xt37.md SS5o).  Returns the whole word,
-// whose low byte is the type; the upper half varies by type and is not understood (SS5p).
-static int xt_read_typeword(bool is37, uint32_t *word) {
-    int32_t at = 0;
-    const xt57_ks_t *ks = xt_pick_ks(is37, 0, &at, false);
-    if (ks == NULL) {
-        return PM3_ESOFT;
+// Read whole blocks in as few sessions as possible: one select plus eight triggers per block, all
+// in one script.  The keystream reaches 178 exchanges (SS5p) so depth is not the limit - the 64
+// responses a reply carries is, which caps a session at seven blocks (7 x 9 = 63).  Reading the eight
+// known blocks is therefore two sessions rather than eight, with one nonce search and one "press the
+// button" notice instead of eight of each.
+#define XT_READ_BLOCKS_PER_SESSION   7
+
+static int xt_read_blocks(const xt57_ks_t *ks, int32_t at, const uint8_t *args, int nargs,
+                          uint32_t out[][8], bool got[][8]) {
+    for (int i = 0; i < nargs; i++) {
+        for (int pg = 0; pg < 8; pg++) {
+            out[i][pg] = 0;
+            got[i][pg] = false;
+        }
     }
-    uint32_t v[8];
-    bool got[8];
-    if (xt_read_block(ks, at, XT_ARG_CONFIG, v, got) != PM3_SUCCESS) {
-        return PM3_ESOFT;
+
+    int first = 0;
+    while (first < nargs) {
+        int count = nargs - first;
+        if (count > XT_READ_BLOCKS_PER_SESSION) {
+            count = XT_READ_BLOCKS_PER_SESSION;
+        }
+        while (count > 1 && (1 + 9 * count) > ks->nfull) {
+            count--;                       // also respect how far this nonce's keystream reaches
+        }
+
+        xt57_step_t st[XT57_MAXSTEPS];
+        int nst = 0;
+        for (int i = 0; i < count; i++) {
+            st[nst++] = (xt57_step_t) { 'S', args[first + i], 0 };
+            for (int pg = 0; pg < 8; pg++) {
+                st[nst++] = (xt57_step_t) { 'R', (uint8_t)pg, 0 };
+            }
+        }
+        xt57_frame_t frames[XT57_MAXSTEPS];
+        if (xt57_build_session(st, nst, ks, frames) == false) {
+            PrintAndLogEx(FAILED, "the keystream at nonce %08X does not reach %d exchanges",
+                          ks->nonce, nst);
+            return PM3_EINVARG;
+        }
+
+        lf_xhorse_xt57_t p;
+        memset(&p, 0, sizeof(p));
+        p.sweep = XT57_SWEEP_POWERUP;
+        p.answer_mode = XT57_ANS_FIXED;
+        p.answer = ks->answer;
+        p.want = ks->nonce;
+        p.off_us = (uint32_t)ks->off_us;
+        p.selbits = XHORSE_XT57_SELLEN * 8;
+        memcpy(p.select, xt57_sel_default, XHORSE_XT57_SELLEN);
+        p.sel_auto = ks->sel_auto;
+        p.npost = (uint8_t)nst;
+        p.rfirst = 1;
+        int packed = xt57_pack_script(frames, nst, p.script, sizeof(p.script));
+        if (packed < 0) {
+            return PM3_EINVARG;
+        }
+        p.scriptlen = (uint16_t)packed;
+        p.count = 30;
+        p.step = 2;
+
+        PacketResponseNG resp;
+        bool ran = false;
+        for (int t = 0; t < 3 && ran == false; t++) {
+            p.base = at - 20;
+            clearCommandBuffer();
+            SendCommandNG(CMD_LF_XHORSE_XT57_NONCE, (uint8_t *)&p, sizeof(p));
+            if (WaitForResponseTimeout(CMD_LF_XHORSE_XT57_NONCE, &resp, 120000) == false) {
+                SendCommandNG(CMD_BREAK_LOOP, NULL, 0);
+                return PM3_ETIMEOUT;
+            }
+            ran = (resp.length >= sizeof(lf_xhorse_xt57_post_reply_t)
+                   - sizeof(xt57_presp_t) * XHORSE_XT57_MAXPOST);
+            if (ran == false && t + 1 < 3) {
+                int32_t fresh = 0;
+                if (xt_steer(ks, at, &fresh, false) == PM3_SUCCESS) {
+                    at = fresh;
+                }
+            }
+        }
+        if (ran == false) {
+            PrintAndLogEx(FAILED, "nonce %08X did not come up - %d blocks unread",
+                          ks->nonce, nargs - first);
+            return PM3_ESOFT;
+        }
+
+        const lf_xhorse_xt57_post_reply_t *q = (const lf_xhorse_xt57_post_reply_t *)resp.data.asBytes;
+        for (int i = 0; i < count; i++) {
+            for (int pg = 0; pg < 8; pg++) {
+                int idx = 1 + i * 9 + pg;          // the select of block i sits at i*9
+                if (idx >= q->npost || q->presp[idx].bits < 40) {
+                    continue;
+                }
+                const xt57_presp_t *r = &q->presp[idx];
+                uint32_t ct = ((uint32_t)r->data[0] << 24) | ((uint32_t)r->data[1] << 16)
+                              | ((uint32_t)r->data[2] << 8) | r->data[3];
+                out[first + i][pg] = ct ^ ks->K[idx + 1];
+                got[first + i][pg] = true;
+            }
+        }
+        first += count;
     }
-    if (got[4] == false) {
-        return PM3_ESOFT;
-    }
-    *word = v[4];
     return PM3_SUCCESS;
 }
 
-// Write one page: select, write, read it back.  The read-back is the whole point - a write is only
-// reported good if the chip returns what went in (docs/xt37.md SS5n, where 354 of 358 recorded
-// writes verified this way).
+// One block, for the callers that want a single read.
+static int xt_read_block(const xt57_ks_t *ks, int32_t at, uint8_t arg, uint32_t *out, bool *got) {
+    uint32_t v[1][8];
+    bool g[1][8];
+    int res = xt_read_blocks(ks, at, &arg, 1, v, g);
+    if (res == PM3_SUCCESS) {
+        memcpy(out, v[0], sizeof(v[0]));
+        memcpy(got, g[0], sizeof(g[0]));
+    }
+    return res;
+}
+
+// Read the emulated type byte: config block, page 4 (docs/xt37.md SS5o).  Returns the whole word,
+// whose low byte is the type; the upper half varies by type and is not understood (SS5p).
+// The block table `read` and `dump` both print.  A row is skipped when nothing came back for it, so
+// a blank row never means "this block is empty" - it means the block was not read.
+static void xt_print_block_table(const uint8_t *args, int nargs, uint32_t v[][8], bool got[][8]) {
+    PrintAndLogEx(INFO, " seg blk  p0       p1       p2       p3       p4       p5       p6       p7");
+    PrintAndLogEx(INFO, " --- ---  -------- -------- -------- -------- -------- -------- -------- --------");
+    for (int b = 0; b < nargs; b++) {
+        bool any = false;
+        for (int i = 0; i < 8; i++) {
+            any |= got[b][i];
+        }
+        if (any == false) {
+            continue;
+        }
+        char line[160] = {0};
+        for (int i = 0; i < 8; i++) {
+            char cell[12];
+            snprintf(cell, sizeof(cell), got[b][i] ? "%08X " : "   --    ", v[b][i]);
+            strncat(line, cell, sizeof(line) - strlen(line) - 1);
+        }
+        PrintAndLogEx(INFO, "  %d  %02X  %s", (args[b] >> 5) & 7, args[b] & 0x1F, line);
+    }
+}
+
+// `lf xhorse dump` for a channel-B chip.  An XT37/XT57 ignores the channel-A handshake entirely, so
+// `dump` only gets here once that has already found nothing - which is what keeps this free for an
+// XT27A.  Everything the header needs is in the blocks themselves (identity at s3 b1E, type at
+// s3 b1F, emulated UID at s0 b00), so one read pass over the whole chip serves the header and the
+// table both, in the two sessions xt_read_blocks needs for eight blocks.
+static int xt_print_bchip(const lf_xhorse_info_t *nfo_in, bool full) {
+    const lf_xhorse_info_t *nfo = nfo_in;
+    char type[12] = {0};
+    bool is37 = false;
+    xh_bchip_type_str(nfo, type, sizeof(type), &is37);
+    char title[32];
+    snprintf(title, sizeof(title), "Xhorse %s%s", type, full ? " dump" : "");
+
+    int32_t found = 0;
+    const xt57_ks_t *ks = xt_pick_ks(is37, 0, &found, true);
+    if (ks == NULL) {
+        PrintAndLogEx(NORMAL, "");
+        xh_print_title(title);
+        PrintAndLogEx(INFO, "Chip type...... " _YELLOW_("%s"), type);
+        xh_print_bchip_identify(nfo, type);
+        PrintAndLogEx(FAILED, "none of this family's recorded nonces came up - nothing could be read");
+        PrintAndLogEx(HINT, "the delay that reaches a nonce is per-tag; try "
+                      "`" _YELLOW_("lf xhorse xt57 read --at <us>") "`");
+        return PM3_ESOFT;
+    }
+
+    // `info` wants only the blocks its header reads from, which is one session instead of two.
+    uint8_t args[ARRAYLEN(xt_blocks)];
+    int nargs = 0;
+    for (size_t b = 0; b < ARRAYLEN(xt_blocks); b++) {
+        uint8_t a = xt_blocks[b].arg;
+        if (full || a == 0x00 || a == 0x7E || a == XT_ARG_CONFIG) {
+            args[nargs++] = a;
+        }
+    }
+    uint32_t v[ARRAYLEN(xt_blocks)][8];
+    bool got[ARRAYLEN(xt_blocks)][8];
+    int res = xt_read_blocks(ks, found, args, nargs, v, got);
+
+    // Pull the header fields back out of what was read, rather than spending sessions on them.
+    const uint32_t *identity = NULL, *image = NULL, *config = NULL;
+    const bool *identity_got = NULL, *image_got = NULL, *config_got = NULL;
+    for (int b = 0; b < nargs; b++) {
+        if (args[b] == 0x7E) {
+            identity = v[b];
+            identity_got = got[b];
+        } else if (args[b] == 0x00) {
+            image = v[b];
+            image_got = got[b];
+        } else if (args[b] == XT_ARG_CONFIG) {
+            config = v[b];
+            config_got = got[b];
+        }
+    }
+
+    PrintAndLogEx(NORMAL, "");
+    xh_print_title(title);
+    PrintAndLogEx(INFO, "Chip type...... " _YELLOW_("%s"), type);
+    xh_print_bchip_identify(nfo, type);
+
+    // The channel-A views print a 16-byte chip ID; the channel-B equivalent is the identity block,
+    // the only four full 32-bit words on the chip and unchanged across every set and reset in the
+    // captures (docs/xt37.md SS5l).  It is what the tool's own identify read targets.
+    if (identity != NULL && identity_got[4] && identity_got[5] && identity_got[6] && identity_got[7]) {
+        uint8_t id[16];
+        for (int w = 0; w < 4; w++) {
+            uint32_t x = identity[4 + w];
+            id[w * 4 + 0] = (uint8_t)(x >> 24);
+            id[w * 4 + 1] = (uint8_t)(x >> 16);
+            id[w * 4 + 2] = (uint8_t)(x >> 8);
+            id[w * 4 + 3] = (uint8_t)x;
+        }
+        PrintAndLogEx(INFO, "Chip ID........ " _GREEN_("%s"), sprint_hex_inrow(id, sizeof(id)));
+    } else {
+        PrintAndLogEx(INFO, "Chip ID........ (identity block not read)");
+    }
+
+    if (image != NULL && image_got[0]) {
+        PrintAndLogEx(INFO, "Emulated UID... " _GREEN_("%08X"), image[0]);
+    }
+    if (config != NULL && config_got[4]) {
+        PrintAndLogEx(INFO, "Emulated type.. " _YELLOW_("0x%02X") " (%s)",
+                      (uint8_t)(config[4] & 0xFF), xt_type_name((uint8_t)(config[4] & 0xFF)));
+        PrintAndLogEx(INFO, "Config word.... %08X", config[4]);
+    }
+
+    if (full) {
+        PrintAndLogEx(NORMAL, "");
+        xt_print_block_table(args, nargs, v, got);
+    }
+    PrintAndLogEx(NORMAL, "");
+    return res;
+}
+
+// `dump`'s channel-B entry point: identify the chip, then print the header and the whole memory.
+static int xt_dump_bchip(void) {
+    lf_xhorse_rdopt_t opt;
+    memset(&opt, 0, sizeof(opt));
+    lf_xhorse_info_t nfo;
+    if (xh_request_info(CMD_LF_XHORSE_INFO, (uint8_t *)&opt, sizeof(opt), &nfo) != PM3_SUCCESS) {
+        return PM3_ENODATA;
+    }
+    if (nfo.bchip == 0) {
+        return PM3_ENODATA;               // not a channel-B chip either: let the caller say so
+    }
+    return xt_print_bchip(&nfo, true);
+}
+
+
+// Write one page: select, write, read it back - good only if the chip returns what went in.
 static int xt_write_page(const xt57_ks_t *ks, int32_t at, uint8_t arg, uint8_t page,
                          uint32_t value, uint32_t *readback) {
     xt57_step_t st[3] = {
@@ -3235,7 +3437,6 @@ static int xt_write_page(const xt57_ks_t *ks, int32_t at, uint8_t arg, uint8_t p
     if (xt57_build_session(st, 3, ks, frames) == false) {
         return PM3_EINVARG;
     }
-
     lf_xhorse_xt57_t p;
     memset(&p, 0, sizeof(p));
     p.sweep = XT57_SWEEP_POWERUP;
@@ -3291,35 +3492,25 @@ static int xt_write_page(const xt57_ks_t *ks, int32_t at, uint8_t arg, uint8_t p
     return PM3_SUCCESS;
 }
 
-// Types that share one image, so switching between them is only a type-byte write (set-type.md:
-// "same default ID46 image").  Anything else needs its image written too, which this does not do.
+// Types that share one emulated image, so switching among them is only a config-word write
+// (set-type.md: "same default ID46 image").
 static bool xt_type_shares_id46_image(uint8_t t) {
     return (t == 0x36 || t == 0x37 || t == 0x46);
 }
 
-
-// The ID46-family image: a UID then three constants (docs/xt37.md SS5p - every 7936/7937/7946 set and
-// the reset write exactly these four pages of s0 b00, pages 4-7 staying zero).
-#define XT_IMG_MIKR     0x4D494B52      // "MIKR" - HITAG2 key low
-#define XT_IMG_ON       0x00004F4E      // "\0\0ON" - HITAG2 key high
-#define XT_IMG_CFG      0x06AA4854      // HITAG2 config page
-
 static int CmdLFXhorseXt57SetType(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "lf xhorse xt57 settype",
-                  "Write the emulated type byte of an XT37 / XT57: config block, page 4\n"
-                  "(docs/xt37.md SS5o).  This writes to the chip.\n"
+                  "Advanced: write only the config word of an XT37 / XT57 (config block, page 4 -\n"
+                  "docs/xt37.md SS5o).  " _RED_("This writes to the chip") ".\n"
                   "\n"
-                  "It writes the type byte ONLY.  ID7936 (0x36), ID7937 (0x37) and ID7946 (0x46)\n"
-                  "share one emulated image, so switching among those three is complete on its own.\n"
-                  "Any other type also needs its image written, which this command does not do - the\n"
-                  "chip would emulate a type whose image is not there.  --force allows it anyway.",
-                  "lf xhorse xt57 settype -t 37      -> ID7937\n"
+                  "`lf xhorse xt57 set` is normally what you want: it writes the image too, which is\n"
+                  "what the tool itself does.  This exists to repair a config word on its own.",
                   "lf xhorse xt57 settype -t 36      -> ID7936 / ID46, the factory personality");
     void *argtable[] = {
         arg_param_begin,
         arg_str1("t", "type", "<hex>", "type byte to write"),
-        arg_lit0(NULL, "force", "write a type whose image this command cannot write"),
+        arg_lit0(NULL, "force", "write a type whose image this does not write"),
         arg_int0(NULL, "at", "<dec>", "power-up delay to use, us (default: steer to one)"),
         arg_param_end,
     };
@@ -3335,12 +3526,10 @@ static int CmdLFXhorseXt57SetType(const char *Cmd) {
         return PM3_EINVARG;
     }
     uint8_t type = tb[0];
-
     if (xt_type_shares_id46_image(type) == false && force == false) {
-        PrintAndLogEx(FAILED, "type %02X (%s) needs its emulated image written too, which this "
-                      "command does not do", type, xt_type_name(type));
-        PrintAndLogEx(INFO, "only %02X, %02X and %02X share one image; --force overrides",
-                      0x36, 0x37, 0x46);
+        PrintAndLogEx(FAILED, "type %02X (%s) needs its emulated image written too", type,
+                      xt_type_name(type));
+        PrintAndLogEx(INFO, "`lf xhorse xt57 set` does both; --force writes the word alone anyway");
         return PM3_EINVARG;
     }
 
@@ -3362,19 +3551,16 @@ static int CmdLFXhorseXt57SetType(const char *Cmd) {
         PrintAndLogEx(FAILED, "no recorded nonce came up - nothing was written");
         return PM3_ESOFT;
     }
-
-    // Read the word first: the upper half varies by type and is not understood (SS5p), so it is
-    // preserved rather than invented, and the old value is printed in case it has to go back.
     uint32_t v[8];
     bool got[8];
     if (xt_read_block(ks, found, XT_ARG_CONFIG, v, got) != PM3_SUCCESS || got[4] == false) {
-        PrintAndLogEx(FAILED, "could not read the current type word - nothing was written");
+        PrintAndLogEx(FAILED, "could not read the current config word - nothing was written");
         return PM3_ESOFT;
     }
     uint32_t oldw = v[4];
     // Prefer the whole word the tool wrote for this type: its upper half is not a constant (01F0,
     // 3FF0, 7FF0 - SS5p), so carrying the chip's current upper half over would write a word no set
-    // session ever produced.  Only a type with no recorded word falls back to patching the low byte.
+    // session ever produced.
     uint32_t neww = (oldw & 0xFFFFFF00) | type;
     bool recorded = false;
     for (size_t ic = 0; ic < ARRAYLEN(xt_images); ic++) {
@@ -3391,7 +3577,7 @@ static int CmdLFXhorseXt57SetType(const char *Cmd) {
     PrintAndLogEx(INFO, "config word.... %08X (%02X, %s)", oldw, (uint8_t)(oldw & 0xFF),
                   xt_type_name((uint8_t)(oldw & 0xFF)));
     if (neww == oldw) {
-        PrintAndLogEx(SUCCESS, "already %02X - nothing to do", type);
+        PrintAndLogEx(SUCCESS, "already %08X - nothing to do", oldw);
         return PM3_SUCCESS;
     }
     PrintAndLogEx(INFO, "writing........ %08X (%02X, %s)%s", neww, type, xt_type_name(type),
@@ -3403,8 +3589,7 @@ static int CmdLFXhorseXt57SetType(const char *Cmd) {
         return res;
     }
     if (back == neww) {
-        PrintAndLogEx(SUCCESS, "read back...... " _GREEN_("%08X") "  type is now %02X (%s)",
-                      back, type, xt_type_name(type));
+        PrintAndLogEx(SUCCESS, "read back...... " _GREEN_("%08X"), back);
         PrintAndLogEx(HINT, "to put it back: `lf xhorse xt57 settype -t %02X`", (uint8_t)(oldw & 0xFF));
         return PM3_SUCCESS;
     }
@@ -3460,33 +3645,151 @@ static int CmdLFXhorseXt57Read(const char *Cmd) {
     PrintAndLogEx(SUCCESS, "nonce %08X at %d us", ks->nonce, found);
 
     PrintAndLogEx(NORMAL, "");
-    PrintAndLogEx(INFO, " seg blk  p0       p1       p2       p3       p4       p5       p6       p7");
-    PrintAndLogEx(INFO, " --- ---  -------- -------- -------- -------- -------- -------- -------- --------");
-    for (size_t b = 0; b < ARRAYLEN(xt_blocks); b++) {
-        uint8_t a = (arglen > 0) ? argb[0] : xt_blocks[b].arg;
-        uint32_t v[8];
-        bool got[8];
-        if (xt_read_block(ks, found, a, v, got) != PM3_SUCCESS) {
-            break;
-        }
-        char line[160] = {0};
-        for (int i = 0; i < 8; i++) {
-            char cell[12];
-            snprintf(cell, sizeof(cell), got[i] ? "%08X " : "   --    ", v[i]);
-            strncat(line, cell, sizeof(line) - strlen(line) - 1);
-        }
-        PrintAndLogEx(INFO, "  %d  %02X  %s", (a >> 5) & 7, a & 0x1F, line);
-        if (arglen > 0) {
-            break;
+    // All the blocks in one go: xt_read_blocks packs seven per session, so the whole chip is two
+    // sessions rather than one per block - one nonce search, one notice, no pauses between blocks.
+    uint8_t args[ARRAYLEN(xt_blocks)];
+    int nargs = 0;
+    if (arglen > 0) {
+        args[nargs++] = argb[0];
+    } else {
+        for (size_t b = 0; b < ARRAYLEN(xt_blocks); b++) {
+            args[nargs++] = xt_blocks[b].arg;
         }
     }
-    return PM3_SUCCESS;
+    uint32_t v[ARRAYLEN(xt_blocks)][8];
+    bool got[ARRAYLEN(xt_blocks)][8];
+    int res = xt_read_blocks(ks, found, args, nargs, v, got);
+    xt_print_block_table(args, nargs, v, got);
+    return res;
+}
+
+// Write arbitrary channel-B pages.  `set` and `restore` write fixed recipes; this is the general
+// case, needed because a set leaves the image area it did not use holding the previous type's data
+// (docs/xt37.md SS5m) and nothing else clears it.  Guarded, because the same mechanism can overwrite
+// the live personality: a session is built from keystream exactly as a read is, so any (block, page)
+// the select can reach is writable.
+static int CmdLFXhorseXt57Write(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "lf xhorse xt57 write",
+                  "Write channel-B pages of an XT37 / XT57 - the write counterpart of\n"
+                  "`lf xhorse xt57 read`.\n"
+                  "\n"
+                  _RED_("This writes to the chip") ".  Each page is written and read straight back, and\n"
+                  "the command reports success only for the pages that returned what went in.\n"
+                  "\n"
+                  "--arg is the select operand, segment << 5 | block, the same as `read` takes.\n"
+                  "--page is one page (`4`) or an inclusive range (`4-7`), 0..7 within that block.\n"
+                  "--data is the 32-bit word written to every page named, so a range clears or\n"
+                  "fills a block in one session.\n"
+                  "\n"
+                  "Two places are refused without " _YELLOW_("--force") ", because another command owns them:\n"
+                  "  pages 0-3 of segment 0 block 00 - the live emulated image (`set` / `restore`)\n"
+                  "  page 4 of the config block 7F     - the emulated type byte (`set` / `settype`)",
+                  "lf xhorse xt57 write --arg 00 --page 4-7 --data 00000000\n"
+                  "lf xhorse xt57 write --arg 01 --page 0-7 --data 00000000\n"
+                  "lf xhorse xt57 write --arg 0C --page 0   --data DEADBEEF");
+    void *argtable[] = {
+        arg_param_begin,
+        arg_str1(NULL, "arg",  "<hex>", "select operand: segment << 5 | block"),
+        arg_str1(NULL, "page", "<spec>", "page 0-7, or a range such as 4-7"),
+        arg_str1(NULL, "data", "<hex>", "32-bit word to write to each page"),
+        arg_int0(NULL, "base", "<dec>", "centre of the power-up search in us (def 119500)"),
+        arg_int0(NULL, "span", "<dec>", "half-width of the search in us (def 400)"),
+        arg_lit0(NULL, "force", "write a page another command owns"),
+        arg_param_end,
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, false);
+
+    int arglen = 0;
+    uint8_t argb[2] = {0};
+    CLIGetHexWithReturn(ctx, 1, argb, &arglen);
+
+    char pspec[16] = {0};
+    int plen = 0;
+    CLIParamStrToBuf(arg_get_str(ctx, 2), (uint8_t *)pspec, sizeof(pspec) - 1, &plen);
+
+    int datalen = 0;
+    uint8_t datab[4] = {0};
+    CLIGetHexWithReturn(ctx, 3, datab, &datalen);
+
+    int centre = arg_get_int_def(ctx, 4, XT57_SEARCH_CENTRE);
+    int span = arg_get_int_def(ctx, 5, XT57_SEARCH_SPAN);
+    bool force = arg_get_lit(ctx, 6);
+    CLIParserFree(ctx);
+
+    if (arglen != 1) {
+        PrintAndLogEx(FAILED, "--arg takes one byte, e.g. --arg 00");
+        return PM3_EINVARG;
+    }
+    if (datalen != 4) {
+        PrintAndLogEx(FAILED, "--data takes four bytes, e.g. --data 00000000");
+        return PM3_EINVARG;
+    }
+    int first = 0, last = 0;
+    if (sscanf(pspec, "%d-%d", &first, &last) == 2) {
+        ;
+    } else if (sscanf(pspec, "%d", &first) == 1) {
+        last = first;
+    } else {
+        PrintAndLogEx(FAILED, "--page wants a page or a range, e.g. --page 4 or --page 4-7");
+        return PM3_EINVARG;
+    }
+    if (first < 0 || last > 7 || first > last) {
+        PrintAndLogEx(FAILED, "pages run 0..7 within a block, low end first");
+        return PM3_EINVARG;
+    }
+
+    uint8_t arg = argb[0];
+    uint32_t value = xt57_be32(datab);
+
+    // The two guarded places.  Both are recoverable only by a command that knows the whole recipe,
+    // so a bare page write there is almost always a mistake.
+    if (force == false) {
+        if (arg == 0x00 && first <= 3) {
+            PrintAndLogEx(FAILED, "pages 0-3 of s0 b00 are the live emulated image");
+            PrintAndLogEx(HINT, "use `" _YELLOW_("lf xhorse xt57 set") "` / `"
+                          _YELLOW_("restore") "`, or --force to write them anyway");
+            return PM3_EINVARG;
+        }
+        if (arg == XT_ARG_CONFIG && first <= 4 && last >= 4) {
+            PrintAndLogEx(FAILED, "page 4 of the config block is the emulated type byte");
+            PrintAndLogEx(HINT, "use `" _YELLOW_("lf xhorse xt57 set") "` / `"
+                          _YELLOW_("settype") "`, or --force to write it anyway");
+            return PM3_EINVARG;
+        }
+    }
+
+    // One select, then write/read-back per page, chunked the way an image write is so a long range
+    // still fits the per-reply response cap.
+    xt57_step_t steps[XT57_MAXSTEPS];
+    int n = 0, in_chunk = 0;
+    steps[n++] = (xt57_step_t) { 'S', arg, 0 };
+    for (int pg = first; pg <= last; pg++) {
+        if (in_chunk >= XT57_IMG_CHUNK) {
+            steps[n++] = (xt57_step_t) { 'X', 0, 0 };
+            steps[n++] = (xt57_step_t) { 'S', arg, 0 };
+            in_chunk = 0;
+        }
+        steps[n++] = (xt57_step_t) { 'W', (uint8_t)pg, value };
+        steps[n++] = (xt57_step_t) { 'R', (uint8_t)pg, 0 };
+        in_chunk++;
+    }
+
+    PrintAndLogEx(INFO, "writing %08X to segment %d block %02X page%s %s, %d exchanges",
+                  value, (arg >> 5) & 7, arg & 0x1F, (first == last) ? "" : "s", pspec, n);
+
+    int res = xt57_run_session(steps, n, 0, centre, span);
+    if (res == PM3_SUCCESS) {
+        PrintAndLogEx(HINT, "`" _YELLOW_("lf xhorse xt57 read --arg %02X") "` shows the block", arg);
+    }
+    return res;
 }
 
 static command_t Xt57CommandTable[] = {
     {"help",  CmdHelpXt57,           AlwaysAvailable, "This help"},
     {"nonce", CmdLFXhorseXt57Nonce,  IfPm3Hitag,      "Collect XT57B nonces over a range of timings"},
     {"read",  CmdLFXhorseXt57Read,   IfPm3Hitag,      "Read channel-B pages of an XT37 / XT57"},
+    {"write", CmdLFXhorseXt57Write,  IfPm3Hitag,      "Write channel-B pages of an XT37 / XT57"},
     {"settype", CmdLFXhorseXt57SetType, IfPm3Hitag,    "Advanced: write only the config word (use `set` normally)"},
     {"reset", CmdLFXhorseXt57Reset,  IfPm3Hitag,      "Free a chip stuck emulating a broadcast type"},
     {"set",   CmdLFXhorseXt57Set,    IfPm3Hitag,      "Set which transponder the chip emulates"},
@@ -3511,7 +3814,7 @@ static command_t CommandTable[] = {
     {"-----------", CmdHelp,           AlwaysAvailable, "----------------- " _CYAN_("Xhorse XT27A / XT136") " -----------------"},
     {"types",     CmdLFXhorseTypes,    AlwaysAvailable, "List the -t type names accepted by configure"},
     {"info",      CmdLFXhorseInfo,     IfPm3Hitag,      "Identify a chip: family, ID, type, emulated image"},
-    {"dump",      CmdLFXhorseDump,     IfPm3Hitag,      "Read all reachable channel-A storage"},
+    {"dump",      CmdLFXhorseDump,     IfPm3Hitag,      "Read all reachable storage of the chip on the antenna"},
     {"configure", CmdLFXhorseConfigure, IfPm3Hitag,     "Set which transponder the chip emulates"},
     {"reset",     CmdLFXhorseReset,    IfPm3Hitag,      "Restore the default ID46 personality"},
     {"read",      CmdLFXhorseRead,     IfPm3Hitag,      "Read raw channel-A pages"},

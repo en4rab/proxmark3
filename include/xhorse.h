@@ -186,6 +186,11 @@ typedef struct {
     uint16_t seed_reply;      // the tag's reply to 7372 (XT27A) / E430 (XT136) that seeds the cipher
     int16_t  em_slip_us;      // `xt57 reset`: how far off the VVDI's nominal burst offset the
                               // burst that actually freed the chip was, in us (0 = the nominal one)
+    // The config words, read from the bank-1 pages they read back at (XT27A only).  Both `info` and
+    // `dump` print them in their shared header, so the firmware reads them in the bank-1 session it
+    // already opens for the type byte - two more page reads, no extra session.
+    uint32_t cfgword[2];      // bank-1 0x3D, 0x3E
+    uint8_t  cfgword_ok;      // bit 0 / bit 1 set => that word had two agreeing reads
 } PACKED lf_xhorse_info_t;
 
 // Client -> firmware payload for `lf xhorse read` / `lf xhorse write`: the raw channel-A page

@@ -1632,6 +1632,14 @@ void Xhorse_Info(const lf_xhorse_rdopt_t *opt, bool ledcontrol) {
     uint32_t tb = 0;
     if (xh_bank(&s, 1) == PM3_SUCCESS) {
         out.typebyte_ok = xh_read_agreed(&s, XH_PG_TYPE, &tb) ? 1 : 0;
+        // The config words come from the same bank, so read them here rather than in a session of
+        // their own: the header `info` and `dump` share reports them.
+        uint32_t c0 = 0, c1 = 0;
+        bool ok0 = xh_read_agreed(&s, XH_PG_CFG0, &c0);
+        bool ok1 = xh_read_agreed(&s, XH_PG_CFG0 + 1, &c1);
+        out.cfgword[0] = c0;
+        out.cfgword[1] = c1;
+        out.cfgword_ok = (uint8_t)((ok0 ? 1 : 0) | (ok1 ? 2 : 0));
     }
     out.typebyte = (uint8_t)(tb & 0xFF);
 
@@ -1677,6 +1685,14 @@ void Xhorse_Dump(uint8_t bank, const lf_xhorse_rdopt_t *opt, bool ledcontrol) {
     uint32_t tb = 0;
     if (xh_bank(&s, 1) == PM3_SUCCESS) {
         out.typebyte_ok = xh_read_agreed(&s, XH_PG_TYPE, &tb) ? 1 : 0;
+        // The config words come from the same bank, so read them here rather than in a session of
+        // their own: the header `info` and `dump` share reports them.
+        uint32_t c0 = 0, c1 = 0;
+        bool ok0 = xh_read_agreed(&s, XH_PG_CFG0, &c0);
+        bool ok1 = xh_read_agreed(&s, XH_PG_CFG0 + 1, &c1);
+        out.cfgword[0] = c0;
+        out.cfgword[1] = c1;
+        out.cfgword_ok = (uint8_t)((ok0 ? 1 : 0) | (ok1 ? 2 : 0));
     }
     out.typebyte = (uint8_t)(tb & 0xFF);
 
